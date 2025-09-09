@@ -120,7 +120,7 @@ class BucketsTableGpu {
         TagType tags[bucketSize];
 
         __device__ int findEmptySlotWarp() const {
-            unsigned int lane_id = threadIdx.x % 32;
+            unsigned int lane_id = threadIdx.x & 31;
             bool has_empty = false;
 
             if (lane_id < bucketSize) {
@@ -136,7 +136,7 @@ class BucketsTableGpu {
         }
 
         __device__ bool containsWarp(TagType tag) const {
-            unsigned int lane_id = threadIdx.x % 32;
+            unsigned int lane_id = threadIdx.x & 31;
             bool found = false;
 
             if (lane_id < bucketSize) {
@@ -451,7 +451,7 @@ class BucketsTableGpu {
         __device__ bool insertWithEvictionWarp(TagType fp, size_t startBucket) {
             TagType currentFp = fp;
             size_t currentBucket = startBucket;
-            unsigned int lane_id = threadIdx.x % 32;
+            unsigned int lane_id = threadIdx.x & 31;
 
             for (size_t evictions = 0; evictions < maxProbes; ++evictions) {
                 if (tryInsertAtBucketWarp(currentBucket, currentFp)) {
@@ -574,7 +574,7 @@ __global__ void insertKernel(
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) {
         // table_view.insert(keys[idx]);
-        if (blockSize % 32 == 0) {
+        if (blockSize & 31 == 0) {
             table_view.insertWarp(keys[idx]);
         } else {
             table_view.insert(keys[idx]);
@@ -603,7 +603,7 @@ __global__ void containsKernel(
 ) {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) {
-        if (blockSize % 32 == 0) {
+        if (blockSize & 31 == 0) {
             output[idx] = table_view.containsWarp(keys[idx]);
         } else {
             output[idx] = table_view.contains(keys[idx]);
