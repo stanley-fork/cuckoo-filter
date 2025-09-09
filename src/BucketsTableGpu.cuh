@@ -10,7 +10,7 @@
 #include <vector>
 #include "common.cuh"
 
-struct __device__ SpinLock {
+struct SpinLock {
     int lock_flag = 0;
 
     __device__ void lock() {
@@ -220,9 +220,36 @@ class BucketsTableGpu {
     size_t insertMany(const T* keys, const size_t n) {
         T* d_keys;
         CUDA_CALL(cudaMalloc(&d_keys, n * sizeof(T)));
-        CUDA_CALL(
-            cudaMemcpy(d_keys, keys, n * sizeof(T), cudaMemcpyHostToDevice)
-        );
+
+        constexpr size_t numStreams = 4;
+        const size_t chunkSize = (n + numStreams - 1) / numStreams;
+        cudaStream_t streams[numStreams];
+
+        for (auto& stream : streams) {
+            CUDA_CALL(cudaStreamCreate(&stream));
+        }
+
+        for (size_t i = 0; i < numStreams; ++i) {
+            size_t offset = i * chunkSize;
+            size_t currentChunkSize = std::min(chunkSize, n - offset);
+            if (currentChunkSize > 0) {
+                CUDA_CALL(cudaMemcpyAsync(
+                    d_keys + offset,
+                    keys + offset,
+                    currentChunkSize * sizeof(T),
+                    cudaMemcpyHostToDevice,
+                    streams[i]
+                ));
+            }
+        }
+
+        for (auto& stream : streams) {
+            CUDA_CALL(cudaStreamSynchronize(stream));
+        }
+
+        for (auto& stream : streams) {
+            CUDA_CALL(cudaStreamDestroy(stream));
+        }
 
         size_t numBlocks = (n + blockSize - 1) / blockSize;
         insertKernel<
@@ -252,34 +279,63 @@ class BucketsTableGpu {
         bool* h_output;
 
         CUDA_CALL(cudaMallocHost(&h_output, n * sizeof(bool)));
-
         CUDA_CALL(cudaMalloc(&d_keys, n * sizeof(T)));
         CUDA_CALL(cudaMalloc(&d_output, n * sizeof(bool)));
-        CUDA_CALL(
-            cudaMemcpy(d_keys, keys, n * sizeof(T), cudaMemcpyHostToDevice)
-        );
 
-        size_t numBlocks = (n + blockSize - 1) / blockSize;
-        containsKernel<
-            T,
-            bitsPerTag,
-            bucketSize,
-            numBuckets,
-            maxProbes,
-            blockSize>
-            <<<numBlocks, blockSize>>>(d_keys, d_output, n, get_device_view());
+        constexpr size_t numStreams = 4;
+        const size_t chunkSize = SDIV(n, numStreams);
+        cudaStream_t streams[numStreams];
 
-        CUDA_CALL(cudaDeviceSynchronize());
-        CUDA_CALL(cudaMemcpy(
-            h_output, d_output, n * sizeof(bool), cudaMemcpyDeviceToHost
-        ));
+        for (auto& stream : streams) {
+            CUDA_CALL(cudaStreamCreate(&stream));
+        }
+
+        for (size_t i = 0; i < numStreams; ++i) {
+            size_t offset = i * chunkSize;
+            size_t currentChunkSize = std::min(chunkSize, n - offset);
+
+            if (currentChunkSize > 0) {
+                CUDA_CALL(cudaMemcpyAsync(
+                    d_keys + offset,
+                    keys + offset,
+                    currentChunkSize * sizeof(T),
+                    cudaMemcpyHostToDevice,
+                    streams[i]
+                ));
+
+                size_t numBlocks = SDIV(currentChunkSize, blockSize);
+                containsKernel<
+                    T,
+                    bitsPerTag,
+                    bucketSize,
+                    numBuckets,
+                    maxProbes,
+                    blockSize><<<numBlocks, blockSize, 0, streams[i]>>>(
+                    d_keys + offset,
+                    d_output + offset,
+                    currentChunkSize,
+                    get_device_view()
+                );
+
+                CUDA_CALL(cudaMemcpyAsync(
+                    h_output + offset,
+                    d_output + offset,
+                    currentChunkSize * sizeof(bool),
+                    cudaMemcpyDeviceToHost,
+                    streams[i]
+                ));
+            }
+        }
+
+        for (auto& stream : streams) {
+            CUDA_CALL(cudaStreamSynchronize(stream));
+            CUDA_CALL(cudaStreamDestroy(stream));
+        }
 
         CUDA_CALL(cudaFree(d_keys));
         CUDA_CALL(cudaFree(d_output));
-
         return h_output;
     }
-
     void clear() {
         CUDA_CALL(cudaMemset(d_buckets, 0, numBuckets * sizeof(Bucket)));
         CUDA_CALL(cudaMemset(d_locks, 0, numBuckets * sizeof(SpinLock)));
@@ -315,7 +371,9 @@ class BucketsTableGpu {
             int slot = d_buckets[bucketIdx].findEmptySlot();
             if (slot != -1) {
                 d_buckets[bucketIdx].insertAt(slot, tag);
-                atomicAdd(reinterpret_cast<unsigned long long *>(d_numOccupied), 1ULL);
+                atomicAdd(
+                    reinterpret_cast<unsigned long long*>(d_numOccupied), 1ULL
+                );
                 d_locks[bucketIdx].unlock();
                 return true;
             }
@@ -333,7 +391,10 @@ class BucketsTableGpu {
                 int slot = d_buckets[currentBucket].findEmptySlot();
                 if (slot != -1) {
                     d_buckets[currentBucket].insertAt(slot, currentFp);
-                    atomicAdd(reinterpret_cast<unsigned long long *>(d_numOccupied), 1ULL);
+                    atomicAdd(
+                        reinterpret_cast<unsigned long long*>(d_numOccupied),
+                        1ULL
+                    );
                     d_locks[currentBucket].unlock();
                     return true;
                 }

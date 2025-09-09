@@ -7,6 +7,8 @@ constexpr bool powerOfTwo(size_t n) {
     return n != 0 && (n & (n - 1)) == 0;
 }
 
+#define SDIV(x,y) (((x)+(y)-1)/(y))
+
 #define CUDA_CALL(err)                                                      \
     do {                                                                    \
         cudaError_t err_ = (err);                                           \
