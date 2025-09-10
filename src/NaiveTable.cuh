@@ -159,7 +159,7 @@ class NaiveTable {
         syncToDevice();
 
         size_t numBlocks = (n + blockSize - 1) / blockSize;
-        containsKernel<T, bitsPerTag, numSlots, maxProbes, blockSize>
+        containsKernel<T, bitsPerTag, maxProbes, blockSize>
             <<<numBlocks, blockSize>>>(
                 d_keys, d_output, n, this->get_device_view()
             );

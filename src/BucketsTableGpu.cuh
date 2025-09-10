@@ -463,7 +463,6 @@ template <
     typename T,
     size_t bitsPerTag,
     size_t bucketSize,
-    size_t numBuckets,
     size_t maxEvictions,
     size_t blockSize>
 __global__ void insertKernel(

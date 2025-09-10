@@ -153,7 +153,7 @@ class BucketsTableCpu {
         return insertWithEviction(fp, h1);
     }
 
-    bool contains(const T& key) const {
+    bool contains(const T& key) {
         auto [h1, h2, fp] = getCandidateBuckets(key);
 
         return buckets[h1].contains(fp) || buckets[h2].contains(fp);
