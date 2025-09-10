@@ -400,7 +400,7 @@ class BucketsTableGpu {
             for (size_t evictions = 0; evictions < maxEvictions; ++evictions) {
                 d_locks[currentBucket].lock();
 
-                int slot = d_buckets[currentBucket].findEmptySlot();
+                int slot = d_buckets[currentBucket].findEmptySlot(fp);
                 if (slot != -1) {
                     d_buckets[currentBucket].insertAt(slot, currentFp);
                     atomicAdd(
