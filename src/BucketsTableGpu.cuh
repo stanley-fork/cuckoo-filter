@@ -122,7 +122,7 @@ class BucketsTableGpu {
         }
 
         __device__ bool remove(TagType tag) {
-            size_t idx = findSlot(tag, tag);
+            int idx = findSlot(tag, tag);
             if (idx != -1) {
                 tags[idx] = EMPTY;
                 return true;
