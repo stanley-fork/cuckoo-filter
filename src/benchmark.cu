@@ -44,8 +44,8 @@ std::vector<double> benchmarkFunction(Func func, int iterations = 5) {
         auto end = std::chrono::high_resolution_clock::now();
 
         auto duration =
-            std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-        times.push_back(duration.count() / 1000.0);
+            std::chrono::duration_cast<std::chrono::nanoseconds>(end - start);
+        times.push_back(duration.count() / 1000.0 / 1000.0);
     }
 
     return times;
@@ -177,9 +177,9 @@ void writeResultsToCsv(
 
     for (const auto& result : results) {
         file << result.exponent << "," << result.n << "," << result.tableType
-             << "," << std::fixed << std::setprecision(3) << result.avgTimeMs
-             << "," << std::fixed << std::setprecision(3) << result.minTimeMs
-             << "," << std::fixed << std::setprecision(3) << result.maxTimeMs
+             << "," << std::fixed << std::setprecision(6) << result.avgTimeMs
+             << "," << std::fixed << std::setprecision(6) << result.minTimeMs
+             << "," << std::fixed << std::setprecision(6) << result.maxTimeMs
              << "," << result.itemsInserted << "," << result.itemsFound << "\n";
     }
 
@@ -227,8 +227,8 @@ int main(int argc, char** argv) {
             auto result = benchmarkHybridTable(input, n, exponent);
             results.push_back(result);
 
-            std::cout << "  [HybridTable] - " << std::fixed
-                      << std::setprecision(2) << result.avgTimeMs << " ("
+            std::cout << "  [HybridTable] - \t" << std::fixed
+                      << std::setprecision(4) << result.avgTimeMs << " ("
                       << result.minTimeMs << "-" << result.maxTimeMs << ") ms"
                       << std::endl;
         }
@@ -237,8 +237,8 @@ int main(int argc, char** argv) {
             auto result = benchmarkCpuTable(input, n, exponent);
             results.push_back(result);
 
-            std::cout << "  [BucketsTableCpu] - " << std::fixed
-                      << std::setprecision(2) << result.avgTimeMs << " ("
+            std::cout << "  [BucketsTableCpu] - \t" << std::fixed
+                      << std::setprecision(4) << result.avgTimeMs << " ("
                       << result.minTimeMs << "-" << result.maxTimeMs << ") ms"
                       << std::endl;
         }
@@ -247,8 +247,8 @@ int main(int argc, char** argv) {
             auto result = benchmarkGpuTable(input, n, exponent);
             results.push_back(result);
 
-            std::cout << "  [BucketsTableGpu] - " << std::fixed
-                      << std::setprecision(2) << result.avgTimeMs << " ("
+            std::cout << "  [BucketsTableGpu] - \t" << std::fixed
+                      << std::setprecision(4) << result.avgTimeMs << " ("
                       << result.minTimeMs << "-" << result.maxTimeMs << ") ms"
                       << std::endl;
         }
