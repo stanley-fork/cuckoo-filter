@@ -106,6 +106,7 @@ class BucketsTableGpu {
                 }
                 idx = (idx + 1) & (bucketSize - 1);
             }
+            return -1;
         }
 
         __device__ bool contains(TagType tag) const {
