@@ -249,7 +249,7 @@ class BucketsTableGpu {
         T* d_keys;
         CUDA_CALL(cudaMalloc(&d_keys, n * sizeof(T)));
 
-        constexpr size_t numStreams = 4;
+        constexpr size_t numStreams = 12;
         const size_t chunkSize = SDIV(n, numStreams);
         cudaStream_t streams[numStreams];
 
@@ -302,7 +302,7 @@ class BucketsTableGpu {
         CUDA_CALL(cudaMalloc(&d_keys, n * sizeof(T)));
         CUDA_CALL(cudaMalloc(&d_output, n * sizeof(bool)));
 
-        constexpr size_t numStreams = 4;
+        constexpr size_t numStreams = 12;
         const size_t chunkSize = SDIV(n, numStreams);
         cudaStream_t streams[numStreams];
 

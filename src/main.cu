@@ -58,7 +58,7 @@ int main(int argc, char** argv) {
     }
 
     if (table_type == 0) {
-        auto table = HybridTable<uint32_t, 32, 1000, 256>(n * 2);
+        auto table = HybridTable<uint32_t, 32, 1000, 256>(n);
 
         auto start = std::chrono::high_resolution_clock::now();
         size_t count = 0;
@@ -78,7 +78,7 @@ int main(int argc, char** argv) {
                   << " items, found " << found << " items in " << duration
                   << " ms" << std::endl;
     } else if (table_type == 1) {
-        auto table = BucketsTableCpu<uint32_t, 32, 32, 1000>(n / 16);
+        auto table = BucketsTableCpu<uint32_t, 32, 32, 1000>(n / 32);
 
         auto start = std::chrono::high_resolution_clock::now();
         size_t count = 0;
@@ -97,7 +97,7 @@ int main(int argc, char** argv) {
                   << " items, found " << found << " items in " << duration
                   << " ms" << std::endl;
     } else if (table_type == 2) {
-        auto table = BucketsTableGpu<uint32_t, 32, 32, 1000>(n / 16);
+        auto table = BucketsTableGpu<uint32_t, 32, 32, 1000>(n / 32);
 
         bool* output;
 
