@@ -7,7 +7,18 @@ constexpr bool powerOfTwo(size_t n) {
     return n != 0 && (n & (n - 1)) == 0;
 }
 
-#define SDIV(x,y) (((x)+(y)-1)/(y))
+template <typename T>
+size_t count_ones(T* data, size_t n) {
+    size_t count = 0;
+    for (size_t i = 0; i < n; ++i) {
+        if (data[i]) {
+            count++;
+        }
+    }
+    return count;
+}
+
+#define SDIV(x, y) (((x) + (y) - 1) / (y))
 
 #define CUDA_CALL(err)                                                      \
     do {                                                                    \

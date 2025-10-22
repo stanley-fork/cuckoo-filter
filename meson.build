@@ -7,7 +7,6 @@ project(
         'warning_level=3',
         'cpp_std=c++20',
         'optimization=3',
-        'buildtype=release',
     ],
 )
 
@@ -40,24 +39,6 @@ includes = ['./include']
 executable(
     'cuckoo-filter-cuda',
     './src/main.cu',
-    dependencies: dependencies,
-    include_directories: includes,
-    cuda_args: cuda_args,
-    install: true,
-)
-
-executable(
-    'benchmark_perf',
-    './src/benchmark.cu',
-    dependencies: dependencies,
-    include_directories: includes,
-    cuda_args: cuda_args,
-    install: true,
-)
-
-executable(
-    'benchmark_bucket_size',
-    './src/benchmark_buckets.cu',
     dependencies: dependencies,
     include_directories: includes,
     cuda_args: cuda_args,

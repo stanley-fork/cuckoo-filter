@@ -5,40 +5,19 @@
 #include <cuda/std/cstdint>
 #include <iostream>
 #include <random>
-#include "BucketsTableCpu.cuh"
 #include "BucketsTableGpu.cuh"
-#include "common.cuh"
-#include "HybridTable.cuh"
+#include "helpers.cuh"
 
-template <typename T>
-size_t count_ones(T* data, size_t n) {
-    size_t count = 0;
-    for (size_t i = 0; i < n; ++i) {
-        if (data[i]) {
-            count++;
-        }
-    }
-    return count;
-}
+
 
 int main(int argc, char** argv) {
-    if (argc < 3) {
-        std::cerr << "Usage: " << argv[0] << " <table_type> <n_exponent>"
-                  << std::endl;
-        std::cerr
-            << "table_type: 0=HybridTable, 1=BucketsTableCpu, 2=BucketsTableGpu"
-            << std::endl;
+    if (argc < 2) {
+        std::cerr << "Usage: " << argv[0] << " <table_type> " << std::endl;
         std::cerr << "n_exponent: exponent for n = 2^x" << std::endl;
         return 1;
     }
 
-    int table_type = std::atoi(argv[1]);
-    int n_exponent = std::atoi(argv[2]);
-
-    if (table_type < 0 || table_type > 2) {
-        std::cerr << "Invalid table type. Use 0, 1, or 2." << std::endl;
-        return 1;
-    }
+    int n_exponent = std::atoi(argv[1]);
 
     if (n_exponent < 1 || n_exponent > 30) {
         std::cerr << "Invalid exponent. Use 1-30." << std::endl;
@@ -53,67 +32,23 @@ int main(int argc, char** argv) {
 
     CUDA_CALL(cudaMallocHost(&input, sizeof(uint32_t) * n));
 
-    for (size_t i = 0; i < n; ++i) {
-        input[i] = dist(rng);
-    }
+    std::generate(input, input + n, [&]() { return dist(rng); });
 
-    if (table_type == 0) {
-        auto table = HybridTable<uint32_t, 32, 1000, 256>(n);
+    auto table = BucketsTableGpu<uint32_t, 32, 32, 1000>(n / 32);
 
-        auto start = std::chrono::high_resolution_clock::now();
-        size_t count = 0;
-        for (size_t i = 0; i < n; ++i) {
-            count += size_t(table.insert(input[i]));
-        }
+    bool* output;
 
-        auto mask = table.containsMany(input, n);
-        auto end = std::chrono::high_resolution_clock::now();
+    CUDA_CALL(cudaMallocHost(&output, sizeof(bool) * n));
 
-        auto duration =
-            std::chrono::duration_cast<std::chrono::milliseconds>(end - start)
-                .count();
+    auto start = std::chrono::high_resolution_clock::now();
+    size_t count = table.insertMany(input, n);
+    table.containsMany(input, n, output);
+    auto end = std::chrono::high_resolution_clock::now();
+    auto duration =
+        std::chrono::duration_cast<std::chrono::milliseconds>(end - start)
+            .count();
 
-        size_t found = count_ones(mask, n);
-        std::cout << "HybridTable: Inserted " << count << " / " << n
-                  << " items, found " << found << " items in " << duration
-                  << " ms" << std::endl;
-    } else if (table_type == 1) {
-        auto table = BucketsTableCpu<uint32_t, 32, 32, 1000>(n / 32);
-
-        auto start = std::chrono::high_resolution_clock::now();
-        size_t count = 0;
-
-        for (size_t i = 0; i < n; ++i) {
-            count += size_t(table.insert(input[i]));
-        }
-        auto mask = table.containsMany(input, n);
-        auto end = std::chrono::high_resolution_clock::now();
-        auto duration =
-            std::chrono::duration_cast<std::chrono::milliseconds>(end - start)
-                .count();
-
-        size_t found = count_ones(mask, n);
-        std::cout << "BucketsTableCpu: Inserted " << count << " / " << n
-                  << " items, found " << found << " items in " << duration
-                  << " ms" << std::endl;
-    } else if (table_type == 2) {
-        auto table = BucketsTableGpu<uint32_t, 32, 32, 1000>(n / 32);
-
-        bool* output;
-
-        CUDA_CALL(cudaMallocHost(&output, sizeof(bool) * n));
-
-        auto start = std::chrono::high_resolution_clock::now();
-        size_t count = table.insertMany(input, n);
-        table.containsMany(input, n, output);
-        auto end = std::chrono::high_resolution_clock::now();
-        auto duration =
-            std::chrono::duration_cast<std::chrono::milliseconds>(end - start)
-                .count();
-
-        size_t found = count_ones(output, n);
-        std::cout << "BucketsTableGpu: Inserted " << count << " / " << n
-                  << " items, found " << found << " items in " << duration
-                  << " ms" << std::endl;
-    }
+    size_t found = count_ones(output, n);
+    std::cout << "Inserted " << count << " / " << n << " items, found " << found
+              << " items in " << duration << " ms" << std::endl;
 }

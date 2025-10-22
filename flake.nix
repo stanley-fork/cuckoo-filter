@@ -12,7 +12,7 @@
         config.allowUnfree = true;
       };
       cudaPkgs = pkgs.cudaPackages;
-      llvm = pkgs.llvmPackages_20;
+      llvm = pkgs.llvmPackages_21;
 
       cuda = {
         arch = "800";
@@ -59,7 +59,6 @@
               - -D__INTELLISENSE__
               - -D__CLANGD__
               - -I${cudaPkgs.cudatoolkit}/include
-              - -L${cudaPkgs.cudatoolkit}/lib
               - -I${toString ./.}/include
               - -I${toString ./.}/subprojects/cuco/include
               - -D__LIBCUDAXX__STD_VER=${cuda.version.major}

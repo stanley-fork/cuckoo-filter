@@ -8,7 +8,7 @@
 #include <cuda/std/cstdint>
 #include <iostream>
 #include <vector>
-#include "common.cuh"
+#include "helpers.cuh"
 
 template <
     typename T,
