@@ -170,6 +170,9 @@ static void BM_CuckooFilter_InsertAndQuery(bm::State& state) {
     }
 
     state.SetItemsProcessed(static_cast<int64_t>(state.iterations() * n));
+    state.SetBytesProcessed(
+        static_cast<int64_t>(state.iterations() * n * sizeof(uint32_t))
+    );
 }
 
 static void BM_BloomFilter_InsertAndQuery(bm::State& state) {
@@ -204,6 +207,9 @@ static void BM_BloomFilter_InsertAndQuery(bm::State& state) {
     }
 
     state.SetItemsProcessed(static_cast<int64_t>(state.iterations() * n));
+    state.SetBytesProcessed(
+        static_cast<int64_t>(state.iterations() * n * sizeof(uint32_t))
+    );
 }
 
 BENCHMARK(BM_CuckooFilter_Insert)
