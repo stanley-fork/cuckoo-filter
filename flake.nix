@@ -39,6 +39,7 @@
           llvm.clang-tools
           llvm.lldb
           meson
+          uv
         ];
 
         CPATH = pkgs.lib.makeIncludePath [

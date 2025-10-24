@@ -231,27 +231,27 @@ static void BM_BloomFilter_InsertAndQuery(bm::State& state) {
 }
 
 BENCHMARK(BM_CuckooFilter_Insert)
-    ->Range(1 << 16, 1 << 24)
+    ->Range(1 << 16, 1 << 28)
     ->Unit(bm::kMillisecond);
 
 BENCHMARK(BM_BloomFilter_Insert)
-    ->Range(1 << 16, 1 << 24)
+    ->Range(1 << 16, 1 << 28)
     ->Unit(bm::kMillisecond);
 
 BENCHMARK(BM_CuckooFilter_Query)
-    ->Range(1 << 16, 1 << 24)
+    ->Range(1 << 16, 1 << 28)
     ->Unit(bm::kMillisecond);
 
 BENCHMARK(BM_BloomFilter_Query)
-    ->Range(1 << 16, 1 << 24)
+    ->Range(1 << 16, 1 << 28)
     ->Unit(bm::kMillisecond);
 
 BENCHMARK(BM_CuckooFilter_InsertAndQuery)
-    ->Range(1 << 16, 1 << 24)
+    ->Range(1 << 16, 1 << 28)
     ->Unit(bm::kMillisecond);
 
 BENCHMARK(BM_BloomFilter_InsertAndQuery)
-    ->Range(1 << 16, 1 << 24)
+    ->Range(1 << 16, 1 << 28)
     ->Unit(bm::kMillisecond);
 
 BENCHMARK_MAIN();
