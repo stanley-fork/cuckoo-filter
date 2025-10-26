@@ -40,7 +40,13 @@ def main():
         print("No benchmark data found in JSON", file=sys.stderr)
         sys.exit(1)
 
-    benchmark_names = sorted(benchmark_data.keys())
+    def get_last_value(bench_name):
+        sizes = sorted(benchmark_data[bench_name].keys())
+        if sizes:
+            return benchmark_data[bench_name][sizes[-1]]
+        return 0
+
+    benchmark_names = sorted(benchmark_data.keys(), key=get_last_value, reverse=True)
 
     fig, ax = plt.subplots(1, 1, figsize=(12, 8))
     fig.suptitle("Performance Comparison", fontsize=16)

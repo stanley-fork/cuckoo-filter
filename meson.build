@@ -48,11 +48,23 @@ executable(
 if get_option('BUILD_BENCHMARKS') == true
     benchmark_dep = dependency('benchmark', required: true)
     benchmark_main_dep = dependency('benchmark_main', required: true)
+    cpu_cuckoo_dep = dependency('cpu-cuckoo', fallback: ['cpu-cuckoo', 'cpu_cuckoo_dep'])
+
+    test_deps = [benchmark_dep, benchmark_main_dep, cuco_dep, cpu_cuckoo_dep]
 
     executable(
         'benchmark-cuckoo-vs-bloom',
         './benchmark/cuckoo_vs_bloom.cu',
-        dependencies: [benchmark_dep, benchmark_main_dep, cuco_dep],
+        dependencies: test_deps,
+        include_directories: includes,
+        cuda_args: cuda_args,
+        install: false,
+    )
+
+    executable(
+        'benchmark-cuckoo-cpu-vs-gpu',
+        './benchmark/cuckoo_cpu_vs_gpu.cu',
+        dependencies: test_deps,
         include_directories: includes,
         cuda_args: cuda_args,
         install: false,

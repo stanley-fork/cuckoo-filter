@@ -553,6 +553,10 @@ class CuckooFilter {
         return numBuckets;
     }
 
+    [[nodiscard]] size_t sizeInBytes() const {
+        return numBuckets * sizeof(Bucket);
+    }
+
     struct DeviceView {
         Bucket* d_buckets;
         cuda::std::atomic<size_t>* d_numOccupied;

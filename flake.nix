@@ -33,6 +33,8 @@
           cuda_cudart
           cuda_cccl
           pkgs.stdenv.cc.cc.lib
+          pkgs.openssl.dev
+          pkgs.openssl.out
         ];
 
         packages = with pkgs; [
@@ -63,6 +65,7 @@
               - -I${toString ./.}/include
               - -I${toString ./.}/subprojects/cuco/include
               - -I${toString ./.}/subprojects/googletest-1.17.0/googletest/include
+              - -I${pkgs.openssl.dev}/include
               - -D__LIBCUDAXX__STD_VER=${cuda.version.major}
               - -D__CUDACC_VER_MAJOR__=${cuda.version.major}
               - -D__CUDACC_VER_MINOR__=${cuda.version.minor}
