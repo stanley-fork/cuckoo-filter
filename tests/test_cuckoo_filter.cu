@@ -1,12 +1,11 @@
 #include <cuda_runtime.h>
 #include <gtest/gtest.h>
 #include <thrust/device_vector.h>
-#include <BucketsTableGpu.cuh>
+#include <CuckooFilter.cuh>
 #include <helpers.cuh>
 #include <random>
 #include <unordered_set>
 #include <vector>
-#include "subprojects/googletest-1.17.0/googletest/include/gtest/gtest.h"
 
 class CuckooFilterTest : public ::testing::Test {
    protected:
@@ -30,7 +29,7 @@ class CuckooFilterTest : public ::testing::Test {
 
 TEST_F(CuckooFilterTest, BasicInsertAndQuery) {
     const size_t capacity = 10000;
-    BucketsTableGpu<Config> filter(capacity);
+    CuckooFilter<Config> filter(capacity);
 
     std::vector<uint32_t> keys = {1, 2, 3, 4, 5, 100, 200, 300};
     thrust::device_vector<uint32_t> d_keys(keys.begin(), keys.end());
@@ -52,7 +51,7 @@ TEST_F(CuckooFilterTest, BasicInsertAndQuery) {
 
 TEST_F(CuckooFilterTest, EmptyFilter) {
     const size_t capacity = 10000;
-    BucketsTableGpu<Config> filter(capacity);
+    CuckooFilter<Config> filter(capacity);
 
     std::vector<uint32_t> queryKeys = {1, 2, 3, 4, 5};
     thrust::device_vector<uint32_t> d_keys(queryKeys.begin(), queryKeys.end());
@@ -70,7 +69,7 @@ TEST_F(CuckooFilterTest, EmptyFilter) {
 
 TEST_F(CuckooFilterTest, ClearOperation) {
     const size_t capacity = 10000;
-    BucketsTableGpu<Config> filter(capacity);
+    CuckooFilter<Config> filter(capacity);
 
     std::vector<uint32_t> keys = {1, 2, 3, 4, 5};
     thrust::device_vector<uint32_t> d_keys(keys.begin(), keys.end());
@@ -101,7 +100,7 @@ TEST_F(CuckooFilterTest, ClearOperation) {
 
 TEST_F(CuckooFilterTest, LoadFactor) {
     const size_t capacity = 10000;
-    BucketsTableGpu<Config> filter(capacity);
+    CuckooFilter<Config> filter(capacity);
 
     EXPECT_FLOAT_EQ(filter.loadFactor(), 0.0f);
 
@@ -127,7 +126,7 @@ TEST_F(CuckooFilterTest, LoadFactor) {
 
 TEST_F(CuckooFilterTest, NearCapacityInsertion) {
     const size_t numKeys = 1 << 20;
-    BucketsTableGpu<Config> filter(numKeys);
+    CuckooFilter<Config> filter(numKeys);
 
     auto keys = generateRandomKeys<uint32_t>(numKeys);
     thrust::device_vector<uint32_t> d_keys(keys.begin(), keys.end());
@@ -149,7 +148,7 @@ TEST_F(CuckooFilterTest, NearCapacityInsertion) {
 
 TEST_F(CuckooFilterTest, DuplicateInsertions) {
     const size_t capacity = 10000;
-    BucketsTableGpu<Config> filter(capacity);
+    CuckooFilter<Config> filter(capacity);
 
     std::vector<uint32_t> keys = {1, 1, 2, 2, 3, 3, 4, 4, 5, 5};
     thrust::device_vector<uint32_t> d_keys(keys.begin(), keys.end());

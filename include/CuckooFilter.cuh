@@ -36,27 +36,27 @@ struct CuckooConfig {
 };
 
 template <typename Config>
-class BucketsTableGpu;
+class CuckooFilter;
 
 template <typename Config>
 __global__ void insertKernel(
     const typename Config::KeyType* keys,
     size_t n,
-    typename BucketsTableGpu<Config>::DeviceTableView tableView
+    typename CuckooFilter<Config>::DeviceView view
 );
 
 template <typename Config>
 __global__ void insertKernelSorted(
     const typename Config::KeyType* keys,
-    const typename BucketsTableGpu<Config>::PackedTagType* packedTags,
+    const typename CuckooFilter<Config>::PackedTagType* packedTags,
     size_t n,
-    typename BucketsTableGpu<Config>::DeviceTableView tableView
+    typename CuckooFilter<Config>::DeviceView view
 );
 
 template <typename Config>
 __global__ void computePackedTagsKernel(
     const typename Config::KeyType* keys,
-    typename BucketsTableGpu<Config>::PackedTagType* packedTags,
+    typename CuckooFilter<Config>::PackedTagType* packedTags,
     size_t n,
     size_t numBuckets
 );
@@ -66,11 +66,11 @@ __global__ void containsKernel(
     const typename Config::KeyType* keys,
     bool* output,
     size_t n,
-    typename BucketsTableGpu<Config>::DeviceTableView tableView
+    typename CuckooFilter<Config>::DeviceView view
 );
 
 template <typename Config>
-class BucketsTableGpu {
+class CuckooFilter {
    public:
     using T = typename Config::KeyType;
     static constexpr size_t bitsPerTag = Config::bitsPerTag;
@@ -245,10 +245,10 @@ class BucketsTableGpu {
     }
 
    public:
-    BucketsTableGpu(const BucketsTableGpu&) = delete;
-    BucketsTableGpu& operator=(const BucketsTableGpu&) = delete;
+    CuckooFilter(const CuckooFilter&) = delete;
+    CuckooFilter& operator=(const CuckooFilter&) = delete;
 
-    explicit BucketsTableGpu(size_t capacity, double targetLoadFactor = 0.95)
+    explicit CuckooFilter(size_t capacity, double targetLoadFactor = 0.95)
         : numBuckets(calculateNumBuckets(capacity, targetLoadFactor)) {
         assert(
             targetLoadFactor > 0.0 && targetLoadFactor <= 1.0 &&
@@ -267,7 +267,7 @@ class BucketsTableGpu {
         clear();
     }
 
-    ~BucketsTableGpu() {
+    ~CuckooFilter() {
         if (d_buckets) {
             CUDA_CALL(cudaFree(d_buckets));
         }
@@ -459,7 +459,7 @@ class BucketsTableGpu {
         return numBuckets;
     }
 
-    struct DeviceTableView {
+    struct DeviceView {
         Bucket* d_buckets;
         cuda::std::atomic<size_t>* d_numOccupied;
         size_t numBuckets;
@@ -504,7 +504,7 @@ class BucketsTableGpu {
                     );
 
                 currentFp = evictedFp;
-                currentBucket = BucketsTableGpu::getAlternateBucket(
+                currentBucket = CuckooFilter::getAlternateBucket(
                     currentBucket, evictedFp, numBuckets
                 );
             }
@@ -529,8 +529,8 @@ class BucketsTableGpu {
         }
     };
 
-    DeviceTableView get_device_view() {
-        return DeviceTableView{
+    DeviceView get_device_view() {
+        return DeviceView{
             d_buckets,
             d_numOccupied,
             numBuckets,
@@ -542,7 +542,7 @@ template <typename Config>
 __global__ void insertKernel(
     const typename Config::KeyType* keys,
     size_t n,
-    typename BucketsTableGpu<Config>::DeviceTableView tableView
+    typename CuckooFilter<Config>::DeviceView view
 ) {
     auto block = cg::this_thread_block();
     auto tile = cg::tiled_partition<32>(block);
@@ -553,14 +553,12 @@ __global__ void insertKernel(
         return;
     }
 
-    int success = tableView.insert(keys[idx]);
+    int success = view.insert(keys[idx]);
 
     int tile_sum = cg::reduce(tile, success, cg::plus<int>());
 
     if (tile.thread_rank() == 0 && tile_sum > 0) {
-        tableView.d_numOccupied->fetch_add(
-            tile_sum, cuda::memory_order_relaxed
-        );
+        view.d_numOccupied->fetch_add(tile_sum, cuda::memory_order_relaxed);
     }
 }
 
@@ -569,19 +567,19 @@ __global__ void containsKernel(
     const typename Config::KeyType* keys,
     bool* output,
     size_t n,
-    typename BucketsTableGpu<Config>::DeviceTableView tableView
+    typename CuckooFilter<Config>::DeviceView view
 ) {
     auto idx = globalThreadId();
 
     if (idx < n) {
-        output[idx] = tableView.contains(keys[idx]);
+        output[idx] = view.contains(keys[idx]);
     }
 }
 
 template <typename Config>
 __global__ void computePackedTagsKernel(
     const typename Config::KeyType* keys,
-    typename BucketsTableGpu<Config>::PackedTagType* packedTags,
+    typename CuckooFilter<Config>::PackedTagType* packedTags,
     size_t n,
     size_t numBuckets
 ) {
@@ -591,12 +589,12 @@ __global__ void computePackedTagsKernel(
         return;
     }
 
-    using BucketsTable = BucketsTableGpu<Config>;
-    using PackedTagType = typename BucketsTable::PackedTagType;
+    using Filter = CuckooFilter<Config>;
+    using PackedTagType = typename Filter::PackedTagType;
     constexpr size_t bitsPerTag = Config::bitsPerTag;
 
     typename Config::KeyType key = keys[idx];
-    auto [i1, i2, fp] = BucketsTable::getCandidateBuckets(key, numBuckets);
+    auto [i1, i2, fp] = Filter::getCandidateBuckets(key, numBuckets);
 
     packedTags[idx] = (static_cast<PackedTagType>(i1) << bitsPerTag) |
                       static_cast<PackedTagType>(fp);
@@ -605,9 +603,9 @@ __global__ void computePackedTagsKernel(
 template <typename Config>
 __global__ void insertKernelSorted(
     const typename Config::KeyType* keys,
-    const typename BucketsTableGpu<Config>::PackedTagType* packedTags,
+    const typename CuckooFilter<Config>::PackedTagType* packedTags,
     size_t n,
-    typename BucketsTableGpu<Config>::DeviceTableView tableView
+    typename CuckooFilter<Config>::DeviceView view
 ) {
     auto block = cg::this_thread_block();
     auto tile = cg::tiled_partition<32>(block);
@@ -617,9 +615,10 @@ __global__ void insertKernelSorted(
     if (idx >= n)
         return;
 
-    using BucketsTable = BucketsTableGpu<Config>;
-    using TagType = typename BucketsTable::TagType;
-    using PackedTagType = typename BucketsTable::PackedTagType;
+    using Filter = CuckooFilter<Config>;
+    using TagType = typename Filter::TagType;
+    using PackedTagType = typename Filter::PackedTagType;
+
     constexpr size_t bitsPerTag = Config::bitsPerTag;
     constexpr TagType fpMask = (1ULL << bitsPerTag) - 1;
 
@@ -627,22 +626,21 @@ __global__ void insertKernelSorted(
     size_t primaryBucket = packedTag >> bitsPerTag;
     auto fp = static_cast<TagType>(packedTag & fpMask);
 
-    size_t secondaryBucket = BucketsTable::getAlternateBucket(
-        primaryBucket, fp, tableView.numBuckets
-    );
+    size_t secondaryBucket =
+        Filter::getAlternateBucket(primaryBucket, fp, view.numBuckets);
 
     bool success = false;
-    if (tableView.tryInsertAtBucket(primaryBucket, fp) ||
-        tableView.tryInsertAtBucket(secondaryBucket, fp)) {
+    if (view.tryInsertAtBucket(primaryBucket, fp) ||
+        view.tryInsertAtBucket(secondaryBucket, fp)) {
         success = true;
     } else {
         auto startBucket = (fp & 1) == 0 ? primaryBucket : secondaryBucket;
-        success = tableView.insertWithEviction(fp, startBucket);
+        success = view.insertWithEviction(fp, startBucket);
     }
 
     int tileSum = cg::reduce(tile, static_cast<int>(success), cg::plus<int>());
 
     if (tile.thread_rank() == 0 && tileSum > 0) {
-        tableView.d_numOccupied->fetch_add(tileSum, cuda::memory_order_relaxed);
+        view.d_numOccupied->fetch_add(tileSum, cuda::memory_order_relaxed);
     }
 }

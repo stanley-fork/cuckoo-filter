@@ -50,7 +50,7 @@ if get_option('BUILD_BENCHMARKS') == true
     benchmark_main_dep = dependency('benchmark_main', required: true)
 
     executable(
-        'benchmark-cuckoo-vs-cuco',
+        'benchmark-cuckoo-vs-bloom',
         './benchmark/cuckoo_vs_bloom.cu',
         dependencies: [benchmark_dep, benchmark_main_dep, cuco_dep],
         include_directories: includes,

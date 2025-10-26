@@ -1,4 +1,4 @@
-#include <BucketsTableGpu.cuh>
+#include <CuckooFilter.cuh>
 #include <chrono>
 #include <cstdint>
 #include <ctime>
@@ -14,7 +14,7 @@ constexpr double TARGET_LOAD_FACTOR = 0.95;
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " <table_type> " << std::endl;
+        std::cerr << "Usage: " << argv[0] << " <n_exponent> " << std::endl;
         std::cerr << "n_exponent: exponent for n = 2^x" << std::endl;
         return 1;
     }
@@ -38,11 +38,11 @@ int main(int argc, char** argv) {
     thrust::device_vector<uint8_t> d_output(n);
 
     using Config = CuckooConfig<uint32_t, 16, 500, 128, 128>;
-    auto table = BucketsTableGpu<Config>(n, TARGET_LOAD_FACTOR);
+    auto filter = CuckooFilter<Config>(n, TARGET_LOAD_FACTOR);
 
     auto start = std::chrono::high_resolution_clock::now();
-    size_t count = table.insertMany(d_input);
-    table.containsMany(d_input, d_output);
+    size_t count = filter.insertMany(d_input);
+    filter.containsMany(d_input, d_output);
     auto end = std::chrono::high_resolution_clock::now();
     auto duration =
         std::chrono::duration_cast<std::chrono::milliseconds>(end - start)
@@ -54,5 +54,5 @@ int main(int argc, char** argv) {
     size_t found = countOnes(reinterpret_cast<bool*>(output.data()), n);
     std::cout << "Inserted " << count << " / " << n << " items, found " << found
               << " items in " << duration << " ms"
-              << " (load factor = " << table.loadFactor() << ")" << std::endl;
+              << " (load factor = " << filter.loadFactor() << ")" << std::endl;
 }

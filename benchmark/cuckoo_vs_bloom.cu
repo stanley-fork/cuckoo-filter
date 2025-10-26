@@ -2,7 +2,7 @@
 #include <cuda_runtime_api.h>
 #include <thrust/device_vector.h>
 #include <thrust/host_vector.h>
-#include <BucketsTableGpu.cuh>
+#include <CuckooFilter.cuh>
 #include <cuco/bloom_filter.cuh>
 #include <cuco/utility/cuda_thread_scope.cuh>
 #include <cuda/std/cstdint>
@@ -23,7 +23,7 @@ constexpr double cuckooBitsPerItem() {
             conditional<Config::bitsPerTag <= 16, uint16_t, uint32_t>::type>::
         type;
 
-    constexpr size_t bucketSize = BucketsTableGpu<Config>::bucketSize;
+    constexpr size_t bucketSize = CuckooFilter<Config>::bucketSize;
     constexpr size_t bytesPerBucket = bucketSize * sizeof(TagType);
     constexpr size_t bitsPerBucket = bytesPerBucket * 8;
 
@@ -57,16 +57,16 @@ static void BM_CuckooFilter_Insert(bm::State& state) {
     mem.snapshotBefore();
 
     thrust::device_vector<uint32_t> d_keys(keys.begin(), keys.end());
-    BucketsTableGpu<Config> table(n, TARGET_LOAD_FACTOR);
+    CuckooFilter<Config> filter(n, TARGET_LOAD_FACTOR);
 
     mem.snapshotAfter();
 
     for (auto _ : state) {
         state.PauseTiming();
-        table.clear();
+        filter.clear();
         state.ResumeTiming();
 
-        size_t inserted = table.insertMany(d_keys);
+        size_t inserted = filter.insertMany(d_keys);
         cudaDeviceSynchronize();
         bm::DoNotOptimize(inserted);
     }
@@ -78,7 +78,7 @@ static void BM_CuckooFilter_Insert(bm::State& state) {
         bm::Counter::kIs1024
     );
     state.counters["bytes_per_item"] = bm::Counter(
-        static_cast<double>(mem.used()) / static_cast<double>(table.capacity()),
+        static_cast<double>(mem.used()) / static_cast<double>(filter.capacity()),
         bm::Counter::kDefaults,
         bm::Counter::kIs1024
     );
@@ -89,17 +89,17 @@ static void BM_CuckooFilter_Query(bm::State& state) {
 
     MemoryUsage mem{};
     mem.snapshotBefore();
-    BucketsTableGpu<Config> table(n, TARGET_LOAD_FACTOR);
+    CuckooFilter<Config> filter(n, TARGET_LOAD_FACTOR);
 
     auto keys = generateKeys<uint32_t>(n);
     thrust::device_vector<uint32_t> d_keys(keys.begin(), keys.end());
     thrust::device_vector<uint8_t> d_output(n);
 
-    table.insertMany(d_keys);
+    filter.insertMany(d_keys);
     mem.snapshotAfter();
 
     for (auto _ : state) {
-        table.containsMany(d_keys, d_output);
+        filter.containsMany(d_keys, d_output);
         cudaDeviceSynchronize();
         bm::DoNotOptimize(d_output.data().get());
     }
@@ -111,7 +111,7 @@ static void BM_CuckooFilter_Query(bm::State& state) {
         bm::Counter::kIs1024
     );
     state.counters["bytes_per_item"] = bm::Counter(
-        static_cast<double>(mem.used()) / static_cast<double>(table.capacity()),
+        static_cast<double>(mem.used()) / static_cast<double>(filter.capacity()),
         bm::Counter::kDefaults,
         bm::Counter::kIs1024
     );
@@ -218,16 +218,16 @@ static void BM_CuckooFilter_InsertAndQuery(bm::State& state) {
 
     MemoryUsage mem{};
     mem.snapshotBefore();
-    BucketsTableGpu<Config> table(n, TARGET_LOAD_FACTOR);
+    CuckooFilter<Config> filter(n, TARGET_LOAD_FACTOR);
     mem.snapshotAfter();
 
     for (auto _ : state) {
         state.PauseTiming();
-        table.clear();
+        filter.clear();
         state.ResumeTiming();
 
-        size_t inserted = table.insertMany(d_keys);
-        table.containsMany(d_keys, d_output);
+        size_t inserted = filter.insertMany(d_keys);
+        filter.containsMany(d_keys, d_output);
 
         cudaDeviceSynchronize();
 
@@ -242,7 +242,7 @@ static void BM_CuckooFilter_InsertAndQuery(bm::State& state) {
         bm::Counter::kIs1024
     );
     state.counters["bytes_per_item"] = bm::Counter(
-        static_cast<double>(mem.used()) / static_cast<double>(table.capacity()),
+        static_cast<double>(mem.used()) / static_cast<double>(filter.capacity()),
         bm::Counter::kDefaults,
         bm::Counter::kIs1024
     );
@@ -303,27 +303,27 @@ static void BM_BloomFilter_InsertAndQuery(bm::State& state) {
 }
 
 BENCHMARK(BM_CuckooFilter_Insert)
-    ->Range(1 << 16, 1 << 20)
+    ->Range(1 << 16, 1 << 28)
     ->Unit(bm::kMillisecond);
 
 BENCHMARK(BM_BloomFilter_Insert)
-    ->Range(1 << 16, 1 << 20)
+    ->Range(1 << 16, 1 << 28)
     ->Unit(bm::kMillisecond);
 
 BENCHMARK(BM_CuckooFilter_Query)
-    ->Range(1 << 16, 1 << 20)
+    ->Range(1 << 16, 1 << 28)
     ->Unit(bm::kMillisecond);
 
 BENCHMARK(BM_BloomFilter_Query)
-    ->Range(1 << 16, 1 << 20)
+    ->Range(1 << 16, 1 << 28)
     ->Unit(bm::kMillisecond);
 
 BENCHMARK(BM_CuckooFilter_InsertAndQuery)
-    ->Range(1 << 16, 1 << 20)
+    ->Range(1 << 16, 1 << 28)
     ->Unit(bm::kMillisecond);
 
 BENCHMARK(BM_BloomFilter_InsertAndQuery)
-    ->Range(1 << 16, 1 << 20)
+    ->Range(1 << 16, 1 << 28)
     ->Unit(bm::kMillisecond);
 
 BENCHMARK_MAIN();
