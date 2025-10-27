@@ -167,13 +167,56 @@ class CuckooFilter {
     static constexpr TagType EMPTY = 0;
     static constexpr size_t tagMask = (1ULL << bitsPerTag) - 1;
 
+    using PackedAtomicSize = uint32_t;
+
     struct Bucket {
-        cuda::std::atomic<TagType> tags[bucketSize];
+        static_assert(
+            powerOfTwo(bitsPerTag),
+            "bitsPerTag must be a power of 2"
+        );
+        static constexpr size_t tagsPerAtomic =
+            sizeof(PackedAtomicSize) / sizeof(TagType);
+        static_assert(tagsPerAtomic >= 1, "TagType must fit in AtomicType");
+        static_assert(
+            bucketSize % tagsPerAtomic == 0,
+            "bucketSize must be divisible by tagsPerAtomic"
+        );
+
+        static constexpr size_t atomicCount = bucketSize / tagsPerAtomic;
+
+        cuda::std::atomic<PackedAtomicSize> packedTags[atomicCount];
+
+        __device__ TagType
+        extractTag(PackedAtomicSize packed, size_t tagIdx) const {
+            size_t shift = tagIdx * bitsPerTag;
+            PackedAtomicSize mask = (1U << bitsPerTag) - 1;
+            return static_cast<TagType>((packed >> shift) & mask);
+        }
+
+        __device__ PackedAtomicSize replaceTag(
+            PackedAtomicSize packed,
+            size_t tagIdx,
+            TagType newTag
+        ) const {
+            size_t shift = tagIdx * bitsPerTag;
+            PackedAtomicSize mask = (1U << bitsPerTag) - 1;
+            PackedAtomicSize cleared = packed & ~(mask << shift);
+            return cleared |
+                   ((static_cast<PackedAtomicSize>(newTag) & mask) << shift);
+        }
+
+        __device__ TagType getTagAt(size_t slot) const {
+            size_t atomicIdx = slot / tagsPerAtomic;
+            size_t tagIdx = slot & (tagsPerAtomic - 1);
+            PackedAtomicSize packed =
+                packedTags[atomicIdx].load(cuda::memory_order_relaxed);
+            return extractTag(packed, tagIdx);
+        }
 
         __forceinline__ __device__ int findSlot(TagType tag, TagType target) {
             uint32_t idx = tag & (bucketSize - 1);
             for (size_t i = 0; i < bucketSize; ++i) {
-                TagType current = tags[idx].load(cuda::memory_order_relaxed);
+                TagType current = getTagAt(idx);
                 if (current == target) {
                     return static_cast<int>(idx);
                 }
@@ -187,27 +230,53 @@ class CuckooFilter {
         }
 
         __device__ bool tryInsertAt(size_t slot, TagType tag) {
-            TagType expected = EMPTY;
-            return tags[slot].compare_exchange_strong(
+            size_t atomicIdx = slot / tagsPerAtomic;
+            size_t tagIdx = slot & (tagsPerAtomic - 1);
+
+            PackedAtomicSize expected =
+                packedTags[atomicIdx].load(cuda::memory_order_relaxed);
+            PackedAtomicSize desired;
+
+            do {
+                TagType currentTag = extractTag(expected, tagIdx);
+                if (currentTag != EMPTY) {
+                    return false;
+                }
+
+                desired = replaceTag(expected, tagIdx, tag);
+            } while (!packedTags[atomicIdx].compare_exchange_weak(
                 expected,
-                tag,
+                desired,
                 cuda::memory_order_relaxed,
                 cuda::memory_order_relaxed
-            );
+            ));
+
+            return true;
         }
 
         __device__ bool tryRemoveAt(size_t slot, TagType tag) {
-            TagType expected = tag;
-            return tags[slot].compare_exchange_strong(
+            size_t atomicIdx = slot / tagsPerAtomic;
+            size_t tagIdx = slot & (tagsPerAtomic - 1);
+
+            PackedAtomicSize expected =
+                packedTags[atomicIdx].load(cuda::memory_order_relaxed);
+            PackedAtomicSize desired;
+
+            do {
+                TagType currentTag = extractTag(expected, tagIdx);
+                if (currentTag != tag) {
+                    return false;
+                }
+
+                desired = replaceTag(expected, tagIdx, EMPTY);
+            } while (!packedTags[atomicIdx].compare_exchange_weak(
                 expected,
-                EMPTY,
+                desired,
                 cuda::memory_order_relaxed,
                 cuda::memory_order_relaxed
-            );
-        }
+            ));
 
-        __device__ TagType getTagAt(size_t slot) const {
-            return tags[slot].load(cuda::memory_order_relaxed);
+            return true;
         }
     };
 
@@ -595,10 +664,25 @@ class CuckooFilter {
 
                 auto evictSlot = (currentFp + evictions) & (bucketSize - 1);
 
-                TagType evictedFp =
-                    d_buckets[currentBucket].tags[evictSlot].exchange(
-                        currentFp, cuda::memory_order_relaxed
-                    );
+                size_t atomicIdx = evictSlot / Bucket::tagsPerAtomic;
+                size_t tagIdx = evictSlot & (Bucket::tagsPerAtomic - 1);
+
+                Bucket& bucket = d_buckets[currentBucket];
+                PackedAtomicSize expected = bucket.packedTags[atomicIdx].load(
+                    cuda::memory_order_relaxed
+                );
+                PackedAtomicSize desired;
+                TagType evictedFp;
+
+                do {
+                    evictedFp = bucket.extractTag(expected, tagIdx);
+                    desired = bucket.replaceTag(expected, tagIdx, currentFp);
+                } while (!bucket.packedTags[atomicIdx].compare_exchange_weak(
+                    expected,
+                    desired,
+                    cuda::memory_order_relaxed,
+                    cuda::memory_order_relaxed
+                ));
 
                 currentFp = evictedFp;
                 currentBucket = CuckooFilter::getAlternateBucket(

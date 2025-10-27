@@ -49,3 +49,21 @@ size_t countOnes(T* data, size_t n) {
         printf("%s:%d %s\n", __FILE__, __LINE__, cudaGetErrorString(err_)); \
         exit(err_);                                                         \
     } while (0)
+
+template <typename Kernel>
+constexpr auto maxOccupancyGridSize(int32_t blockSize, Kernel kernel) {
+    int device = 0;
+    cudaGetDevice(&device);
+
+    int num_multiprocessors = -1;
+    cudaDeviceGetAttribute(
+        &num_multiprocessors, cudaDevAttrMultiProcessorCount, device
+    );
+
+    int max_active_blocks_per_multiprocessor{};
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &max_active_blocks_per_multiprocessor, kernel, blockSize, 0
+    );
+
+    return max_active_blocks_per_multiprocessor * num_multiprocessors;
+}
