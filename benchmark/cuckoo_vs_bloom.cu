@@ -3,6 +3,9 @@
 #include <cuda_runtime_api.h>
 #include <thrust/device_vector.h>
 #include <thrust/host_vector.h>
+#include <thrust/random.h>
+#include <thrust/transform.h>
+#include <thrust/iterator/counting_iterator.h>
 #include <CuckooFilter.cuh>
 #include <cuco/bloom_filter.cuh>
 #include <cuco/utility/cuda_thread_scope.cuh>
@@ -15,14 +18,22 @@ namespace bm = benchmark;
 constexpr double TARGET_LOAD_FACTOR = 0.95;
 using Config = CuckooConfig<uint32_t, 16, 500, 128, 128>;
 
-template <typename T>
-std::vector<T> generateKeys(size_t n, unsigned seed = 42) {
-    std::vector<T> keys(n);
-    std::mt19937 rng(seed);
-    std::uniform_int_distribution<T> dist(1, std::numeric_limits<T>::max());
-    std::generate(keys.begin(), keys.end(), [&]() { return dist(rng); });
 
-    return keys;
+// Generate random keys on GPU
+template <typename T>
+void generateKeysGPU(thrust::device_vector<T>& d_keys, unsigned seed = 42) {
+    size_t n = d_keys.size();
+    thrust::transform(
+        thrust::counting_iterator<size_t>(0),
+        thrust::counting_iterator<size_t>(n),
+        d_keys.begin(),
+        [seed] __device__ (size_t idx) {
+            thrust::default_random_engine rng(seed);
+            thrust::uniform_int_distribution<T> dist(1, std::numeric_limits<T>::max());
+            rng.discard(idx);
+            return dist(rng);
+        }
+    );
 }
 
 template <typename Filter, size_t bitsPerTag>
@@ -35,8 +46,8 @@ size_t cucoNumBlocks(size_t n) {
 static void BM_CuckooFilter_Insert(bm::State& state) {
     const size_t n = state.range(0) * TARGET_LOAD_FACTOR;
 
-    auto keys = generateKeys<uint32_t>(n);
-    thrust::device_vector<uint32_t> d_keys(keys.begin(), keys.end());
+    thrust::device_vector<uint32_t> d_keys(n);
+    generateKeysGPU(d_keys);
     CuckooFilter<Config> filter(n, TARGET_LOAD_FACTOR);
 
     size_t filterMemory = filter.sizeInBytes();
@@ -68,9 +79,9 @@ static void BM_CuckooFilter_Insert(bm::State& state) {
 static void BM_CuckooFilter_Query(bm::State& state) {
     const size_t n = state.range(0) * TARGET_LOAD_FACTOR;
 
-    auto keys = generateKeys<uint32_t>(n);
+    thrust::device_vector<uint32_t> d_keys(n);
+    generateKeysGPU(d_keys);
     CuckooFilter<Config> filter(n, TARGET_LOAD_FACTOR);
-    thrust::device_vector<uint32_t> d_keys(keys.begin(), keys.end());
     thrust::device_vector<uint8_t> d_output(n);
 
     filter.insertMany(d_keys);
@@ -100,9 +111,9 @@ static void BM_CuckooFilter_Query(bm::State& state) {
 static void BM_CuckooFilter_Delete(bm::State& state) {
     const size_t n = state.range(0) * TARGET_LOAD_FACTOR;
 
-    auto keys = generateKeys<uint32_t>(n);
+    thrust::device_vector<uint32_t> d_keys(n);
+    generateKeysGPU(d_keys);
     CuckooFilter<Config> filter(n, TARGET_LOAD_FACTOR);
-    thrust::device_vector<uint32_t> d_keys(keys.begin(), keys.end());
     thrust::device_vector<uint8_t> d_output(n);
 
     size_t filterMemory = filter.sizeInBytes();
@@ -142,8 +153,8 @@ static void BM_BloomFilter_Insert(bm::State& state) {
 
     const size_t numBlocks = cucoNumBlocks<BloomFilter, bitsPerTag>(n);
 
-    auto keys = generateKeys<uint32_t>(n);
-    thrust::device_vector<uint32_t> d_keys(keys.begin(), keys.end());
+    thrust::device_vector<uint32_t> d_keys(n);
+    generateKeysGPU(d_keys);
     BloomFilter filter(
         cuco::extent{numBlocks},
         cuco::cuda_thread_scope<cuda::thread_scope_device>{}
@@ -183,13 +194,13 @@ static void BM_BloomFilter_Query(bm::State& state) {
 
     const size_t numBlocks = cucoNumBlocks<BloomFilter, bitsPerTag>(n);
 
-    auto keys = generateKeys<uint32_t>(n);
+    thrust::device_vector<uint32_t> d_keys(n);
+    generateKeysGPU(d_keys);
     BloomFilter filter(
         cuco::extent{numBlocks},
         cuco::cuda_thread_scope<cuda::thread_scope_device>{}
     );
 
-    thrust::device_vector<uint32_t> d_keys(keys.begin(), keys.end());
     thrust::device_vector<uint8_t> d_output(n);
 
     filter.add(d_keys.begin(), d_keys.end());
@@ -221,10 +232,10 @@ static void BM_BloomFilter_Query(bm::State& state) {
 }
 
 static void BM_CuckooFilter_InsertAndQuery(bm::State& state) {
-    const size_t n = state.range(0) * TARGET_LOAD_FACTOR;
+    const size_t n = state.range(0);
 
-    auto keys = generateKeys<uint32_t>(n);
-    thrust::device_vector<uint32_t> d_keys(keys.begin(), keys.end());
+    thrust::device_vector<uint32_t> d_keys(n);
+    generateKeysGPU(d_keys);
     thrust::device_vector<uint8_t> d_output(n);
     CuckooFilter<Config> filter(n, TARGET_LOAD_FACTOR);
 
@@ -261,8 +272,8 @@ static void BM_CuckooFilter_InsertAndQuery(bm::State& state) {
 static void BM_CuckooFilter_InsertQueryDelete(bm::State& state) {
     const size_t n = state.range(0) * TARGET_LOAD_FACTOR;
 
-    auto keys = generateKeys<uint32_t>(n);
-    thrust::device_vector<uint32_t> d_keys(keys.begin(), keys.end());
+    thrust::device_vector<uint32_t> d_keys(n);
+    generateKeysGPU(d_keys);
     thrust::device_vector<uint8_t> d_output(n);
     CuckooFilter<Config> filter(n, TARGET_LOAD_FACTOR);
 
@@ -306,8 +317,8 @@ static void BM_BloomFilter_InsertAndQuery(bm::State& state) {
     using BloomFilter = cuco::bloom_filter<uint32_t>;
     const size_t numBlocks = cucoNumBlocks<BloomFilter, bitsPerTag>(n);
 
-    auto keys = generateKeys<uint32_t>(n);
-    thrust::device_vector<uint32_t> d_keys(keys.begin(), keys.end());
+    thrust::device_vector<uint32_t> d_keys(n);
+    generateKeysGPU(d_keys);
     thrust::device_vector<uint8_t> d_output(n);
 
     BloomFilter filter(

@@ -1,4 +1,7 @@
 #include <thrust/device_vector.h>
+#include <thrust/random.h>
+#include <thrust/transform.h>
+#include <thrust/iterator/counting_iterator.h>
 #include <chrono>
 #include <cstdint>
 #include <ctime>
@@ -28,14 +31,21 @@ int main(int argc, char** argv) {
 
     size_t n = (UINT64_C(1) << n_exponent) * TARGET_LOAD_FACTOR;
 
-    std::mt19937 rng(std::random_device{}());
-    std::uniform_int_distribution<uint32_t> dist(1, UINT32_MAX);
-
-    std::vector<uint32_t> input(n);
-    std::generate(input.begin(), input.end(), [&]() { return dist(rng); });
-
-    thrust::device_vector<uint32_t> d_input(input.begin(), input.end());
+    thrust::device_vector<uint32_t> d_input(n);
     thrust::device_vector<uint8_t> d_output(n);
+
+    unsigned int seed = std::random_device{}();
+    thrust::transform(
+        thrust::counting_iterator<size_t>(0),
+        thrust::counting_iterator<size_t>(n),
+        d_input.begin(),
+        [seed] __device__ (size_t idx) {
+            thrust::default_random_engine rng(seed);
+            thrust::uniform_int_distribution<uint32_t> dist(1, UINT32_MAX);
+            rng.discard(idx);
+            return dist(rng);
+        }
+    );
 
     using Config = CuckooConfig<uint32_t, 16, 500, 256, 128>;
     auto filter = CuckooFilter<Config>(n, TARGET_LOAD_FACTOR);
@@ -87,5 +97,5 @@ int main(int argc, char** argv) {
     size_t stillFound =
         countOnes(reinterpret_cast<bool*>(deleteOutput.data()), deleteCount);
     std::cout << "After deletion, " << stillFound << " / " << deleteCount
-              << " deleted items still found (false positives)" << std::endl;
+              << " deleted items still found (false negatives)" << std::endl;
 }
