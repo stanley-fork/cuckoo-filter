@@ -155,11 +155,9 @@ class CuckooFilter {
     static constexpr TagType EMPTY = 0;
     static constexpr size_t fpMask = (1ULL << bitsPerTag) - 1;
 
-    using PackedAtomicSize = uint32_t;
-
     struct Bucket {
         static_assert(powerOfTwo(bitsPerTag), "bitsPerTag must be a power of 2");
-        static constexpr size_t tagsPerAtomic = sizeof(PackedAtomicSize) / sizeof(TagType);
+        static constexpr size_t tagsPerAtomic = sizeof(uint32_t) / sizeof(TagType);
         static_assert(tagsPerAtomic >= 1, "TagType must fit in AtomicType");
         static_assert(
             bucketSize % tagsPerAtomic == 0,
@@ -170,16 +168,15 @@ class CuckooFilter {
         static constexpr size_t atomicCount = bucketSize / tagsPerAtomic;
         static_assert(powerOfTwo(atomicCount), "atomicCount must be a power of 2");
 
-        cuda::std::atomic<PackedAtomicSize> packedTags[atomicCount];
+        cuda::std::atomic<uint32_t> packedTags[atomicCount];
 
-        __device__ TagType extractTag(PackedAtomicSize packed, size_t tagIdx) const {
+        __device__ TagType extractTag(uint32_t packed, size_t tagIdx) const {
             return static_cast<TagType>((packed >> (tagIdx * bitsPerTag)) & fpMask);
         }
 
-        __device__ PackedAtomicSize
-        replaceTag(PackedAtomicSize packed, size_t tagIdx, TagType newTag) const {
+        __device__ uint32_t replaceTag(uint32_t packed, size_t tagIdx, TagType newTag) const {
             size_t shift = tagIdx * bitsPerTag;
-            PackedAtomicSize cleared = packed & ~(fpMask << shift);
+            uint32_t cleared = packed & ~(fpMask << shift);
             return cleared | (newTag << shift);
         }
 
@@ -188,31 +185,50 @@ class CuckooFilter {
             size_t startAtomicIdx = startIdx / tagsPerAtomic;
             size_t startTagIdx = startIdx & (tagsPerAtomic - 1);
 
-            for (size_t i = 0; i < atomicCount; ++i) {
-                size_t atomicIdx = (startAtomicIdx + i) & (atomicCount - 1);
-                auto packed = packedTags[atomicIdx].load(cuda::memory_order_relaxed);
+            for (size_t i = 0; i < atomicCount; i += 4) {
+                size_t baseIdx = (startAtomicIdx + i) & (atomicCount - 1);
 
-                size_t jStart, jEnd;
-                if (i == 0) {
-                    // First iteration: start at startTagIdx, go to end
-                    jStart = startTagIdx;
-                    jEnd = tagsPerAtomic;
-                } else if (atomicIdx != startAtomicIdx) {
-                    // Other atomic words: check all tags
-                    jStart = 0;
-                    jEnd = tagsPerAtomic;
+                // use vectorised load if properly aligned and size permits
+                uint32_t loaded[4];
+                if (baseIdx % 4 == 0 && baseIdx + 4 <= atomicCount) {
+                    uint4 vec = __ldg(reinterpret_cast<const uint4*>(&packedTags[baseIdx]));
+                    loaded[0] = vec.x;
+                    loaded[1] = vec.y;
+                    loaded[2] = vec.z;
+                    loaded[3] = vec.w;
                 } else {
-                    // Wrapped back to the starting atomic word: check from 0 to startTagIdx
-                    jStart = 0;
-                    jEnd = startTagIdx;
-                    if (jEnd == 0) {
-                        continue;
+                    for (size_t k = 0; k < 4; ++k) {
+                        size_t idx = (baseIdx + k) & (atomicCount - 1);
+                        loaded[k] = __ldg(reinterpret_cast<const uint32_t*>(&packedTags[idx]));
                     }
                 }
 
-                for (size_t j = jStart; j < jEnd; ++j) {
-                    if (extractTag(packed, j) == target) {
-                        return static_cast<int>(atomicIdx * tagsPerAtomic + j);
+                for (size_t k = 0; k < 4 && (i + k) < atomicCount; ++k) {
+                    size_t atomicIdx = (baseIdx + k) & (atomicCount - 1);
+                    auto packed = loaded[k];
+
+                    size_t jStart, jEnd;
+                    if (i + k == 0) {
+                        // First iteration: start at startTagIdx, go to end
+                        jStart = startTagIdx;
+                        jEnd = tagsPerAtomic;
+                    } else if (atomicIdx != startAtomicIdx) {
+                        // Other atomic words: check all tags
+                        jStart = 0;
+                        jEnd = tagsPerAtomic;
+                    } else {
+                        // Wrapped back to the starting atomic word: check from 0 to startTagIdx
+                        jStart = 0;
+                        jEnd = startTagIdx;
+                        if (jEnd == 0) {
+                            continue;
+                        }
+                    }
+
+                    for (size_t j = jStart; j < jEnd; ++j) {
+                        if (extractTag(packed, j) == target) {
+                            return static_cast<int>(atomicIdx * tagsPerAtomic + j);
+                        }
                     }
                 }
             }
@@ -643,7 +659,7 @@ class CuckooFilter {
 
                 Bucket& bucket = d_buckets[currentBucket];
                 auto expected = bucket.packedTags[atomicIdx].load(cuda::memory_order_relaxed);
-                PackedAtomicSize desired;
+                uint32_t desired;
                 TagType evictedFp;
 
                 do {
