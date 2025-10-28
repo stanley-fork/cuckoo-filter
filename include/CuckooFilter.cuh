@@ -157,8 +157,7 @@ class CuckooFilter {
 
     struct Bucket {
         static_assert(powerOfTwo(bitsPerTag), "bitsPerTag must be a power of 2");
-        static constexpr size_t tagsPerAtomic = sizeof(uint32_t) / sizeof(TagType);
-        static_assert(tagsPerAtomic >= 1, "TagType must fit in AtomicType");
+        static constexpr size_t tagsPerAtomic = sizeof(uint64_t) / sizeof(TagType);
         static_assert(
             bucketSize % tagsPerAtomic == 0,
             "bucketSize must be divisible by tagsPerAtomic"
@@ -168,16 +167,16 @@ class CuckooFilter {
         static constexpr size_t atomicCount = bucketSize / tagsPerAtomic;
         static_assert(powerOfTwo(atomicCount), "atomicCount must be a power of 2");
 
-        cuda::std::atomic<uint32_t> packedTags[atomicCount];
+        cuda::std::atomic<uint64_t> packedTags[atomicCount];
 
-        __device__ TagType extractTag(uint32_t packed, size_t tagIdx) const {
+        __device__ TagType extractTag(uint64_t packed, size_t tagIdx) const {
             return static_cast<TagType>((packed >> (tagIdx * bitsPerTag)) & fpMask);
         }
 
-        __device__ uint32_t replaceTag(uint32_t packed, size_t tagIdx, TagType newTag) const {
+        __device__ uint64_t replaceTag(uint64_t packed, size_t tagIdx, TagType newTag) const {
             size_t shift = tagIdx * bitsPerTag;
-            uint32_t cleared = packed & ~(fpMask << shift);
-            return cleared | (newTag << shift);
+            uint64_t cleared = packed & ~(static_cast<uint64_t>(fpMask) << shift);
+            return cleared | (static_cast<uint64_t>(newTag) << shift);
         }
 
         __forceinline__ __device__ int findSlot(TagType tag, TagType target) {
@@ -185,25 +184,23 @@ class CuckooFilter {
             size_t startAtomicIdx = startIdx / tagsPerAtomic;
             size_t startTagIdx = startIdx & (tagsPerAtomic - 1);
 
-            for (size_t i = 0; i < atomicCount; i += 4) {
+            for (size_t i = 0; i < atomicCount; i += 2) {
                 size_t baseIdx = (startAtomicIdx + i) & (atomicCount - 1);
 
                 // use vectorised load if properly aligned and size permits
-                uint32_t loaded[4];
-                if (baseIdx % 4 == 0 && baseIdx + 4 <= atomicCount) {
-                    uint4 vec = __ldg(reinterpret_cast<const uint4*>(&packedTags[baseIdx]));
+                uint64_t loaded[2];
+                if (baseIdx % 2 == 0 && baseIdx + 2 <= atomicCount) {
+                    auto vec = __ldg(reinterpret_cast<const ulonglong2*>(&packedTags[baseIdx]));
                     loaded[0] = vec.x;
                     loaded[1] = vec.y;
-                    loaded[2] = vec.z;
-                    loaded[3] = vec.w;
                 } else {
-                    for (size_t k = 0; k < 4; ++k) {
+                    for (size_t k = 0; k < 2; ++k) {
                         size_t idx = (baseIdx + k) & (atomicCount - 1);
-                        loaded[k] = __ldg(reinterpret_cast<const uint32_t*>(&packedTags[idx]));
+                        loaded[k] = __ldg(reinterpret_cast<const uint64_t*>(&packedTags[idx]));
                     }
                 }
 
-                for (size_t k = 0; k < 4 && (i + k) < atomicCount; ++k) {
+                for (size_t k = 0; k < 2 && (i + k) < atomicCount; ++k) {
                     size_t atomicIdx = (baseIdx + k) & (atomicCount - 1);
                     auto packed = loaded[k];
 
@@ -659,7 +656,7 @@ class CuckooFilter {
 
                 Bucket& bucket = d_buckets[currentBucket];
                 auto expected = bucket.packedTags[atomicIdx].load(cuda::memory_order_relaxed);
-                uint32_t desired;
+                uint64_t desired;
                 TagType evictedFp;
 
                 do {
