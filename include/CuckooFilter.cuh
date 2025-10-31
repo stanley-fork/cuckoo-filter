@@ -22,13 +22,13 @@ template <
     size_t bitsPerTag_,
     size_t maxEvictions_,
     size_t blockSize_,
-    size_t maxBucketBytes_>
+    size_t bucketSize_>
 struct CuckooConfig {
     using KeyType = T;
     static constexpr size_t bitsPerTag = bitsPerTag_;
     static constexpr size_t maxEvictions = maxEvictions_;
     static constexpr size_t blockSize = blockSize_;
-    static constexpr size_t maxBucketBytes = maxBucketBytes_;
+    static constexpr size_t bucketSize = bucketSize_;
 };
 
 template <typename Config>
@@ -85,8 +85,7 @@ class CuckooFilter {
         typename std::conditional<bitsPerTag <= 16, uint16_t, uint32_t>::type>::type;
 
     static constexpr size_t tagEntryBytes = sizeof(TagType);
-
-    static constexpr size_t maxEntriesByBytes = (Config::maxBucketBytes) / tagEntryBytes;
+    static constexpr size_t bucketSize = Config::bucketSize;
 
     static constexpr size_t maxEvictions = Config::maxEvictions;
     static constexpr size_t blockSize = Config::blockSize;
@@ -96,14 +95,6 @@ class CuckooFilter {
         bitsPerTag <= 8 * sizeof(T),
         "The tag cannot be larger than the size of the type"
     );
-
-    static constexpr size_t bucketSize = []() constexpr {
-        size_t v = 1;
-        while ((v << 1) <= maxEntriesByBytes) {
-            v <<= 1;
-        }
-        return v;
-    }();
 
     static_assert(bucketSize > 0, "Bucket size must be greater than 0");
     static_assert(powerOfTwo(bucketSize), "Bucket size must be a power of 2");
