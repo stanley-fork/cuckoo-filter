@@ -14,7 +14,7 @@
 namespace bm = benchmark;
 
 constexpr double TARGET_LOAD_FACTOR = 0.95;
-using GPUConfig = CuckooConfig<uint32_t, 16, 500, 128, 128>;
+using GPUConfig = CuckooConfig<uint32_t, 16, 500, 128, 16>;
 constexpr size_t CPU_BITS_PER_ITEM = GPUConfig::bitsPerTag;
 
 template <typename T>
@@ -338,7 +338,7 @@ static void BM_CPU_CuckooFilter_InsertQueryDelete(bm::State& state) {
 static void BM_GPU_CuckooFilter_FalsePositiveRate(bm::State& state) {
     const size_t n = state.range(0) * TARGET_LOAD_FACTOR;
 
-    using FPRConfig = CuckooConfig<uint64_t, 16, 500, 128, 128>;
+    using FPRConfig = CuckooConfig<uint64_t, 16, 500, 128, 4>;
 
     thrust::device_vector<uint64_t> d_keys(n);
     generateKeysGPU<uint64_t>(d_keys, UINT32_MAX);
