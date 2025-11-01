@@ -191,7 +191,7 @@ class CuckooFilter {
                     }
                 }
 
-                for (size_t k = 0; k < 2 && (i + k) < atomicCount; ++k) {
+                for (size_t k = 0; k < 2; ++k) {
                     size_t atomicIdx = (baseIdx + k) & (atomicCount - 1);
                     auto packed = loaded[k];
 
@@ -638,6 +638,56 @@ class CuckooFilter {
             return false;
         }
 
+        __device__ bool insertWithEvictionBFS(TagType fp, size_t startBucket) {
+            constexpr size_t numCandidates = std::min(8UL, bucketSize / 2);
+
+            Bucket& bucket = d_buckets[startBucket];
+
+            for (size_t i = 0; i < numCandidates; ++i) {
+                size_t slot = (fp + i * 7) & (bucketSize - 1);
+                size_t atomicIdx = slot / Bucket::tagsPerAtomic;
+                size_t tagIdx = slot & (Bucket::tagsPerAtomic - 1);
+
+                auto packed = bucket.packedTags[atomicIdx].load(cuda::memory_order_relaxed);
+                TagType candidateFp = bucket.extractTag(packed, tagIdx);
+
+                if (candidateFp == EMPTY) {
+                    if (tryInsertAtBucket(startBucket, fp)) {
+                        return true;
+                    }
+                    continue;
+                }
+
+                size_t altBucket =
+                    CuckooFilter::getAlternateBucket(startBucket, candidateFp, numBuckets);
+                if (tryInsertAtBucket(altBucket, candidateFp)) {
+                    // Successfully inserted the evicted tag at its alternate location
+                    // Now atomically swap in our tag at the original location
+                    auto expected = bucket.packedTags[atomicIdx].load(cuda::memory_order_relaxed);
+
+                    // Verify the tag is still there and try to replace it
+                    if (bucket.extractTag(expected, tagIdx) == candidateFp) {
+                        auto desired = bucket.replaceTag(expected, tagIdx, fp);
+
+                        if (bucket.packedTags[atomicIdx].compare_exchange_weak(
+                                expected,
+                                desired,
+                                cuda::memory_order_relaxed,
+                                cuda::memory_order_relaxed
+                            )) {
+                            return true;
+                        }
+                    }
+
+                    // Failed to swap, clean up the tag we inserted to avoid duplicates
+                    tryRemoveAtBucket(altBucket, candidateFp);
+                }
+            }
+
+            // fall back to greedy DFS
+            return insertWithEviction(fp, startBucket);
+        }
+
         __device__ bool insert(const T& key) {
             auto [i1, i2, fp] = getCandidateBuckets(key, numBuckets);
 
@@ -647,7 +697,7 @@ class CuckooFilter {
 
             auto startBucket = (fp & 1) == 0 ? i1 : i2;
 
-            return insertWithEviction(fp, startBucket);
+            return insertWithEvictionBFS(fp, startBucket);
         }
 
         // FIXME: Somehow this isn't guaranteed to find all existing keys?
@@ -684,14 +734,18 @@ __global__ void insertKernel(
     auto idx = globalThreadId();
 
     int32_t success = 0;
+
     if (idx < n) {
         success = view.insert(keys[idx]);
     }
 
-    int32_t blockSum = BlockReduce(tempStorage).Sum(success);
+    int32_t blockSuccessSum = BlockReduce(tempStorage).Sum(success);
+    __syncthreads();
 
-    if (threadIdx.x == 0 && blockSum > 0) {
-        view.d_numOccupied->fetch_add(blockSum, cuda::memory_order_relaxed);
+    if (threadIdx.x == 0) {
+        if (blockSuccessSum > 0) {
+            view.d_numOccupied->fetch_add(blockSuccessSum, cuda::memory_order_relaxed);
+        }
     }
 }
 
