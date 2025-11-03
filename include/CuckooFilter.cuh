@@ -101,6 +101,13 @@ class CuckooFilter {
 
     using PackedTagType = uint64_t;
 
+    /**
+     * @brief This is used by the sorted insert kernel to store the fingerprint and primary bucket
+     * index in a compact format that allows you to sort them directly since the bucket index lives
+     * in the upper bits.
+     * FIXME: This should probably be optimised to not use 64 bits when possible
+     *
+     */
     struct PackedTag {
         PackedTagType value;
 
@@ -146,6 +153,18 @@ class CuckooFilter {
     static constexpr TagType EMPTY = 0;
     static constexpr size_t fpMask = (1ULL << bitsPerTag) - 1;
 
+    /**
+     * @brief Bucket structure that holds the fingerprint and tags for a given bucket.
+     * The bucket is divided into words of 64 bits each, where each word is made up of at least two
+     * fingerprints. How many depends on the fingerprint size specified by the user of the filter.
+     *
+     * This optimisation allows us to avoid having to perform atomic operations on every fingerprint
+     * in the bucket, the extra computational overhead is negligible.
+     *
+     * For efficiency reasons, the number of fingerprints per word is enforced to be a power of 2,
+     * same goes for the total number of fingerprints in the bucket.
+     *
+     */
     struct Bucket {
         static_assert(powerOfTwo(bitsPerTag), "bitsPerTag must be a power of 2");
         static constexpr size_t tagsPerWord = sizeof(uint64_t) / sizeof(TagType);
@@ -171,6 +190,14 @@ class CuckooFilter {
             return cleared | (static_cast<uint64_t>(newTag) << shift);
         }
 
+        /**
+         * @brief Finds the index of a tag in the bucket. Because we can guarantee that no threads
+         * will try to insert into the bucket while doing so, we can make use of non-atomic
+         * vectorised loads to speed up the search.
+         *
+         * @param tag Tag to search for
+         * @return Index of the tag in the bucket, or -1 if not found
+         */
         __forceinline__ __device__ int32_t findSlot(TagType tag) {
             const uint32_t startSlot = tag & (bucketSize - 1);
             const size_t startAtomicIdx = startSlot / tagsPerWord;
@@ -228,13 +255,27 @@ class CuckooFilter {
         return xxhash::xxhash64(key);
     }
 
+    /**
+     * @brief Performs partial-key cuckoo hashing to find the fingerprint and both
+     * bucket indices for a given key.
+     *
+     * We derive the fingerprint and bucket indices from different parts of the key's
+     * hash to greatly reduce the number of collisions. The fingerprint value 0 is reserved to
+     * indicate an empty slot, so we use 1 if the computed fingerprint is 0.
+     *
+     * @param key Key to hash
+     * @param numBuckets Number of buckets in the filter
+     * @return A tuple of (bucket1, bucket2, fingerprint)
+     */
     static __host__ __device__ cuda::std::tuple<size_t, size_t, TagType>
     getCandidateBuckets(const T& key, size_t numBuckets) {
         const uint64_t h = hash64(key);
 
         // Upper 32 bits for the fingerprint
         const uint32_t h_fp = h >> 32;
-        const TagType fp = static_cast<TagType>(h_fp & fpMask) + 1;
+        const uint32_t masked = h_fp & fpMask;
+
+        const auto fp = TagType(masked == 0 ? 1 : masked);
 
         // Lower 32 bits for the bucket indices
         const uint32_t h_bucket = h & 0xFFFFFFFF;
@@ -249,6 +290,10 @@ class CuckooFilter {
         return bucket ^ (hash64(fp) & (numBuckets - 1));
     }
 
+    /**
+     * @brief The number of buckets is enforced to be a power of two in order to allow for efficient
+     * modulo on the bucket indices
+     */
     static size_t calculateNumBuckets(size_t capacity) {
         auto requiredBuckets = std::ceil(static_cast<double>(capacity) / bucketSize);
 
@@ -312,6 +357,14 @@ class CuckooFilter {
         return h_numOccupied;
     }
 
+    /**
+     * @brief This pre-sorts the input keys based on the primary bucket index to allow for coalesced
+     * memory access when you later insert them into the filter.
+     *
+     * @param keys Pointer to the array of keys to insert
+     * @param n Number of keys to insert
+     * @return size_t Updated number of occupied slots in the filter
+     */
     size_t insertManySorted(const T* keys, const size_t n) {
         T* d_keys;
         PackedTagType* d_packedTags;
@@ -384,6 +437,16 @@ class CuckooFilter {
         }
     }
 
+    /**
+     * @brief Tries to remove a set of keys from the filter. If the key is not present, it is
+     * ignored.
+     *
+     * @param d_keys Pointer to the array of keys to remove
+     * @param n Number of keys to remove
+     * @param d_output Optional pointer to an output array indicating the success of each key
+     * removal
+     * @return size_t Updated number of occupied slots in the filter
+     */
     size_t deleteMany(const T* d_keys, const size_t n, bool* d_output = nullptr) {
         const size_t numStreams = std::clamp(n / blockSize, size_t(1), size_t(12));
         const size_t chunkSize = SDIV(n, numStreams);
@@ -539,45 +602,72 @@ class CuckooFilter {
         cuda::std::atomic<size_t>* d_numOccupied;
         size_t numBuckets;
 
+        /**
+         * @brief Attempt to remove a single instance of a fingerprint from a bucket
+         *
+         * Scans the atomic words that make up the bucket and attempts a CAS on each matching
+         * tag position until one removal succeeds. This allows multiple concurrent
+         * deleters to remove distinct copies when a bucket contains several identical
+         * fingerprints instead of all trying to clear the same slot
+         *
+         * The function is lock-free and uses per-word compare-and-swap operations.
+         * It does NOT update any global occupancy counter, the caller is responsible
+         * for decrementing d_numOccupied if appropriate
+         *
+         * @param bucketIdx Index of the bucket to search.
+         * @param tag       Fingerprint value to remove (must not be EMPTY).
+         * @return true if a single instance of `tag` was removed from the bucket;
+         *         false if no matching tag remained (or another thread removed the
+         *         last matching instance before this call could succeed).
+         */
         __device__ bool tryRemoveAtBucket(size_t bucketIdx, TagType tag) {
             Bucket& bucket = d_buckets[bucketIdx];
 
-            int32_t slot = bucket.findSlot(tag);
-            if (slot == -1) {
-                return false;
+            const uint32_t startSlot = tag & (bucketSize - 1);
+            const size_t startWord = startSlot / Bucket::tagsPerWord;
+
+            for (size_t i = 0; i < Bucket::wordCount; ++i) {
+                const size_t currIdx = (startWord + i) & (Bucket::wordCount - 1);
+
+                while (true) {
+                    uint64_t expected = bucket.packedTags[currIdx].load(cuda::memory_order_relaxed);
+
+                    bool anyMatch = false;
+                    for (size_t tagIdx = 0; tagIdx < Bucket::tagsPerWord; ++tagIdx) {
+                        if (bucket.extractTag(expected, tagIdx) == tag) {
+                            anyMatch = true;
+
+                            uint64_t desired = bucket.replaceTag(expected, tagIdx, EMPTY);
+
+                            if (bucket.packedTags[currIdx].compare_exchange_weak(
+                                    expected,
+                                    desired,
+                                    cuda::memory_order_relaxed,
+                                    cuda::memory_order_relaxed
+                                )) {
+                                return true;
+                            }
+                            break;
+                        }
+                    }
+
+                    if (!anyMatch) {
+                        break;
+                    }
+                }
             }
 
-            size_t atomicIdx = slot / Bucket::tagsPerWord;
-            size_t tagIdx = slot & (Bucket::tagsPerWord - 1);
-
-            auto expected = bucket.packedTags[atomicIdx].load(cuda::memory_order_relaxed);
-
-            do {
-                // Verify the tag is still there
-                if (bucket.extractTag(expected, tagIdx) != tag) {
-                    return false;
-                }
-
-                auto desired = bucket.replaceTag(expected, tagIdx, EMPTY);
-
-                if (bucket.packedTags[atomicIdx].compare_exchange_weak(
-                        expected, desired, cuda::memory_order_relaxed, cuda::memory_order_relaxed
-                    )) {
-                    return true;
-                }
-            } while (bucket.extractTag(expected, tagIdx) == tag);
-
-            return false;  // Tag was removed by another thread during our CAS attempts
+            return false;
         }
 
         __device__ bool tryInsertAtBucket(size_t bucketIdx, TagType tag) {
             Bucket& bucket = d_buckets[bucketIdx];
             const uint32_t startIdx = tag & (bucketSize - 1);
-            const size_t startAtomicIdx = startIdx / Bucket::tagsPerWord;
+            const size_t startWord = startIdx / Bucket::tagsPerWord;
 
             for (size_t i = 0; i < Bucket::wordCount; ++i) {
-                const size_t atomicIdx = (startAtomicIdx + i) & (Bucket::wordCount - 1);
-                auto expected = bucket.packedTags[atomicIdx].load(cuda::memory_order_relaxed);
+                const size_t currWord = (startWord + i) & (Bucket::wordCount - 1);
+                auto expected = bucket.packedTags[currWord].load(cuda::memory_order_relaxed);
 
                 bool retryWord;
                 do {
@@ -587,7 +677,7 @@ class CuckooFilter {
                         if (bucket.extractTag(expected, j) == EMPTY) {
                             auto desired = bucket.replaceTag(expected, j, tag);
 
-                            if (bucket.packedTags[atomicIdx].compare_exchange_weak(
+                            if (bucket.packedTags[currWord].compare_exchange_strong(
                                     expected,
                                     desired,
                                     cuda::memory_order_relaxed,
@@ -605,6 +695,17 @@ class CuckooFilter {
             return false;
         }
 
+        /**
+         * @brief Inserts a fingerprint into the filter by evicting existing fingerprints. The
+         * thread first picks a pseudo-random target to replace with the new fingerprint. Then it
+         * tries to insert the evicted fingerprint into its alternate bucket. This process is
+         * repeated until either a fingerprint is inserted into an empty slot or the maximum number
+         * of evictions is reached.
+         *
+         * @param fp Fingerprint to insert
+         * @param startBucket Index of the bucket to start the search from
+         * @return true if the insertion was successful, false otherwise
+         */
         __device__ bool insertWithEviction(TagType fp, size_t startBucket) {
             TagType currentFp = fp;
             size_t currentBucket = startBucket;
@@ -612,18 +713,18 @@ class CuckooFilter {
             for (size_t evictions = 0; evictions < maxEvictions; ++evictions) {
                 auto evictSlot = (currentFp + evictions * 7) & (bucketSize - 1);
 
-                size_t atomicIdx = evictSlot / Bucket::tagsPerWord;
-                size_t tagIdx = evictSlot & (Bucket::tagsPerWord - 1);
+                size_t evictWord = evictSlot / Bucket::tagsPerWord;
+                size_t evictTagIdx = evictSlot & (Bucket::tagsPerWord - 1);
 
                 Bucket& bucket = d_buckets[currentBucket];
-                auto expected = bucket.packedTags[atomicIdx].load(cuda::memory_order_relaxed);
+                auto expected = bucket.packedTags[evictWord].load(cuda::memory_order_relaxed);
                 uint64_t desired;
                 TagType evictedFp;
 
                 do {
-                    evictedFp = bucket.extractTag(expected, tagIdx);
-                    desired = bucket.replaceTag(expected, tagIdx, currentFp);
-                } while (!bucket.packedTags[atomicIdx].compare_exchange_weak(
+                    evictedFp = bucket.extractTag(expected, evictTagIdx);
+                    desired = bucket.replaceTag(expected, evictTagIdx, currentFp);
+                } while (!bucket.packedTags[evictWord].compare_exchange_strong(
                     expected, desired, cuda::memory_order_relaxed, cuda::memory_order_relaxed
                 ));
 
@@ -637,6 +738,17 @@ class CuckooFilter {
             return false;
         }
 
+        /**
+         * @brief Inserts a fingerprint into the filter by evicting existing fingerprints using a
+         * very shallow breadth-first search. It tries multiple random random eviction targets and
+         * checks if there is an empty slot in their alternate buckets. If there is, it inserts the
+         * existing fingerprint into its alternate bucket and places the new fingerprint in the
+         * original location.
+         *
+         * @param fp Fingerprint to insert
+         * @param startBucket Index of the bucket to start the search from
+         * @return true if the insertion was successful, false otherwise
+         */
         __device__ bool insertWithEvictionBFS(TagType fp, size_t startBucket) {
             constexpr size_t numCandidates = std::min(8UL, bucketSize / 2);
 
@@ -667,7 +779,7 @@ class CuckooFilter {
                     if (bucket.extractTag(expected, tagIdx) == candidateFp) {
                         auto desired = bucket.replaceTag(expected, tagIdx, fp);
 
-                        if (bucket.packedTags[atomicIdx].compare_exchange_weak(
+                        if (bucket.packedTags[atomicIdx].compare_exchange_strong(
                                 expected,
                                 desired,
                                 cuda::memory_order_relaxed,
@@ -695,7 +807,7 @@ class CuckooFilter {
 
             auto startBucket = (fp & 1) == 0 ? i1 : i2;
 
-            return insertWithEviction(fp, startBucket);
+            return insertWithEvictionBFS(fp, startBucket);
         }
 
         __device__ bool contains(const T& key) const {
