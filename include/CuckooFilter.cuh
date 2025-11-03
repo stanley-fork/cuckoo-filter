@@ -698,7 +698,6 @@ class CuckooFilter {
             return insertWithEviction(fp, startBucket);
         }
 
-        // FIXME: Somehow this isn't guaranteed to find all existing keys?
         __device__ bool contains(const T& key) const {
             auto [i1, i2, fp] = getCandidateBuckets(key, numBuckets);
             return d_buckets[i1].contains(fp) || d_buckets[i2].contains(fp);
