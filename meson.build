@@ -47,7 +47,16 @@ if get_option('BUILD_BENCHMARKS') == true
     cuco_sub = cmake.subproject('cuco', options: cuco_opts)
     cuco_dep = cuco_sub.dependency('cuco')
 
-    bench_deps = [benchmark_dep, benchmark_main_dep, cuco_dep, cpu_cuckoo_dep]
+    partitioned_opts = cmake.subproject_options()
+    partitioned_opts.add_cmake_defines(
+        {
+            'BUILD_TESTING': 'OFF',
+        },
+    )
+    partitioned_sub = cmake.subproject('partitioned-filters', options: partitioned_opts)
+    partitioned_dep = partitioned_sub.dependency('filters')
+
+    bench_deps = [benchmark_dep, benchmark_main_dep, cuco_dep, cpu_cuckoo_dep, partitioned_dep]
 
     executable(
         'benchmark-cuckoo-vs-bloom',

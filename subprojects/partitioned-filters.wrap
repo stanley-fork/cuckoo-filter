@@ -1,0 +1,5 @@
+[wrap-git]
+url = https://github.com/tum-db/partitioned-filters.git
+revision = b868d10ab1f4b7771b84126cdd85cab4ab098f56
+depth = 1
+diff_files = remove-benchmarks.patch
