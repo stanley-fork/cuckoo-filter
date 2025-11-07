@@ -1,5 +1,6 @@
 #include <thrust/host_vector.h>
 #include <chrono>
+#include <CLI/CLI.hpp>
 #include <iostream>
 #include <random>
 #include <thread>
@@ -7,8 +8,6 @@
 #include "CuckooFilterIPC.cuh"
 
 using Config = CuckooConfig<uint64_t, 16, 500, 256, 16>;
-
-constexpr double TARGET_LOAD_FACTOR = 0.95;
 
 void runServer(const std::string& name, size_t capacity, bool forceShutdown = false) {
     std::cout << "Starting server with capacity: " << capacity << std::endl;
@@ -163,75 +162,71 @@ void runClientThrust(const std::string& name, int clientId, size_t numKeys) {
 }
 
 int main(int argc, char** argv) {
-    if (argc < 4) {
-        std::cout << "Usage:" << std::endl;
-        std::cout << "    Server: " << argv[0] << " server <name> [capacity_exponent] [--force]"
-                  << std::endl;
-        std::cout << "            capacity_exponent: capacity = 2^x (default: 25)" << std::endl;
-        std::cout << "            --force: Force shutdown (cancel pending requests)" << std::endl
-                  << std::endl;
-        std::cout << "    Client: " << argv[0]
-                  << " client <name> <client_type> <num_clients> [capacity_exponent]" << std::endl;
-        std::cout << "            client_type: 'normal' or 'thrust' (required)" << std::endl;
-        std::cout << "            num_clients: number of concurrent clients to launch (default: 1)"
-                  << std::endl;
-        std::cout << "            capacity_exponent: same as server (default: 25)" << std::endl;
-        std::cout << "            Keys to insert per client = 2^capacity_exponent * "
-                  << TARGET_LOAD_FACTOR << std::endl;
-        return 1;
-    }
+    CLI::App app{"Cuckoo Filter IPC Server/Client"};
+    app.require_subcommand(1);
 
-    std::string mode = argv[1];
-    std::string name = argv[2];
+    auto* serverCmd = app.add_subcommand("server", "Run the IPC server");
 
-    if (mode == "server") {
-        int capacityExponent = 25;
-        bool forceShutdown = false;
+    std::string serverName;
+    int serverCapacityExp = 25;
+    bool forceShutdown = false;
 
-        for (int i = 3; i < argc; i++) {
-            std::string arg = argv[i];
-            if (arg == "--force") {
-                forceShutdown = true;
-            } else {
-                capacityExponent = std::stoi(arg);
-            }
-        }
+    serverCmd->add_option("name", serverName, "Server name for IPC")->required();
 
-        size_t capacity = 1ULL << capacityExponent;
-        runServer(name, capacity, forceShutdown);
-    } else if (mode == "client") {
-        if (argc < 4) {
-            std::cerr << "Error: client_type is required for client mode" << std::endl;
-            std::cerr << "Usage: " << argv[0]
-                      << " client <name> <client_type> <num_clients> [capacity_exponent]"
-                      << std::endl;
-            return 1;
-        }
+    serverCmd
+        ->add_option("-c,--capacity", serverCapacityExp, "Capacity exponent (capacity = 2^x)")
+        ->default_val(25)
+        ->check(CLI::PositiveNumber);
 
-        std::string clientType = argv[3];
-        if (clientType != "normal" && clientType != "thrust") {
-            std::cerr << "Error: client_type must be 'normal' or 'thrust', got: " << clientType
-                      << std::endl;
-            return 1;
-        }
+    serverCmd->add_flag("-f,--force", forceShutdown, "Force shutdown (cancel pending requests)");
 
-        int numClients = (argc > 4) ? std::stoi(argv[4]) : 1;
-        int capacityExponent = (argc > 5) ? std::stoi(argv[5]) : 25;
-        size_t numKeys = (1ULL << capacityExponent) * TARGET_LOAD_FACTOR;
+    auto* clientCmd = app.add_subcommand("client", "Run IPC client(s)");
 
+    std::string clientType = "normal";
+    int numClients = 1;
+    int clientCapacityExp = 25;
+    double targetLoadFactor = 0.95;
+
+    clientCmd->add_option("name", serverName, "Server name to connect to")->required();
+
+    clientCmd->add_option("-t,--type", clientType, "Client type")
+        ->default_val("normal")
+        ->check(CLI::IsMember({"normal", "thrust"}));
+
+    clientCmd->add_option("-n,--num-clients", numClients, "Number of concurrent clients")
+        ->default_val(1)
+        ->check(CLI::PositiveNumber);
+
+    clientCmd
+        ->add_option(
+            "-c,--capacity",
+            clientCapacityExp,
+            "Capacity exponent (must match server, keys = 2^x * loadFactor)"
+        )
+        ->default_val(25)
+        ->check(CLI::PositiveNumber);
+
+    clientCmd->add_option("-l,--load-factor", targetLoadFactor, "Target load factor")
+        ->check(CLI::Range(0.0, 1.0))
+        ->default_val(0.95);
+
+    CLI11_PARSE(app, argc, argv);
+
+    if (*serverCmd) {
+        size_t capacity = 1ULL << serverCapacityExp;
+        runServer(serverName, capacity, forceShutdown);
+    } else if (*clientCmd) {
+        size_t numKeys = (1ULL << clientCapacityExp) * targetLoadFactor;
         auto clientFunc = (clientType == "normal") ? runClient : runClientThrust;
 
         std::vector<std::thread> clientThreads;
         for (int i = 0; i < numClients; i++) {
-            clientThreads.emplace_back(clientFunc, name, i, numKeys);
+            clientThreads.emplace_back(clientFunc, serverName, i, numKeys);
         }
 
         for (auto& thread : clientThreads) {
             thread.join();
         }
-    } else {
-        std::cerr << "Unknown mode: " << mode << std::endl;
-        return 1;
     }
 
     return 0;

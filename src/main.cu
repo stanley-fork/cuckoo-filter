@@ -3,6 +3,7 @@
 #include <thrust/random.h>
 #include <thrust/transform.h>
 #include <chrono>
+#include <CLI/CLI.hpp>
 #include <cstdint>
 #include <ctime>
 #include <CuckooFilter.cuh>
@@ -13,23 +14,23 @@
 #include <random>
 #include <vector>
 
-constexpr double TARGET_LOAD_FACTOR = 0.95;
-
 int main(int argc, char** argv) {
-    if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " <n_exponent> " << std::endl;
-        std::cerr << "n_exponent: exponent for n = 2^x" << std::endl;
-        return 1;
-    }
+    CLI::App app{"Cuckoo Filter Benchmark"};
 
-    int n_exponent = std::atoi(argv[1]);
+    int exponent = 20;
+    double target_load_factor = 0.95;
 
-    if (n_exponent < 1) {
-        std::cerr << "Invalid exponent. Use >= 1" << std::endl;
-        return 1;
-    }
+    app.add_option("exponent", exponent, "Exponent for n = 2^x")
+        ->required()
+        ->check(CLI::PositiveNumber);
 
-    size_t n = (UINT64_C(1) << n_exponent) * TARGET_LOAD_FACTOR;
+    app.add_option("-l,--load-factor", target_load_factor, "Target load factor")
+        ->check(CLI::Range(0.0, 1.0))
+        ->default_val(0.95);
+
+    CLI11_PARSE(app, argc, argv);
+
+    size_t n = (UINT64_C(1) << exponent) * target_load_factor;
 
     thrust::device_vector<uint64_t> d_input(n);
     thrust::device_vector<uint8_t> d_output(n);
@@ -96,7 +97,8 @@ int main(int argc, char** argv) {
     size_t falsePositives = countOnes(reinterpret_cast<bool*>(fprOutput.data()), fprTestSize);
 
     double fpr = static_cast<double>(falsePositives) / static_cast<double>(fprTestSize) * 100.0;
-    double theoreticalFPR = static_cast<double>(2 * filter.bucketSize) / (1ULL << Config::bitsPerTag);
+    double theoreticalFPR =
+        static_cast<double>(2 * filter.bucketSize) / (1ULL << Config::bitsPerTag);
 
     std::cout << "False Positive Rate: " << falsePositives << " / " << fprTestSize << " = " << fpr
               << "% (theoretical " << 100 * theoreticalFPR << "% for " << Config::bitsPerTag

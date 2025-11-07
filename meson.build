@@ -15,15 +15,19 @@ cuda_args = [
     '--expt-relaxed-constexpr',
     '--generate-line-info',
     '-gencode=arch=compute_120,code=sm_120',
-    '-gencode=arch=compute_75,code=compute_75'
+    '-gencode=arch=compute_75,code=compute_75',
 ]
 
 includes = ['./include']
+deps = [
+    dependency('CLI11', required: true),
+]
 
 executable(
     'cuckoo-filter-cuda',
     './src/main.cu',
     include_directories: includes,
+    dependencies: deps,
     cuda_args: cuda_args,
     install: true,
 )
@@ -32,6 +36,7 @@ executable(
     'cuckoo-filter-ipc',
     './src/ipc_main.cu',
     include_directories: includes,
+    dependencies: deps,
     cuda_args: cuda_args,
     install: true,
 )
