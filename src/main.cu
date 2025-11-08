@@ -31,7 +31,7 @@ int main(int argc, char** argv) {
 
     CLI11_PARSE(app, argc, argv);
 
-    using Config = CuckooConfig<uint64_t, 16, 500, 256, 16, AddSubHashStrategy>;
+    using Config = CuckooConfig<uint64_t, 16, 500, 256, 16, XorHashStrategy>;
 
     size_t capacity = 1ULL << exponent;
     size_t n = capacity * target_load_factor;
