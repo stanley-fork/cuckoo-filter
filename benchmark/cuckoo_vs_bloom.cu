@@ -9,9 +9,9 @@
 #include <cuco/bloom_filter.cuh>
 #include <cuco/utility/cuda_thread_scope.cuh>
 #include <cuda/std/cstdint>
+#include <hash_strategies.cuh>
 #include <helpers.cuh>
 #include <random>
-#include <hash_strategies.cuh>
 #include "benchmark_common.cuh"
 
 namespace bm = benchmark;
@@ -119,19 +119,15 @@ static void CuckooFilter_Delete(bm::State& state) {
 }
 
 static void BloomFilter_Insert(bm::State& state) {
-    const size_t n = state.range(0) * TARGET_LOAD_FACTOR;
-
-    constexpr auto bitsPerTag = Config::bitsPerTag;
+    auto [capacity, n] = calculateCapacityAndSize<Config>(state.range(0), TARGET_LOAD_FACTOR);
 
     using BloomFilter = cuco::bloom_filter<uint32_t>;
 
-    const size_t numBlocks = cucoNumBlocks<BloomFilter, bitsPerTag>(state.range(0));
+    const size_t numBlocks = cucoNumBlocks<BloomFilter, Config::bitsPerTag>(capacity);
 
     thrust::device_vector<uint32_t> d_keys(n);
     generateKeysGPU(d_keys);
-    BloomFilter filter(
-        cuco::extent{numBlocks}, cuco::cuda_thread_scope<cuda::thread_scope_device>{}
-    );
+    BloomFilter filter(numBlocks);
 
     size_t filterMemory = filter.block_extent() * BloomFilter::words_per_block *
                           sizeof(typename BloomFilter::word_type);
@@ -157,19 +153,14 @@ static void BloomFilter_Insert(bm::State& state) {
 }
 
 static void BloomFilter_Query(bm::State& state) {
-    const size_t n = state.range(0) * TARGET_LOAD_FACTOR;
-
-    constexpr auto bitsPerTag = Config::bitsPerTag;
+    auto [capacity, n] = calculateCapacityAndSize<Config>(state.range(0), TARGET_LOAD_FACTOR);
 
     using BloomFilter = cuco::bloom_filter<uint32_t>;
-
-    const size_t numBlocks = cucoNumBlocks<BloomFilter, bitsPerTag>(state.range(0));
+    const size_t numBlocks = cucoNumBlocks<BloomFilter, Config::bitsPerTag>(capacity);
 
     thrust::device_vector<uint32_t> d_keys(n);
     generateKeysGPU(d_keys);
-    BloomFilter filter(
-        cuco::extent{numBlocks}, cuco::cuda_thread_scope<cuda::thread_scope_device>{}
-    );
+    BloomFilter filter(numBlocks);
 
     thrust::device_vector<uint8_t> d_output(n);
 
@@ -272,20 +263,16 @@ static void CuckooFilter_InsertQueryDelete(bm::State& state) {
 }
 
 static void BloomFilter_InsertAndQuery(bm::State& state) {
-    const size_t n = state.range(0) * TARGET_LOAD_FACTOR;
-
-    constexpr auto bitsPerTag = Config::bitsPerTag;
+    auto [capacity, n] = calculateCapacityAndSize<Config>(state.range(0), TARGET_LOAD_FACTOR);
 
     using BloomFilter = cuco::bloom_filter<uint32_t>;
-    const size_t numBlocks = cucoNumBlocks<BloomFilter, bitsPerTag>(state.range(0));
+    const size_t numBlocks = cucoNumBlocks<BloomFilter, Config::bitsPerTag>(capacity);
 
     thrust::device_vector<uint32_t> d_keys(n);
     generateKeysGPU(d_keys);
     thrust::device_vector<uint8_t> d_output(n);
 
-    BloomFilter filter(
-        cuco::extent{numBlocks}, cuco::cuda_thread_scope<cuda::thread_scope_device>{}
-    );
+    BloomFilter filter(numBlocks);
 
     size_t filterMemory = filter.block_extent() * BloomFilter::words_per_block *
                           sizeof(typename BloomFilter::word_type);
@@ -373,18 +360,16 @@ static void CuckooFilter_FalsePositiveRate(bm::State& state) {
 }
 
 static void BloomFilter_FalsePositiveRate(bm::State& state) {
-    const size_t n = state.range(0) * TARGET_LOAD_FACTOR;
+    auto [capacity, n] = calculateCapacityAndSize<Config>(state.range(0), TARGET_LOAD_FACTOR);
 
     constexpr auto bitsPerTag = Config::bitsPerTag;
     using BloomFilter = cuco::bloom_filter<uint64_t>;
-    const size_t numBlocks = cucoNumBlocks<BloomFilter, bitsPerTag>(state.range(0));
+    const size_t numBlocks = cucoNumBlocks<BloomFilter, bitsPerTag>(capacity);
 
     thrust::device_vector<uint64_t> d_keys(n);
     generateKeysGPU<uint64_t>(d_keys, UINT32_MAX);
 
-    BloomFilter filter(
-        cuco::extent{numBlocks}, cuco::cuda_thread_scope<cuda::thread_scope_device>{}
-    );
+    BloomFilter filter(numBlocks);
     filter.add(d_keys.begin(), d_keys.end());
 
     size_t fprTestSize = std::min(n, size_t(1'000'000));
