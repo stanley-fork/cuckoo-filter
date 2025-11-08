@@ -32,7 +32,7 @@ struct FilterRequest {
     size_t result;                    // Updated number of occupied slots after insert/delete
 };
 
-struct SharedRingBuffer {
+struct SharedQueue {
     static constexpr size_t QUEUE_SIZE = 256;
     static_assert(powerOfTwo(QUEUE_SIZE), "queue size must be a power of two");
 
@@ -130,7 +130,7 @@ template <typename Config>
 class CuckooFilterIPCServer {
    private:
     CuckooFilter<Config>* filter;
-    SharedRingBuffer* ring;
+    SharedQueue* queue;
     int shmFd;
     std::string shmName;
     bool running;
@@ -141,11 +141,11 @@ class CuckooFilterIPCServer {
 
         while (true) {
             // Finally break once queue is drained after shutdown
-            if (shutdownReceived && ring->pendingRequests() == 0) {
+            if (shutdownReceived && queue->pendingRequests() == 0) {
                 break;
             }
 
-            FilterRequest* reqPtr = ring->dequeue();
+            FilterRequest* reqPtr = queue->dequeue();
 
             // check if we should continue
             if (!reqPtr) {
@@ -160,7 +160,7 @@ class CuckooFilterIPCServer {
             if (req.type == RequestType::SHUTDOWN) {
                 shutdownReceived = true;
                 req.completed.store(true, std::memory_order_release);
-                ring->signalDequeued();
+                queue->signalDequeued();
                 continue;
             }
 
@@ -168,14 +168,14 @@ class CuckooFilterIPCServer {
                 filter->clear();
                 req.result = 0;
                 req.completed.store(true, std::memory_order_release);
-                ring->signalDequeued();
+                queue->signalDequeued();
                 continue;
             }
 
             // Skip cancelled requests (from force shutdown)
             if (req.cancelled.load(std::memory_order_acquire)) {
                 req.completed.store(true, std::memory_order_release);
-                ring->signalDequeued();
+                queue->signalDequeued();
                 continue;
             }
 
@@ -188,7 +188,7 @@ class CuckooFilterIPCServer {
 
             req.completed.store(true, std::memory_order_release);
 
-            ring->signalDequeued();
+            queue->signalDequeued();
         }
     }
 
@@ -202,9 +202,9 @@ class CuckooFilterIPCServer {
         bool hasKeys = memcmp(&req.keysHandle, &zeroHandle, sizeof(cudaIpcMemHandle_t)) != 0;
 
         if (hasKeys) {
-            CUDA_CALL(
-                cudaIpcOpenMemHandle((void**)&d_keys, req.keysHandle, cudaIpcMemLazyEnablePeerAccess)
-            );
+            CUDA_CALL(cudaIpcOpenMemHandle(
+                (void**)&d_keys, req.keysHandle, cudaIpcMemLazyEnablePeerAccess
+            ));
         }
 
         bool hasOutput = false;
@@ -252,48 +252,48 @@ class CuckooFilterIPCServer {
         : shmName("/cuckoo_filter_" + name), running(false) {
         filter = new CuckooFilter<Config>(capacity);
 
-        // shared memory for ring buffer
+        // shared memory for queue
         shmFd = shm_open(shmName.c_str(), O_CREAT | O_RDWR, 0666);
         if (shmFd == -1) {
             throw std::runtime_error("Failed to create shared memory");
         }
 
-        if (ftruncate(shmFd, sizeof(SharedRingBuffer)) == -1) {
+        if (ftruncate(shmFd, sizeof(SharedQueue)) == -1) {
             close(shmFd);
             throw std::runtime_error("Failed to set shared memory size");
         }
 
-        ring = static_cast<SharedRingBuffer*>(
-            mmap(nullptr, sizeof(SharedRingBuffer), PROT_READ | PROT_WRITE, MAP_SHARED, shmFd, 0)
+        queue = static_cast<SharedQueue*>(
+            mmap(nullptr, sizeof(SharedQueue), PROT_READ | PROT_WRITE, MAP_SHARED, shmFd, 0)
         );
 
-        if (ring == MAP_FAILED) {
+        if (queue == MAP_FAILED) {
             close(shmFd);
             throw std::runtime_error("Failed to map shared memory");
         }
 
-        ring->head.store(0, std::memory_order_release);
-        ring->tail.store(0, std::memory_order_release);
-        ring->shuttingDown.store(false, std::memory_order_release);
+        queue->head.store(0, std::memory_order_release);
+        queue->tail.store(0, std::memory_order_release);
+        queue->shuttingDown.store(false, std::memory_order_release);
 
-        sem_init(&ring->producerSem, 1, SharedRingBuffer::QUEUE_SIZE);
-        sem_init(&ring->consumerSem, 1, 0);
+        sem_init(&queue->producerSem, 1, SharedQueue::QUEUE_SIZE);
+        sem_init(&queue->consumerSem, 1, 0);
 
-        for (auto& request : ring->requests) {
+        for (auto& request : queue->requests) {
             request.completed.store(false, std::memory_order_release);
             request.cancelled.store(false, std::memory_order_release);
         }
 
-        ring->initialised = true;
+        queue->initialised = true;
     }
 
     ~CuckooFilterIPCServer() {
         stop();
 
-        if (ring != MAP_FAILED) {
-            sem_destroy(&ring->producerSem);
-            sem_destroy(&ring->consumerSem);
-            munmap(ring, sizeof(SharedRingBuffer));
+        if (queue != MAP_FAILED) {
+            sem_destroy(&queue->producerSem);
+            sem_destroy(&queue->consumerSem);
+            munmap(queue, sizeof(SharedQueue));
         }
 
         if (shmFd != -1) {
@@ -321,13 +321,13 @@ class CuckooFilterIPCServer {
         running = false;
 
         if (force) {
-            size_t cancelled = ring->cancelPendingRequests();
+            size_t cancelled = queue->cancelPendingRequests();
             if (cancelled > 0) {
                 std::cout << "Force shutdown: cancelled " << cancelled << " pending requests"
                           << std::endl;
             }
         } else {
-            size_t pending = ring->pendingRequests();
+            size_t pending = queue->pendingRequests();
             if (pending > 0) {
                 std::cout << "Graceful shutdown: draining " << pending << " pending requests..."
                           << std::endl;
@@ -336,17 +336,17 @@ class CuckooFilterIPCServer {
 
         // Send shutdown request to the worker thread before
         // setting shutdown flag so the enqueue() doesn't reject it
-        FilterRequest* reqPtr = ring->enqueue();
+        FilterRequest* reqPtr = queue->enqueue();
         if (reqPtr) {
             FilterRequest& req = *reqPtr;
             req.type = RequestType::SHUTDOWN;
             req.completed.store(false, std::memory_order_release);
             req.cancelled.store(false, std::memory_order_release);
 
-            ring->signalEnqueued();
+            queue->signalEnqueued();
         }
 
-        ring->initiateShutdown();
+        queue->initiateShutdown();
 
         if (workerThread.joinable()) {
             workerThread.join();
@@ -361,7 +361,7 @@ class CuckooFilterIPCServer {
 template <typename Config>
 class CuckooFilterIPCClient {
    private:
-    SharedRingBuffer* ring;
+    SharedQueue* queue;
     int shmFd;
     std::string shmName;
     uint64_t nextRequestId;
@@ -376,25 +376,25 @@ class CuckooFilterIPCClient {
             throw std::runtime_error("Failed to open shared memory, is the server running?");
         }
 
-        ring = static_cast<SharedRingBuffer*>(
-            mmap(nullptr, sizeof(SharedRingBuffer), PROT_READ | PROT_WRITE, MAP_SHARED, shmFd, 0)
+        queue = static_cast<SharedQueue*>(
+            mmap(nullptr, sizeof(SharedQueue), PROT_READ | PROT_WRITE, MAP_SHARED, shmFd, 0)
         );
 
-        if (ring == MAP_FAILED) {
+        if (queue == MAP_FAILED) {
             close(shmFd);
             throw std::runtime_error("Failed to map shared memory");
         }
 
-        if (!ring->initialised) {
-            munmap(ring, sizeof(SharedRingBuffer));
+        if (!queue->initialised) {
+            munmap(queue, sizeof(SharedQueue));
             close(shmFd);
             throw std::runtime_error("Ring buffer not initialised, server may not be ready");
         }
     }
 
     ~CuckooFilterIPCClient() {
-        if (ring != MAP_FAILED) {
-            munmap(ring, sizeof(SharedRingBuffer));
+        if (queue != MAP_FAILED) {
+            munmap(queue, sizeof(SharedQueue));
         }
         if (shmFd != -1) {
             close(shmFd);
@@ -418,20 +418,20 @@ class CuckooFilterIPCClient {
     }
 
     void requestShutdown() {
-        if (ring->isShuttingDown()) {
+        if (queue->isShuttingDown()) {
             return;
         }
 
-        ring->initiateShutdown();
+        queue->initiateShutdown();
 
-        FilterRequest* reqPtr = ring->enqueue();
+        FilterRequest* reqPtr = queue->enqueue();
         if (reqPtr) {
             FilterRequest& req = *reqPtr;
             req.type = RequestType::SHUTDOWN;
             req.completed.store(false, std::memory_order_release);
             req.cancelled.store(false, std::memory_order_release);
 
-            ring->signalEnqueued();
+            queue->signalEnqueued();
 
             while (!req.completed.load(std::memory_order_acquire)) {
                 std::this_thread::yield();
@@ -441,7 +441,7 @@ class CuckooFilterIPCClient {
 
    private:
     size_t submitRequest(RequestType type, const T* d_keys, size_t count, bool* d_output) {
-        FilterRequest* reqPtr = ring->enqueue();
+        FilterRequest* reqPtr = queue->enqueue();
         if (!reqPtr) {
             throw std::runtime_error("Server is shutting down, not accepting new requests");
         }
@@ -467,7 +467,7 @@ class CuckooFilterIPCClient {
         req.cancelled.store(false, std::memory_order_release);
         req.result = 0;
 
-        ring->signalEnqueued();
+        queue->signalEnqueued();
 
         while (!req.completed.load(std::memory_order_acquire)) {
             std::this_thread::yield();
