@@ -828,8 +828,7 @@ __global__ void insertKernelSorted(
         if (filter->tryInsertAtBucket(primaryBucket, fp)) {
             success = 1;
         } else {
-            size_t secondaryBucket =
-                Filter::getAlternateBucket(primaryBucket, fp, filter->numBuckets);
+            size_t secondaryBucket = getAlternateBucket(primaryBucket, fp, filter->numBuckets);
 
             if (filter->tryInsertAtBucket(secondaryBucket, fp)) {
                 success = 1;
