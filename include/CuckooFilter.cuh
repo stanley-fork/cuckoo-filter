@@ -44,18 +44,15 @@ template <typename Config>
 class CuckooFilter;
 
 template <typename Config>
-__global__ void insertKernel(
-    const typename Config::KeyType* keys,
-    size_t n,
-    typename CuckooFilter<Config>::DeviceView view
-);
+__global__ void
+insertKernel(const typename Config::KeyType* keys, size_t n, CuckooFilter<Config>* filter);
 
 template <typename Config>
 __global__ void insertKernelSorted(
     const typename Config::KeyType* keys,
     const typename CuckooFilter<Config>::PackedTagType* packedTags,
     size_t n,
-    typename CuckooFilter<Config>::DeviceView view
+    CuckooFilter<Config>* filter
 );
 
 template <typename Config>
@@ -71,7 +68,7 @@ __global__ void containsKernel(
     const typename Config::KeyType* keys,
     bool* output,
     size_t n,
-    typename CuckooFilter<Config>::DeviceView view
+    CuckooFilter<Config>* filter
 );
 
 template <typename Config>
@@ -79,12 +76,11 @@ __global__ void deleteKernel(
     const typename Config::KeyType* keys,
     bool* output,
     size_t n,
-    typename CuckooFilter<Config>::DeviceView view
+    CuckooFilter<Config>* filter
 );
 
 template <typename Config>
-class CuckooFilter {
-   public:
+struct CuckooFilter {
     using T = typename Config::KeyType;
     static constexpr size_t bitsPerTag = Config::bitsPerTag;
 
@@ -250,13 +246,12 @@ class CuckooFilter {
         }
     };
 
-   private:
     size_t numBuckets;
     Bucket* d_buckets;
     cuda::std::atomic<size_t>* d_numOccupied{};
+
     size_t h_numOccupied = 0;
 
-   public:
     template <typename H>
     static __host__ __device__ uint64_t hash64(const H& key) {
         return HashStrategy::hash64(key);
@@ -280,7 +275,6 @@ class CuckooFilter {
         return HashStrategy::calculateNumBuckets(capacity);
     }
 
-   public:
     CuckooFilter(const CuckooFilter&) = delete;
     CuckooFilter& operator=(const CuckooFilter&) = delete;
 
@@ -302,7 +296,7 @@ class CuckooFilter {
 
     size_t insertMany(const T* d_keys, const size_t n) {
         size_t numBlocks = SDIV(n, blockSize);
-        insertKernel<Config><<<numBlocks, blockSize>>>(d_keys, n, getDeviceView());
+        insertKernel<Config><<<numBlocks, blockSize>>>(d_keys, n, this);
 
         CUDA_CALL(cudaDeviceSynchronize());
 
@@ -342,8 +336,7 @@ class CuckooFilter {
 
         CUDA_CALL(cudaFree(d_tempStorage));
 
-        insertKernelSorted<Config>
-            <<<numBlocks, blockSize>>>(d_keys, d_packedTags, n, getDeviceView());
+        insertKernelSorted<Config><<<numBlocks, blockSize>>>(d_keys, d_packedTags, n, this);
 
         CUDA_CALL(cudaDeviceSynchronize());
 
@@ -354,7 +347,7 @@ class CuckooFilter {
 
     void containsMany(const T* d_keys, const size_t n, bool* d_output) {
         size_t numBlocks = SDIV(n, blockSize);
-        containsKernel<Config><<<numBlocks, blockSize>>>(d_keys, d_output, n, getDeviceView());
+        containsKernel<Config><<<numBlocks, blockSize>>>(d_keys, d_output, n, this);
 
         CUDA_CALL(cudaDeviceSynchronize());
     }
@@ -371,7 +364,7 @@ class CuckooFilter {
      */
     size_t deleteMany(const T* d_keys, const size_t n, bool* d_output = nullptr) {
         size_t numBlocks = SDIV(n, blockSize);
-        deleteKernel<Config><<<numBlocks, blockSize>>>(d_keys, d_output, n, getDeviceView());
+        deleteKernel<Config><<<numBlocks, blockSize>>>(d_keys, d_output, n, this);
 
         CUDA_CALL(cudaDeviceSynchronize());
 
@@ -497,189 +490,44 @@ class CuckooFilter {
         return occupiedCount;
     }
 
-    struct DeviceView {
-        Bucket* d_buckets;
-        cuda::std::atomic<size_t>* d_numOccupied;
-        size_t numBuckets;
+    /**
+     * @brief Attempt to remove a single instance of a fingerprint from a bucket
+     *
+     * Scans the atomic words that make up the bucket and attempts a CAS on each matching
+     * tag position until one removal succeeds. This allows multiple concurrent
+     * deleters to remove distinct copies when a bucket contains several identical
+     * fingerprints instead of all trying to clear the same slot
+     *
+     * The function is lock-free and uses per-word compare-and-swap operations.
+     * It does NOT update any global occupancy counter, the caller is responsible
+     * for decrementing d_numOccupied if appropriate
+     *
+     * @param bucketIdx Index of the bucket to search.
+     * @param tag       Fingerprint value to remove (must not be EMPTY).
+     * @return true if a single instance of `tag` was removed from the bucket;
+     *         false if no matching tag remained (or another thread removed the
+     *         last matching instance before this call could succeed).
+     */
+    __device__ bool tryRemoveAtBucket(size_t bucketIdx, TagType tag) {
+        Bucket& bucket = d_buckets[bucketIdx];
 
-        /**
-         * @brief Attempt to remove a single instance of a fingerprint from a bucket
-         *
-         * Scans the atomic words that make up the bucket and attempts a CAS on each matching
-         * tag position until one removal succeeds. This allows multiple concurrent
-         * deleters to remove distinct copies when a bucket contains several identical
-         * fingerprints instead of all trying to clear the same slot
-         *
-         * The function is lock-free and uses per-word compare-and-swap operations.
-         * It does NOT update any global occupancy counter, the caller is responsible
-         * for decrementing d_numOccupied if appropriate
-         *
-         * @param bucketIdx Index of the bucket to search.
-         * @param tag       Fingerprint value to remove (must not be EMPTY).
-         * @return true if a single instance of `tag` was removed from the bucket;
-         *         false if no matching tag remained (or another thread removed the
-         *         last matching instance before this call could succeed).
-         */
-        __device__ bool tryRemoveAtBucket(size_t bucketIdx, TagType tag) {
-            Bucket& bucket = d_buckets[bucketIdx];
+        const uint32_t startSlot = tag & (bucketSize - 1);
+        const size_t startWord = startSlot / Bucket::tagsPerWord;
 
-            const uint32_t startSlot = tag & (bucketSize - 1);
-            const size_t startWord = startSlot / Bucket::tagsPerWord;
+        for (size_t i = 0; i < Bucket::wordCount; ++i) {
+            const size_t currIdx = (startWord + i) & (Bucket::wordCount - 1);
 
-            for (size_t i = 0; i < Bucket::wordCount; ++i) {
-                const size_t currIdx = (startWord + i) & (Bucket::wordCount - 1);
+            while (true) {
+                uint64_t expected = bucket.packedTags[currIdx].load(cuda::memory_order_relaxed);
 
-                while (true) {
-                    uint64_t expected = bucket.packedTags[currIdx].load(cuda::memory_order_relaxed);
+                bool anyMatch = false;
+                for (size_t tagIdx = 0; tagIdx < Bucket::tagsPerWord; ++tagIdx) {
+                    if (bucket.extractTag(expected, tagIdx) == tag) {
+                        anyMatch = true;
 
-                    bool anyMatch = false;
-                    for (size_t tagIdx = 0; tagIdx < Bucket::tagsPerWord; ++tagIdx) {
-                        if (bucket.extractTag(expected, tagIdx) == tag) {
-                            anyMatch = true;
+                        uint64_t desired = bucket.replaceTag(expected, tagIdx, EMPTY);
 
-                            uint64_t desired = bucket.replaceTag(expected, tagIdx, EMPTY);
-
-                            if (bucket.packedTags[currIdx].compare_exchange_weak(
-                                    expected,
-                                    desired,
-                                    cuda::memory_order_relaxed,
-                                    cuda::memory_order_relaxed
-                                )) {
-                                return true;
-                            }
-                            break;
-                        }
-                    }
-
-                    if (!anyMatch) {
-                        break;
-                    }
-                }
-            }
-
-            return false;
-        }
-
-        __device__ bool tryInsertAtBucket(size_t bucketIdx, TagType tag) {
-            Bucket& bucket = d_buckets[bucketIdx];
-            const uint32_t startIdx = tag & (bucketSize - 1);
-            const size_t startWord = startIdx / Bucket::tagsPerWord;
-
-            for (size_t i = 0; i < Bucket::wordCount; ++i) {
-                const size_t currWord = (startWord + i) & (Bucket::wordCount - 1);
-                auto expected = bucket.packedTags[currWord].load(cuda::memory_order_relaxed);
-
-                bool retryWord;
-                do {
-                    retryWord = false;
-
-                    for (size_t j = 0; j < Bucket::tagsPerWord; ++j) {
-                        if (bucket.extractTag(expected, j) == EMPTY) {
-                            auto desired = bucket.replaceTag(expected, j, tag);
-
-                            if (bucket.packedTags[currWord].compare_exchange_strong(
-                                    expected,
-                                    desired,
-                                    cuda::memory_order_relaxed,
-                                    cuda::memory_order_relaxed
-                                )) {
-                                return true;
-                            } else {
-                                retryWord = true;
-                                break;
-                            }
-                        }
-                    }
-                } while (retryWord);
-            }
-            return false;
-        }
-
-        /**
-         * @brief Inserts a fingerprint into the filter by evicting existing fingerprints. The
-         * thread first picks a pseudo-random target to replace with the new fingerprint. Then it
-         * tries to insert the evicted fingerprint into its alternate bucket. This process is
-         * repeated until either a fingerprint is inserted into an empty slot or the maximum number
-         * of evictions is reached.
-         *
-         * @param fp Fingerprint to insert
-         * @param startBucket Index of the bucket to start the search from
-         * @return true if the insertion was successful, false otherwise
-         */
-        __device__ bool insertWithEviction(TagType fp, size_t startBucket) {
-            TagType currentFp = fp;
-            size_t currentBucket = startBucket;
-
-            for (size_t evictions = 0; evictions < maxEvictions; ++evictions) {
-                auto evictSlot = (currentFp + evictions * 7) & (bucketSize - 1);
-
-                size_t evictWord = evictSlot / Bucket::tagsPerWord;
-                size_t evictTagIdx = evictSlot & (Bucket::tagsPerWord - 1);
-
-                Bucket& bucket = d_buckets[currentBucket];
-                auto expected = bucket.packedTags[evictWord].load(cuda::memory_order_relaxed);
-                uint64_t desired;
-                TagType evictedFp;
-
-                do {
-                    evictedFp = bucket.extractTag(expected, evictTagIdx);
-                    desired = bucket.replaceTag(expected, evictTagIdx, currentFp);
-                } while (!bucket.packedTags[evictWord].compare_exchange_strong(
-                    expected, desired, cuda::memory_order_relaxed, cuda::memory_order_relaxed
-                ));
-
-                currentFp = evictedFp;
-                currentBucket = getAlternateBucket(currentBucket, evictedFp, numBuckets);
-
-                if (tryInsertAtBucket(currentBucket, currentFp)) {
-                    return true;
-                }
-            }
-            return false;
-        }
-
-        /**
-         * @brief Inserts a fingerprint into the filter by evicting existing fingerprints using a
-         * very shallow breadth-first search. It tries multiple random random eviction targets and
-         * checks if there is an empty slot in their alternate buckets. If there is, it inserts the
-         * existing fingerprint into its alternate bucket and places the new fingerprint in the
-         * original location.
-         *
-         * @param fp Fingerprint to insert
-         * @param startBucket Index of the bucket to start the search from
-         * @return true if the insertion was successful, false otherwise
-         */
-        __device__ bool insertWithEvictionBFS(TagType fp, size_t startBucket) {
-            constexpr size_t numCandidates = std::min(8UL, bucketSize / 2);
-
-            Bucket& bucket = d_buckets[startBucket];
-
-            for (size_t i = 0; i < numCandidates; ++i) {
-                size_t slot = (fp + i * 7) & (bucketSize - 1);
-                size_t atomicIdx = slot / Bucket::tagsPerWord;
-                size_t tagIdx = slot & (Bucket::tagsPerWord - 1);
-
-                auto packed = bucket.packedTags[atomicIdx].load(cuda::memory_order_relaxed);
-                TagType candidateFp = bucket.extractTag(packed, tagIdx);
-
-                if (candidateFp == EMPTY) {
-                    if (tryInsertAtBucket(startBucket, fp)) {
-                        return true;
-                    }
-                    continue;
-                }
-
-                size_t altBucket = getAlternateBucket(startBucket, candidateFp, numBuckets);
-                if (tryInsertAtBucket(altBucket, candidateFp)) {
-                    // Successfully inserted the evicted tag at its alternate location
-                    // Now atomically swap in our tag at the original location
-                    auto expected = bucket.packedTags[atomicIdx].load(cuda::memory_order_relaxed);
-
-                    // Verify the tag is still there and try to replace it
-                    if (bucket.extractTag(expected, tagIdx) == candidateFp) {
-                        auto desired = bucket.replaceTag(expected, tagIdx, fp);
-
-                        if (bucket.packedTags[atomicIdx].compare_exchange_strong(
+                        if (bucket.packedTags[currIdx].compare_exchange_weak(
                                 expected,
                                 desired,
                                 cuda::memory_order_relaxed,
@@ -687,56 +535,184 @@ class CuckooFilter {
                             )) {
                             return true;
                         }
+                        break;
                     }
+                }
 
-                    // Failed to swap, clean up the tag we inserted to avoid duplicates
-                    tryRemoveAtBucket(altBucket, candidateFp);
+                if (!anyMatch) {
+                    break;
                 }
             }
-
-            // fall back to greedy DFS
-            return insertWithEviction(fp, startBucket);
         }
 
-        __device__ bool insert(const T& key) {
-            auto [i1, i2, fp] = getCandidateBuckets(key, numBuckets);
+        return false;
+    }
 
-            if (tryInsertAtBucket(i1, fp) || tryInsertAtBucket(i2, fp)) {
+    __device__ bool tryInsertAtBucket(size_t bucketIdx, TagType tag) {
+        Bucket& bucket = d_buckets[bucketIdx];
+        const uint32_t startIdx = tag & (bucketSize - 1);
+        const size_t startWord = startIdx / Bucket::tagsPerWord;
+
+        for (size_t i = 0; i < Bucket::wordCount; ++i) {
+            const size_t currWord = (startWord + i) & (Bucket::wordCount - 1);
+            auto expected = bucket.packedTags[currWord].load(cuda::memory_order_relaxed);
+
+            bool retryWord;
+            do {
+                retryWord = false;
+
+                for (size_t j = 0; j < Bucket::tagsPerWord; ++j) {
+                    if (bucket.extractTag(expected, j) == EMPTY) {
+                        auto desired = bucket.replaceTag(expected, j, tag);
+
+                        if (bucket.packedTags[currWord].compare_exchange_strong(
+                                expected,
+                                desired,
+                                cuda::memory_order_relaxed,
+                                cuda::memory_order_relaxed
+                            )) {
+                            return true;
+                        } else {
+                            retryWord = true;
+                            break;
+                        }
+                    }
+                }
+            } while (retryWord);
+        }
+        return false;
+    }
+
+    /**
+     * @brief Inserts a fingerprint into the filter by evicting existing fingerprints. The
+     * thread first picks a pseudo-random target to replace with the new fingerprint. Then it
+     * tries to insert the evicted fingerprint into its alternate bucket. This process is
+     * repeated until either a fingerprint is inserted into an empty slot or the maximum number
+     * of evictions is reached.
+     *
+     * @param fp Fingerprint to insert
+     * @param startBucket Index of the bucket to start the search from
+     * @return true if the insertion was successful, false otherwise
+     */
+    __device__ bool insertWithEviction(TagType fp, size_t startBucket) {
+        TagType currentFp = fp;
+        size_t currentBucket = startBucket;
+
+        for (size_t evictions = 0; evictions < maxEvictions; ++evictions) {
+            auto evictSlot = (currentFp + evictions * 7) & (bucketSize - 1);
+
+            size_t evictWord = evictSlot / Bucket::tagsPerWord;
+            size_t evictTagIdx = evictSlot & (Bucket::tagsPerWord - 1);
+
+            Bucket& bucket = d_buckets[currentBucket];
+            auto expected = bucket.packedTags[evictWord].load(cuda::memory_order_relaxed);
+            uint64_t desired;
+            TagType evictedFp;
+
+            do {
+                evictedFp = bucket.extractTag(expected, evictTagIdx);
+                desired = bucket.replaceTag(expected, evictTagIdx, currentFp);
+            } while (!bucket.packedTags[evictWord].compare_exchange_strong(
+                expected, desired, cuda::memory_order_relaxed, cuda::memory_order_relaxed
+            ));
+
+            currentFp = evictedFp;
+            currentBucket = getAlternateBucket(currentBucket, evictedFp, numBuckets);
+
+            if (tryInsertAtBucket(currentBucket, currentFp)) {
                 return true;
             }
+        }
+        return false;
+    }
 
-            auto startBucket = (fp & 1) == 0 ? i1 : i2;
+    /**
+     * @brief Inserts a fingerprint into the filter by evicting existing fingerprints using a
+     * very shallow breadth-first search. It tries multiple random random eviction targets and
+     * checks if there is an empty slot in their alternate buckets. If there is, it inserts the
+     * existing fingerprint into its alternate bucket and places the new fingerprint in the
+     * original location.
+     *
+     * @param fp Fingerprint to insert
+     * @param startBucket Index of the bucket to start the search from
+     * @return true if the insertion was successful, false otherwise
+     */
+    __device__ bool insertWithEvictionBFS(TagType fp, size_t startBucket) {
+        constexpr size_t numCandidates = std::min(8UL, bucketSize / 2);
 
-            return insertWithEvictionBFS(fp, startBucket);
+        Bucket& bucket = d_buckets[startBucket];
+
+        for (size_t i = 0; i < numCandidates; ++i) {
+            size_t slot = (fp + i * 7) & (bucketSize - 1);
+            size_t atomicIdx = slot / Bucket::tagsPerWord;
+            size_t tagIdx = slot & (Bucket::tagsPerWord - 1);
+
+            auto packed = bucket.packedTags[atomicIdx].load(cuda::memory_order_relaxed);
+            TagType candidateFp = bucket.extractTag(packed, tagIdx);
+
+            if (candidateFp == EMPTY) {
+                if (tryInsertAtBucket(startBucket, fp)) {
+                    return true;
+                }
+                continue;
+            }
+
+            size_t altBucket = getAlternateBucket(startBucket, candidateFp, numBuckets);
+            if (tryInsertAtBucket(altBucket, candidateFp)) {
+                // Successfully inserted the evicted tag at its alternate location
+                // Now atomically swap in our tag at the original location
+                auto expected = bucket.packedTags[atomicIdx].load(cuda::memory_order_relaxed);
+
+                // Verify the tag is still there and try to replace it
+                if (bucket.extractTag(expected, tagIdx) == candidateFp) {
+                    auto desired = bucket.replaceTag(expected, tagIdx, fp);
+
+                    if (bucket.packedTags[atomicIdx].compare_exchange_strong(
+                            expected,
+                            desired,
+                            cuda::memory_order_relaxed,
+                            cuda::memory_order_relaxed
+                        )) {
+                        return true;
+                    }
+                }
+
+                // Failed to swap, clean up the tag we inserted to avoid duplicates
+                tryRemoveAtBucket(altBucket, candidateFp);
+            }
         }
 
-        __device__ bool contains(const T& key) const {
-            auto [i1, i2, fp] = getCandidateBuckets(key, numBuckets);
-            return d_buckets[i1].contains(fp) || d_buckets[i2].contains(fp);
+        // fall back to greedy DFS
+        return insertWithEviction(fp, startBucket);
+    }
+
+    __device__ bool insert(const T& key) {
+        auto [i1, i2, fp] = getCandidateBuckets(key, numBuckets);
+
+        if (tryInsertAtBucket(i1, fp) || tryInsertAtBucket(i2, fp)) {
+            return true;
         }
 
-        __device__ bool remove(const T& key) {
-            auto [i1, i2, fp] = getCandidateBuckets(key, numBuckets);
+        auto startBucket = (fp & 1) == 0 ? i1 : i2;
 
-            return tryRemoveAtBucket(i1, fp) || tryRemoveAtBucket(i2, fp);
-        }
-    };
+        return insertWithEvictionBFS(fp, startBucket);
+    }
 
-    DeviceView getDeviceView() {
-        return DeviceView{
-            d_buckets,
-            d_numOccupied,
-            numBuckets,
-        };
+    __device__ bool contains(const T& key) const {
+        auto [i1, i2, fp] = getCandidateBuckets(key, numBuckets);
+        return d_buckets[i1].contains(fp) || d_buckets[i2].contains(fp);
+    }
+
+    __device__ bool remove(const T& key) {
+        auto [i1, i2, fp] = getCandidateBuckets(key, numBuckets);
+
+        return tryRemoveAtBucket(i1, fp) || tryRemoveAtBucket(i2, fp);
     }
 };
 
 template <typename Config>
-__global__ void insertKernel(
-    const typename Config::KeyType* keys,
-    size_t n,
-    typename CuckooFilter<Config>::DeviceView view
-) {
+__global__ void
+insertKernel(const typename Config::KeyType* keys, size_t n, CuckooFilter<Config>* filter) {
     using BlockReduce = cub::BlockReduce<int32_t, Config::blockSize>;
     __shared__ typename BlockReduce::TempStorage tempStorage;
 
@@ -745,7 +721,7 @@ __global__ void insertKernel(
     int32_t success = 0;
 
     if (idx < n) {
-        success = view.insert(keys[idx]);
+        success = filter->insert(keys[idx]);
     }
 
     int32_t blockSuccessSum = BlockReduce(tempStorage).Sum(success);
@@ -753,7 +729,7 @@ __global__ void insertKernel(
 
     if (threadIdx.x == 0) {
         if (blockSuccessSum > 0) {
-            view.d_numOccupied->fetch_add(blockSuccessSum, cuda::memory_order_relaxed);
+            filter->d_numOccupied->fetch_add(blockSuccessSum, cuda::memory_order_relaxed);
         }
     }
 }
@@ -763,12 +739,12 @@ __global__ void containsKernel(
     const typename Config::KeyType* keys,
     bool* output,
     size_t n,
-    typename CuckooFilter<Config>::DeviceView view
+    CuckooFilter<Config>* filter
 ) {
     auto idx = globalThreadId();
 
     if (idx < n) {
-        output[idx] = view.contains(keys[idx]);
+        output[idx] = filter->contains(keys[idx]);
     }
 }
 
@@ -777,7 +753,7 @@ __global__ void deleteKernel(
     const typename Config::KeyType* keys,
     bool* output,
     size_t n,
-    typename CuckooFilter<Config>::DeviceView view
+    CuckooFilter<Config>* filter
 ) {
     using BlockReduce = cub::BlockReduce<int32_t, Config::blockSize>;
     __shared__ typename BlockReduce::TempStorage tempStorage;
@@ -786,7 +762,7 @@ __global__ void deleteKernel(
 
     int32_t success = 0;
     if (idx < n) {
-        success = view.remove(keys[idx]);
+        success = filter->remove(keys[idx]);
 
         if (output != nullptr) {
             output[idx] = success;
@@ -796,7 +772,7 @@ __global__ void deleteKernel(
     int32_t blockSum = BlockReduce(tempStorage).Sum(success);
 
     if (threadIdx.x == 0 && blockSum > 0) {
-        view.d_numOccupied->fetch_sub(blockSum, cuda::memory_order_relaxed);
+        filter->d_numOccupied->fetch_sub(blockSum, cuda::memory_order_relaxed);
     }
 }
 
@@ -829,7 +805,7 @@ __global__ void insertKernelSorted(
     const typename Config::KeyType* keys,
     const typename CuckooFilter<Config>::PackedTagType* packedTags,
     size_t n,
-    typename CuckooFilter<Config>::DeviceView view
+    CuckooFilter<Config>* filter
 ) {
     using BlockReduce = cub::BlockReduce<int, Config::blockSize>;
     __shared__ typename BlockReduce::TempStorage tempStorage;
@@ -849,16 +825,17 @@ __global__ void insertKernelSorted(
         size_t primaryBucket = packedTag >> bitsPerTag;
         auto fp = static_cast<TagType>(packedTag & fpMask);
 
-        if (view.tryInsertAtBucket(primaryBucket, fp)) {
+        if (filter->tryInsertAtBucket(primaryBucket, fp)) {
             success = 1;
         } else {
-            size_t secondaryBucket = Filter::getAlternateBucket(primaryBucket, fp, view.numBuckets);
+            size_t secondaryBucket =
+                Filter::getAlternateBucket(primaryBucket, fp, filter->numBuckets);
 
-            if (view.tryInsertAtBucket(secondaryBucket, fp)) {
+            if (filter->tryInsertAtBucket(secondaryBucket, fp)) {
                 success = 1;
             } else {
                 auto startBucket = (fp & 1) == 0 ? primaryBucket : secondaryBucket;
-                success = view.insertWithEviction(fp, startBucket);
+                success = filter->insertWithEviction(fp, startBucket);
             }
         }
     }
@@ -866,6 +843,6 @@ __global__ void insertKernelSorted(
     int32_t blockSum = BlockReduce(tempStorage).Sum(success);
 
     if (threadIdx.x == 0 && blockSum > 0) {
-        view.d_numOccupied->fetch_add(blockSum, cuda::memory_order_relaxed);
+        filter->d_numOccupied->fetch_add(blockSum, cuda::memory_order_relaxed);
     }
 }
