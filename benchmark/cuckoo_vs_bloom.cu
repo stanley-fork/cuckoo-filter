@@ -45,15 +45,7 @@ static void CuckooFilter_Insert(bm::State& state) {
         bm::DoNotOptimize(inserted);
     }
 
-    state.SetItemsProcessed(static_cast<int64_t>(state.iterations() * n));
-    state.counters["memory_bytes"] = bm::Counter(
-        static_cast<double>(filterMemory), bm::Counter::kDefaults, bm::Counter::kIs1024
-    );
-    state.counters["bytes_per_item"] = bm::Counter(
-        static_cast<double>(filterMemory) / static_cast<double>(n),
-        bm::Counter::kDefaults,
-        bm::Counter::kIs1024
-    );
+    setCommonCounters(state, filterMemory, n);
 }
 
 static void CuckooFilter_Query(bm::State& state) {
@@ -74,15 +66,7 @@ static void CuckooFilter_Query(bm::State& state) {
         bm::DoNotOptimize(d_output.data().get());
     }
 
-    state.SetItemsProcessed(static_cast<int64_t>(state.iterations() * n));
-    state.counters["memory_bytes"] = bm::Counter(
-        static_cast<double>(filterMemory), bm::Counter::kDefaults, bm::Counter::kIs1024
-    );
-    state.counters["bytes_per_item"] = bm::Counter(
-        static_cast<double>(filterMemory) / static_cast<double>(n),
-        bm::Counter::kDefaults,
-        bm::Counter::kIs1024
-    );
+    setCommonCounters(state, filterMemory, n);
 }
 
 static void CuckooFilter_Delete(bm::State& state) {
@@ -107,15 +91,7 @@ static void CuckooFilter_Delete(bm::State& state) {
         bm::DoNotOptimize(d_output.data().get());
     }
 
-    state.SetItemsProcessed(static_cast<int64_t>(state.iterations() * n));
-    state.counters["memory_bytes"] = bm::Counter(
-        static_cast<double>(filterMemory), bm::Counter::kDefaults, bm::Counter::kIs1024
-    );
-    state.counters["bytes_per_item"] = bm::Counter(
-        static_cast<double>(filterMemory) / static_cast<double>(n),
-        bm::Counter::kDefaults,
-        bm::Counter::kIs1024
-    );
+    setCommonCounters(state, filterMemory, n);
 }
 
 static void BloomFilter_Insert(bm::State& state) {
@@ -141,15 +117,7 @@ static void BloomFilter_Insert(bm::State& state) {
         cudaDeviceSynchronize();
     }
 
-    state.SetItemsProcessed(static_cast<int64_t>(state.iterations() * n));
-    state.counters["memory_bytes"] = bm::Counter(
-        static_cast<double>(filterMemory), bm::Counter::kDefaults, bm::Counter::kIs1024
-    );
-    state.counters["bytes_per_item"] = bm::Counter(
-        static_cast<double>(filterMemory) / static_cast<double>(n),
-        bm::Counter::kDefaults,
-        bm::Counter::kIs1024
-    );
+    setCommonCounters(state, filterMemory, n);
 }
 
 static void BloomFilter_Query(bm::State& state) {
@@ -179,15 +147,7 @@ static void BloomFilter_Query(bm::State& state) {
         bm::DoNotOptimize(d_output.data().get());
     }
 
-    state.SetItemsProcessed(static_cast<int64_t>(state.iterations() * n));
-    state.counters["memory_bytes"] = bm::Counter(
-        static_cast<double>(filterMemory), bm::Counter::kDefaults, bm::Counter::kIs1024
-    );
-    state.counters["bytes_per_item"] = bm::Counter(
-        static_cast<double>(filterMemory) / static_cast<double>(n),
-        bm::Counter::kDefaults,
-        bm::Counter::kIs1024
-    );
+    setCommonCounters(state, filterMemory, n);
 }
 
 static void CuckooFilter_InsertAndQuery(bm::State& state) {
@@ -214,15 +174,7 @@ static void CuckooFilter_InsertAndQuery(bm::State& state) {
         bm::DoNotOptimize(d_output.data().get());
     }
 
-    state.SetItemsProcessed(static_cast<int64_t>(state.iterations() * n));
-    state.counters["memory_bytes"] = bm::Counter(
-        static_cast<double>(filterMemory), bm::Counter::kDefaults, bm::Counter::kIs1024
-    );
-    state.counters["bytes_per_item"] = bm::Counter(
-        static_cast<double>(filterMemory) / static_cast<double>(n),
-        bm::Counter::kDefaults,
-        bm::Counter::kIs1024
-    );
+    setCommonCounters(state, filterMemory, n);
 }
 
 static void CuckooFilter_InsertQueryDelete(bm::State& state) {
@@ -251,15 +203,7 @@ static void CuckooFilter_InsertQueryDelete(bm::State& state) {
         bm::DoNotOptimize(d_output.data().get());
     }
 
-    state.SetItemsProcessed(static_cast<int64_t>(state.iterations() * n));
-    state.counters["memory_bytes"] = bm::Counter(
-        static_cast<double>(filterMemory), bm::Counter::kDefaults, bm::Counter::kIs1024
-    );
-    state.counters["bytes_per_item"] = bm::Counter(
-        static_cast<double>(filterMemory) / static_cast<double>(n),
-        bm::Counter::kDefaults,
-        bm::Counter::kIs1024
-    );
+    setCommonCounters(state, filterMemory, n);
 }
 
 static void BloomFilter_InsertAndQuery(bm::State& state) {
@@ -294,15 +238,7 @@ static void BloomFilter_InsertAndQuery(bm::State& state) {
         bm::DoNotOptimize(d_output.data().get());
     }
 
-    state.SetItemsProcessed(static_cast<int64_t>(state.iterations() * n));
-    state.counters["memory_bytes"] = bm::Counter(
-        static_cast<double>(filterMemory), bm::Counter::kDefaults, bm::Counter::kIs1024
-    );
-    state.counters["bytes_per_item"] = bm::Counter(
-        static_cast<double>(filterMemory) / static_cast<double>(n),
-        bm::Counter::kDefaults,
-        bm::Counter::kIs1024
-    );
+    setCommonCounters(state, filterMemory, n);
 }
 
 static void CuckooFilter_FalsePositiveRate(bm::State& state) {

@@ -81,15 +81,7 @@ static void Local_Insert(bm::State& state) {
         bm::DoNotOptimize(inserted);
     }
 
-    state.SetItemsProcessed(static_cast<int64_t>(state.iterations() * n));
-    state.counters["memory_bytes"] = bm::Counter(
-        static_cast<double>(filterMemory), bm::Counter::kDefaults, bm::Counter::kIs1024
-    );
-    state.counters["bytes_per_item"] = bm::Counter(
-        static_cast<double>(filterMemory) / static_cast<double>(n),
-        bm::Counter::kDefaults,
-        bm::Counter::kIs1024
-    );
+    setCommonCounters(state, filterMemory, n);
 }
 
 static void IPC_Insert(bm::State& state) {
@@ -119,15 +111,7 @@ static void IPC_Insert(bm::State& state) {
         bm::DoNotOptimize(inserted);
     }
 
-    state.SetItemsProcessed(static_cast<int64_t>(state.iterations() * n));
-    state.counters["memory_bytes"] = bm::Counter(
-        static_cast<double>(filterMemory), bm::Counter::kDefaults, bm::Counter::kIs1024
-    );
-    state.counters["bytes_per_item"] = bm::Counter(
-        static_cast<double>(filterMemory) / static_cast<double>(n),
-        bm::Counter::kDefaults,
-        bm::Counter::kIs1024
-    );
+    setCommonCounters(state, filterMemory, n);
 }
 
 static void Local_Query(bm::State& state) {
@@ -148,15 +132,7 @@ static void Local_Query(bm::State& state) {
         bm::DoNotOptimize(d_output.data().get());
     }
 
-    state.SetItemsProcessed(static_cast<int64_t>(state.iterations() * n));
-    state.counters["memory_bytes"] = bm::Counter(
-        static_cast<double>(filterMemory), bm::Counter::kDefaults, bm::Counter::kIs1024
-    );
-    state.counters["bytes_per_item"] = bm::Counter(
-        static_cast<double>(filterMemory) / static_cast<double>(n),
-        bm::Counter::kDefaults,
-        bm::Counter::kIs1024
-    );
+    setCommonCounters(state, filterMemory, n);
 }
 
 static void IPC_Query(bm::State& state) {
@@ -185,15 +161,7 @@ static void IPC_Query(bm::State& state) {
         bm::DoNotOptimize(d_output.data().get());
     }
 
-    state.SetItemsProcessed(static_cast<int64_t>(state.iterations() * n));
-    state.counters["memory_bytes"] = bm::Counter(
-        static_cast<double>(filterMemory), bm::Counter::kDefaults, bm::Counter::kIs1024
-    );
-    state.counters["bytes_per_item"] = bm::Counter(
-        static_cast<double>(filterMemory) / static_cast<double>(n),
-        bm::Counter::kDefaults,
-        bm::Counter::kIs1024
-    );
+    setCommonCounters(state, filterMemory, n);
 }
 
 static void Local_Delete(bm::State& state) {
@@ -218,15 +186,7 @@ static void Local_Delete(bm::State& state) {
         bm::DoNotOptimize(d_output.data().get());
     }
 
-    state.SetItemsProcessed(static_cast<int64_t>(state.iterations() * n));
-    state.counters["memory_bytes"] = bm::Counter(
-        static_cast<double>(filterMemory), bm::Counter::kDefaults, bm::Counter::kIs1024
-    );
-    state.counters["bytes_per_item"] = bm::Counter(
-        static_cast<double>(filterMemory) / static_cast<double>(n),
-        bm::Counter::kDefaults,
-        bm::Counter::kIs1024
-    );
+    setCommonCounters(state, filterMemory, n);
 }
 
 static void IPC_Delete(bm::State& state) {
@@ -259,15 +219,7 @@ static void IPC_Delete(bm::State& state) {
         bm::DoNotOptimize(d_output.data().get());
     }
 
-    state.SetItemsProcessed(static_cast<int64_t>(state.iterations() * n));
-    state.counters["memory_bytes"] = bm::Counter(
-        static_cast<double>(filterMemory), bm::Counter::kDefaults, bm::Counter::kIs1024
-    );
-    state.counters["bytes_per_item"] = bm::Counter(
-        static_cast<double>(filterMemory) / static_cast<double>(n),
-        bm::Counter::kDefaults,
-        bm::Counter::kIs1024
-    );
+    setCommonCounters(state, filterMemory, n);
 }
 
 static void Local_InsertAndQuery(bm::State& state) {
@@ -294,15 +246,7 @@ static void Local_InsertAndQuery(bm::State& state) {
         bm::DoNotOptimize(d_output.data().get());
     }
 
-    state.SetItemsProcessed(static_cast<int64_t>(state.iterations() * n));
-    state.counters["memory_bytes"] = bm::Counter(
-        static_cast<double>(filterMemory), bm::Counter::kDefaults, bm::Counter::kIs1024
-    );
-    state.counters["bytes_per_item"] = bm::Counter(
-        static_cast<double>(filterMemory) / static_cast<double>(n),
-        bm::Counter::kDefaults,
-        bm::Counter::kIs1024
-    );
+    setCommonCounters(state, filterMemory, n);
 }
 
 static void IPC_InsertAndQuery(bm::State& state) {
@@ -337,15 +281,7 @@ static void IPC_InsertAndQuery(bm::State& state) {
         bm::DoNotOptimize(d_output.data().get());
     }
 
-    state.SetItemsProcessed(static_cast<int64_t>(state.iterations() * n));
-    state.counters["memory_bytes"] = bm::Counter(
-        static_cast<double>(filterMemory), bm::Counter::kDefaults, bm::Counter::kIs1024
-    );
-    state.counters["bytes_per_item"] = bm::Counter(
-        static_cast<double>(filterMemory) / static_cast<double>(n),
-        bm::Counter::kDefaults,
-        bm::Counter::kIs1024
-    );
+    setCommonCounters(state, filterMemory, n);
 }
 
 BENCHMARK(Local_Insert)->RangeMultiplier(2)->Range(1 << 16, 1 << 28)->Unit(bm::kMillisecond);
@@ -360,10 +296,12 @@ BENCHMARK(Local_InsertAndQuery)
     ->Range(1 << 16, 1 << 28)
     ->Unit(bm::kMillisecond);
 
+// clang-format off
 BENCHMARK(IPC_InsertAndQuery)
     ->RangeMultiplier(2)
     ->Range(1 << 16, 1 << 28)
     ->Unit(bm::kMillisecond);
+// clang-format on
 
 int main(int argc, char** argv) {
     bm::Initialize(&argc, argv);

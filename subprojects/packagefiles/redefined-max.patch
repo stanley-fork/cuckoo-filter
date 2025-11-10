@@ -1,0 +1,23 @@
+diff --git a/lib/vacuumfilter/ModifiedCuckooFilter/src/cuckoofilter.h b/lib/vacuumfilter/ModifiedCuckooFilter/src/cuckoofilter.h
+index 05f9e63..30a9650 100644
+--- a/lib/vacuumfilter/ModifiedCuckooFilter/src/cuckoofilter.h
++++ b/lib/vacuumfilter/ModifiedCuckooFilter/src/cuckoofilter.h
+@@ -21,11 +21,6 @@
+ const int AR = 4;
+ const int BATCH_SIZE = 128;
+ 
+-int max(int x, int y) {
+-    if (x > y) return x;
+-    return y;
+-}
+-
+ inline int find_the_highest_bit(int v) {
+     // tricks of bit
+     // from http://graphics.stanford.edu/~seander/bithacks.html
+@@ -753,4 +748,4 @@ std::string CuckooFilter<ItemType, bits_per_item, TableType, HashFamily>::Info()
+ }
+ }  // namespace modifiedcuckoofilter
+ 
+-#endif  // MODIFIED_CUCKOO_FILTER_CUCKOO_FILTER_H_
+\ No newline at end of file
++#endif  // MODIFIED_CUCKOO_FILTER_CUCKOO_FILTER_H_

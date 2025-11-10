@@ -3,7 +3,6 @@
 #include <iostream>
 #include <string>
 #include <thread>
-#include "benchmark_common.cuh"
 #include "CuckooFilterIPC.cuh"
 
 using Config = CuckooConfig<uint32_t, 16, 500, 128, 16, XorHashStrategy>;

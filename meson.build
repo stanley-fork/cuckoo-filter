@@ -18,7 +18,7 @@ cuda_args = [
     '-gencode=arch=compute_75,code=compute_75',
 ]
 
-includes = ['./include']
+includes = ['./include', './benchmark']
 deps = [
     dependency('CLI11', required: true),
 ]
@@ -44,7 +44,7 @@ executable(
 executable(
     'cuckoo-filter-ipc-server',
     './src/ipc_server_main.cu',
-    include_directories: includes + ['./benchmark'],
+    include_directories: includes,
     dependencies: deps,
     cuda_args: cuda_args,
     install: true,
@@ -120,6 +120,15 @@ if get_option('BUILD_BENCHMARKS') == true
         dependencies: bench_deps,
         include_directories: includes,
         cuda_args: cuda_args,
+        install: false,
+    )
+
+    executable(
+        'benchmark-cuckoo-vs-partitioned',
+        './benchmark/cuckoo_vs_partitioned.cu',
+        dependencies: bench_deps,
+        include_directories: includes,
+        cuda_args: cuda_args + ['-w'],
         install: false,
     )
 endif

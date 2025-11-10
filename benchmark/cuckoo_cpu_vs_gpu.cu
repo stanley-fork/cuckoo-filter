@@ -15,16 +15,6 @@ constexpr double TARGET_LOAD_FACTOR = 0.95;
 using GPUConfig = CuckooConfig<uint32_t, 16, 500, 128, 16>;
 constexpr size_t CPU_BITS_PER_ITEM = GPUConfig::bitsPerTag;
 
-template <typename T>
-std::vector<T>
-generateKeysCPU(size_t n, unsigned seed = 42, T min = 1, T max = std::numeric_limits<T>::max()) {
-    std::vector<T> keys(n);
-    std::mt19937 rng(seed);
-    std::uniform_int_distribution<T> dist(min, max);
-    std::generate(keys.begin(), keys.end(), [&]() { return dist(rng); });
-    return keys;
-}
-
 static void GPU_CuckooFilter_Insert(bm::State& state) {
     auto [capacity, n] = calculateCapacityAndSize<GPUConfig>(state.range(0), TARGET_LOAD_FACTOR);
 
@@ -44,15 +34,7 @@ static void GPU_CuckooFilter_Insert(bm::State& state) {
         bm::DoNotOptimize(inserted);
     }
 
-    state.SetItemsProcessed(static_cast<int64_t>(state.iterations() * n));
-    state.counters["memory_bytes"] = bm::Counter(
-        static_cast<double>(filterMemory), bm::Counter::kDefaults, bm::Counter::kIs1024
-    );
-    state.counters["bytes_per_item"] = bm::Counter(
-        static_cast<double>(filterMemory) / static_cast<double>(capacity),
-        bm::Counter::kDefaults,
-        bm::Counter::kIs1024
-    );
+    setCommonCounters(state, filterMemory, n);
 }
 
 static void GPU_CuckooFilter_Query(bm::State& state) {
@@ -74,15 +56,7 @@ static void GPU_CuckooFilter_Query(bm::State& state) {
         bm::DoNotOptimize(d_output.data().get());
     }
 
-    state.SetItemsProcessed(static_cast<int64_t>(state.iterations() * n));
-    state.counters["memory_bytes"] = bm::Counter(
-        static_cast<double>(filterMemory), bm::Counter::kDefaults, bm::Counter::kIs1024
-    );
-    state.counters["bytes_per_item"] = bm::Counter(
-        static_cast<double>(filterMemory) / static_cast<double>(capacity),
-        bm::Counter::kDefaults,
-        bm::Counter::kIs1024
-    );
+    setCommonCounters(state, filterMemory, n);
 }
 
 static void GPU_CuckooFilter_Delete(bm::State& state) {
@@ -107,15 +81,7 @@ static void GPU_CuckooFilter_Delete(bm::State& state) {
         bm::DoNotOptimize(d_output.data().get());
     }
 
-    state.SetItemsProcessed(static_cast<int64_t>(state.iterations() * n));
-    state.counters["memory_bytes"] = bm::Counter(
-        static_cast<double>(filterMemory), bm::Counter::kDefaults, bm::Counter::kIs1024
-    );
-    state.counters["bytes_per_item"] = bm::Counter(
-        static_cast<double>(filterMemory) / static_cast<double>(capacity),
-        bm::Counter::kDefaults,
-        bm::Counter::kIs1024
-    );
+    setCommonCounters(state, filterMemory, n);
 }
 
 static void GPU_CuckooFilter_InsertQueryDelete(bm::State& state) {
@@ -144,15 +110,7 @@ static void GPU_CuckooFilter_InsertQueryDelete(bm::State& state) {
         bm::DoNotOptimize(d_output.data().get());
     }
 
-    state.SetItemsProcessed(static_cast<int64_t>(state.iterations() * n));
-    state.counters["memory_bytes"] = bm::Counter(
-        static_cast<double>(filterMemory), bm::Counter::kDefaults, bm::Counter::kIs1024
-    );
-    state.counters["bytes_per_item"] = bm::Counter(
-        static_cast<double>(filterMemory) / static_cast<double>(capacity),
-        bm::Counter::kDefaults,
-        bm::Counter::kIs1024
-    );
+    setCommonCounters(state, filterMemory, n);
 }
 
 static void CPU_CuckooFilter_Insert(bm::State& state) {
@@ -162,7 +120,6 @@ static void CPU_CuckooFilter_Insert(bm::State& state) {
     cuckoofilter::CuckooFilter<uint32_t, CPU_BITS_PER_ITEM> filter(capacity);
 
     size_t filterMemory = filter.SizeInBytes();
-    size_t actualCapacity = filterMemory / (CPU_BITS_PER_ITEM / 8);
 
     for (auto _ : state) {
         state.PauseTiming();
@@ -178,15 +135,7 @@ static void CPU_CuckooFilter_Insert(bm::State& state) {
         bm::DoNotOptimize(inserted);
     }
 
-    state.SetItemsProcessed(static_cast<int64_t>(state.iterations() * n));
-    state.counters["memory_bytes"] = bm::Counter(
-        static_cast<double>(filterMemory), bm::Counter::kDefaults, bm::Counter::kIs1024
-    );
-    state.counters["bytes_per_item"] = bm::Counter(
-        static_cast<double>(filterMemory) / static_cast<double>(actualCapacity),
-        bm::Counter::kDefaults,
-        bm::Counter::kIs1024
-    );
+    setCommonCounters(state, filterMemory, n);
 }
 
 static void CPU_CuckooFilter_Query(bm::State& state) {
@@ -200,7 +149,6 @@ static void CPU_CuckooFilter_Query(bm::State& state) {
     }
 
     size_t filterMemory = filter.SizeInBytes();
-    size_t actualCapacity = filterMemory / (CPU_BITS_PER_ITEM / 8);
 
     for (auto _ : state) {
         size_t found = 0;
@@ -212,15 +160,7 @@ static void CPU_CuckooFilter_Query(bm::State& state) {
         bm::DoNotOptimize(found);
     }
 
-    state.SetItemsProcessed(static_cast<int64_t>(state.iterations() * n));
-    state.counters["memory_bytes"] = bm::Counter(
-        static_cast<double>(filterMemory), bm::Counter::kDefaults, bm::Counter::kIs1024
-    );
-    state.counters["bytes_per_item"] = bm::Counter(
-        static_cast<double>(filterMemory) / static_cast<double>(actualCapacity),
-        bm::Counter::kDefaults,
-        bm::Counter::kIs1024
-    );
+    setCommonCounters(state, filterMemory, n);
 }
 
 static void CPU_CuckooFilter_Delete(bm::State& state) {
@@ -230,7 +170,6 @@ static void CPU_CuckooFilter_Delete(bm::State& state) {
     cuckoofilter::CuckooFilter<uint32_t, CPU_BITS_PER_ITEM> filter(capacity);
 
     size_t filterMemory = filter.SizeInBytes();
-    size_t actualCapacity = filterMemory / (CPU_BITS_PER_ITEM / 8);
 
     for (auto _ : state) {
         state.PauseTiming();
@@ -249,15 +188,7 @@ static void CPU_CuckooFilter_Delete(bm::State& state) {
         bm::DoNotOptimize(deleted);
     }
 
-    state.SetItemsProcessed(static_cast<int64_t>(state.iterations() * n));
-    state.counters["memory_bytes"] = bm::Counter(
-        static_cast<double>(filterMemory), bm::Counter::kDefaults, bm::Counter::kIs1024
-    );
-    state.counters["bytes_per_item"] = bm::Counter(
-        static_cast<double>(filterMemory) / static_cast<double>(actualCapacity),
-        bm::Counter::kDefaults,
-        bm::Counter::kIs1024
-    );
+    setCommonCounters(state, filterMemory, n);
 }
 
 static void CPU_CuckooFilter_InsertQueryDelete(bm::State& state) {
@@ -267,7 +198,6 @@ static void CPU_CuckooFilter_InsertQueryDelete(bm::State& state) {
     cuckoofilter::CuckooFilter<uint32_t, CPU_BITS_PER_ITEM> filter(capacity);
 
     size_t filterMemory = filter.SizeInBytes();
-    size_t actualCapacity = filterMemory / (CPU_BITS_PER_ITEM / 8);
 
     for (auto _ : state) {
         state.PauseTiming();
@@ -300,15 +230,7 @@ static void CPU_CuckooFilter_InsertQueryDelete(bm::State& state) {
         bm::DoNotOptimize(deleted);
     }
 
-    state.SetItemsProcessed(static_cast<int64_t>(state.iterations() * n));
-    state.counters["memory_bytes"] = bm::Counter(
-        static_cast<double>(filterMemory), bm::Counter::kDefaults, bm::Counter::kIs1024
-    );
-    state.counters["bytes_per_item"] = bm::Counter(
-        static_cast<double>(filterMemory) / static_cast<double>(actualCapacity),
-        bm::Counter::kDefaults,
-        bm::Counter::kIs1024
-    );
+    setCommonCounters(state, filterMemory, n);
 }
 
 static void GPU_CuckooFilter_FalsePositiveRate(bm::State& state) {
