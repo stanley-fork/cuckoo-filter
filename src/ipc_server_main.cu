@@ -5,7 +5,7 @@
 #include <thread>
 #include "CuckooFilterIPC.cuh"
 
-using Config = CuckooConfig<uint32_t, 16, 500, 128, 16, XorHashStrategy>;
+using Config = CuckooConfig<uint32_t, 16, 500, 128, 16, XorAltBucketPolicy>;
 static constexpr char SERVER_NAME[] = "benchmark_server";
 
 CuckooFilterIPCServer<Config>* g_server = nullptr;

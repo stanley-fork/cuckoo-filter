@@ -12,10 +12,10 @@
  * to compute alternate bucket indices.
  */
 template <typename KeyType, typename TagType, size_t bitsPerTag, size_t bucketSize>
-struct XorHashStrategy {
+struct XorAltBucketPolicy {
     static constexpr size_t fpMask = (1ULL << bitsPerTag) - 1;
 
-    static constexpr char name[] = "XorHashStrategy";
+    static constexpr char name[] = "XorAltBucketPolicy";
 
     template <typename H>
     static __host__ __device__ uint64_t hash64(const H& key) {
@@ -78,10 +78,10 @@ struct XorHashStrategy {
  * - Block 1: buckets [numBuckets/2, numBuckets)
  */
 template <typename KeyType, typename TagType, size_t bitsPerTag, size_t bucketSize>
-struct AddSubHashStrategy {
+struct AddSubAltBucketPolicy {
     static constexpr size_t fpMask = (1ULL << bitsPerTag) - 1;
 
-    static constexpr char name[] = "AddSubHashStrategy";
+    static constexpr char name[] = "AddSubAltBucketPolicy";
 
     template <typename H>
     static __host__ __device__ uint64_t hash64(const H& key) {

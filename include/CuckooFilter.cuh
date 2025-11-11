@@ -21,10 +21,10 @@
 template <
     typename T,
     size_t bitsPerTag_,
-    size_t maxEvictions_,
-    size_t blockSize_,
-    size_t bucketSize_,
-    template <typename, typename, size_t, size_t> class HashStrategy_ = XorHashStrategy>
+    size_t maxEvictions_ = 500,
+    size_t blockSize_ = 256,
+    size_t bucketSize_ = 16,
+    template <typename, typename, size_t, size_t> class AltBucketPolicy_ = XorAltBucketPolicy>
 struct CuckooConfig {
     using KeyType = T;
     static constexpr size_t bitsPerTag = bitsPerTag_;
@@ -37,7 +37,7 @@ struct CuckooConfig {
         uint8_t,
         typename std::conditional<bitsPerTag <= 16, uint16_t, uint32_t>::type>::type;
 
-    using HashStrategy = HashStrategy_<KeyType, TagType, bitsPerTag, bucketSize_>;
+    using AltBucketPolicy = AltBucketPolicy_<KeyType, TagType, bitsPerTag, bucketSize_>;
 };
 
 template <typename Config>
@@ -85,7 +85,7 @@ struct CuckooFilter {
     static constexpr size_t bitsPerTag = Config::bitsPerTag;
 
     using TagType = typename Config::TagType;
-    using HashStrategy = typename Config::HashStrategy;
+    using AltBucketPolicy = typename Config::AltBucketPolicy;
 
     static constexpr size_t tagEntryBytes = sizeof(TagType);
     static constexpr size_t bucketSize = Config::bucketSize;
@@ -253,17 +253,17 @@ struct CuckooFilter {
 
     template <typename H>
     static __host__ __device__ uint64_t hash64(const H& key) {
-        return HashStrategy::hash64(key);
+        return AltBucketPolicy::hash64(key);
     }
 
     static __host__ __device__ cuda::std::tuple<size_t, size_t, TagType>
     getCandidateBuckets(const T& key, size_t numBuckets) {
-        return HashStrategy::getCandidateBuckets(key, numBuckets);
+        return AltBucketPolicy::getCandidateBuckets(key, numBuckets);
     }
 
     static __host__ __device__ size_t
     getAlternateBucket(size_t bucket, TagType fp, size_t numBuckets) {
-        return HashStrategy::getAlternateBucket(bucket, fp, numBuckets);
+        return AltBucketPolicy::getAlternateBucket(bucket, fp, numBuckets);
     }
 
     /**
@@ -271,7 +271,7 @@ struct CuckooFilter {
      * modulo on the bucket indices
      */
     static size_t calculateNumBuckets(size_t capacity) {
-        return HashStrategy::calculateNumBuckets(capacity);
+        return AltBucketPolicy::calculateNumBuckets(capacity);
     }
 
     CuckooFilter(const CuckooFilter&) = delete;

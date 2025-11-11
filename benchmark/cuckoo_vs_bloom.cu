@@ -17,7 +17,7 @@
 namespace bm = benchmark;
 
 constexpr double TARGET_LOAD_FACTOR = 0.95;
-using Config = CuckooConfig<uint64_t, 16, 500, 128, 16, XorHashStrategy>;
+using Config = CuckooConfig<uint64_t, 16, 500, 128, 16, XorAltBucketPolicy>;
 
 template <typename Filter>
 size_t cucoNumBlocks(size_t n) {

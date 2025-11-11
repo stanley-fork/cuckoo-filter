@@ -31,12 +31,12 @@ int main(int argc, char** argv) {
 
     CLI11_PARSE(app, argc, argv);
 
-    using Config = CuckooConfig<uint64_t, 16, 500, 256, 16, XorHashStrategy>;
+    using Config = CuckooConfig<uint64_t, 16, 500, 128, 16, XorAltBucketPolicy>;
 
     size_t capacity = 1ULL << exponent;
     size_t n = capacity * target_load_factor;
 
-    std::cout << "Using " << Config::HashStrategy::name << " as the hash strategy" << std::endl;
+    std::cout << "Using " << Config::AltBucketPolicy::name << " as the hash strategy" << std::endl;
 
     thrust::device_vector<uint64_t> d_input(n);
     thrust::device_vector<uint8_t> d_output(n);
