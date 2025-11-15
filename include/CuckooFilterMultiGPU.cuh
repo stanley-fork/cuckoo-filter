@@ -367,7 +367,7 @@ class CuckooFilterMultiGPU {
 
    public:
     CuckooFilterMultiGPU(size_t numGPUs, size_t capacity)
-        : numGPUs(numGPUs), capacityPerGPU(static_cast<size_t>(SDIV(capacity, numGPUs) * 1.05)) {
+        : numGPUs(numGPUs), capacityPerGPU(static_cast<size_t>(SDIV(capacity, numGPUs))) {
         assert(numGPUs > 0 && "Number of GPUs must be at least 1");
 
         streams.resize(numGPUs);
