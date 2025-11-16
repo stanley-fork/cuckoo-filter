@@ -140,25 +140,30 @@ class CuckooFilterMultiGPU {
     }
 
     /**
-     * @brief Generic function for querying the filter and reordering results.
-     * Processes keys in chunks dynamically sized based on available GPU VRAM.
-     * @tparam returnOccupied If true, the function queries and returns
-     * the total number of occupied slots after the operation.
-     * @tparam FilterFunctor A callable that performs the desired CuckooFilter operation (e.g.,
-     * contains, delete).
+     * @brief Generic function for processing keys and optionally reordering results.
+     * Processes keys in chunks dynamically sized based on available GPU VRAM. This function
+     * is the common backend for insertMany, containsMany, and deleteMany.
+     *
      * @param h_keys Host vector of keys to process.
-     * @param h_output Host vector to store the boolean results.
-     * @param filterOp The specific filter operation to execute.
+     * @param h_output Optional host vector to store the boolean results. If nullptr, no results are
+     * returned.
+     * @param filterOp The specific CuckooFilter operation to execute.
+     * @tparam returnOccupied If true, the function returns the total number of occupied slots after
+     * the operation.
+     * @tparam hasOutput If true, the function expects an output buffer to store the results.
      * @return Total occupied slots if returnOccupied is true, otherwise 0.
      */
-    template <bool returnOccupied, typename FilterFunctor>
-    size_t queryAndReorder(
+    template <bool returnOccupied, bool hasOutput, typename FilterFunc>
+    size_t executeOperation(
         const thrust::host_vector<T>& h_keys,
         thrust::host_vector<bool>* h_output,
-        FilterFunctor filterOp
+        FilterFunc filterOp
     ) {
         size_t n = h_keys.size();
-        h_output->resize(n);
+
+        if constexpr (hasOutput) {
+            h_output->resize(n);
+        }
 
         if (n == 0) {
             return returnOccupied ? totalOccupiedSlots() : 0;
@@ -168,9 +173,10 @@ class CuckooFilterMultiGPU {
         while (processedCount < n) {
             std::vector<size_t> freeMem = getGpuMemoryInfo();
 
-            // Estimate memory needed per item for sorting, including overhead.
-            // (key + original_index + target_gpu_index) * safety_factor
-            const size_t memPerItem = sizeof(T) + 2 * sizeof(size_t);
+            // Estimate memory needed per item, including overhead.
+            // If reordering is needed, we also need to store the original index.
+            const size_t memPerItem =
+                sizeof(T) + sizeof(size_t) + (hasOutput ? sizeof(size_t) : 0);
 
             // Thrust likes to use A LOT of temporary memory
             const float safetyFactor = 3.0f;
@@ -189,14 +195,15 @@ class CuckooFilterMultiGPU {
 
             totalChunkSize = std::min(totalChunkSize, remainingKeys);
 
+            const size_t totalCapacityInChunk =
+                std::accumulate(chunkSizes.begin(), chunkSizes.end(), size_t(0));
+
             std::vector<size_t> chunkOffsets(numGPUs + 1, 0);
+
             // Proportionally resize chunk sizes to match the total we can process
             for (size_t i = 0; i < numGPUs; ++i) {
                 auto keysForGPU = static_cast<size_t>(
-                    static_cast<double>(chunkSizes[i]) /
-                    static_cast<double>(
-                        std::accumulate(chunkSizes.begin(), chunkSizes.end(), size_t(0))
-                    ) *
+                    static_cast<double>(chunkSizes[i]) / static_cast<double>(totalCapacityInChunk) *
                     totalChunkSize
                 );
                 chunkOffsets[i + 1] = chunkOffsets[i] + keysForGPU;
@@ -219,15 +226,24 @@ class CuckooFilterMultiGPU {
                     h_keys.begin() + processedCount + localChunkEnd
                 );
 
-                thrust::device_vector<size_t> d_localIndices(localChunkSize);
-                thrust::sequence(thrust::device, d_localIndices.begin(), d_localIndices.end(), 0);
+                thrust::device_vector<size_t> d_localIndices;
+                if constexpr (hasOutput) {
+                    d_localIndices.resize(localChunkSize);
+                    thrust::sequence(
+                        thrust::device, d_localIndices.begin(), d_localIndices.end(), 0
+                    );
+                }
 
                 thrust::device_vector<size_t> d_sendCounts(numGPUs);
                 thrust::device_vector<size_t> d_sendOffsets(numGPUs);
-                partitionByGPU(d_localKeys, d_sendCounts, d_sendOffsets, &d_localIndices);
+                partitionByGPU(
+                    d_localKeys,
+                    d_sendCounts,
+                    d_sendOffsets,
+                    hasOutput ? &d_localIndices : nullptr
+                );
 
                 thrust::device_vector<size_t> d_recvCounts(numGPUs);
-
                 exchangeCounts(gpuId, d_sendCounts, d_recvCounts);
 
                 thrust::device_vector<size_t> d_recvOffsets(numGPUs);
@@ -275,8 +291,16 @@ class CuckooFilterMultiGPU {
                 NCCL_CALL(ncclGroupEnd());
 
                 // Perform the filter operation on the received keys
-                thrust::device_vector<bool> d_localResults(totalToReceive);
+                thrust::device_vector<bool> d_localResults;
+                if constexpr (hasOutput) {
+                    d_localResults.resize(totalToReceive);
+                }
                 filterOp(filters[gpuId], d_receivedKeys, d_localResults, streams[gpuId]);
+
+                // If no output is required, we are done for this GPU
+                if constexpr (!hasOutput) {
+                    return;
+                }
 
                 // Shuffle results back to the original GPUs
                 thrust::device_vector<bool> d_resultsToSendBack(localChunkSize);
@@ -367,7 +391,7 @@ class CuckooFilterMultiGPU {
 
    public:
     CuckooFilterMultiGPU(size_t numGPUs, size_t capacity)
-        : numGPUs(numGPUs), capacityPerGPU(static_cast<size_t>(SDIV(capacity, numGPUs))) {
+        : numGPUs(numGPUs), capacityPerGPU(static_cast<size_t>(SDIV(capacity, numGPUs) * 1.02)) {
         assert(numGPUs > 0 && "Number of GPUs must be at least 1");
 
         streams.resize(numGPUs);
@@ -405,125 +429,23 @@ class CuckooFilterMultiGPU {
      * @return The total number of occupied slots across all GPUs after insertion.
      */
     size_t insertMany(const thrust::host_vector<T>& h_keys) {
-        size_t n = h_keys.size();
-        if (n == 0) {
-            return totalOccupiedSlots();
-        }
-
-        size_t processedCount = 0;
-        while (processedCount < n) {
-            std::vector<size_t> freeMem = getGpuMemoryInfo();
-
-            // Estimate memory needed per item, including overhead.
-            // (key + target_gpu_index) * safety_factor
-            const size_t memPerItem = sizeof(T) + sizeof(size_t);
-
-            // Thrust likes to use A LOT of temporary memory
-            const float safetyFactor = 3.0f;
-            const auto requiredMemPerItem = static_cast<size_t>(memPerItem * safetyFactor);
-
-            std::vector<size_t> chunkSizes(numGPUs);
-            size_t totalChunkSize = 0;
-            size_t remainingKeys = n - processedCount;
-
-            for (size_t i = 0; i < numGPUs; ++i) {
-                size_t maxItemsForGPU = freeMem[i] / requiredMemPerItem;
-                chunkSizes[i] = maxItemsForGPU;
-                totalChunkSize += chunkSizes[i];
-            }
-
-            totalChunkSize = std::min(totalChunkSize, remainingKeys);
-
-            std::vector<size_t> chunkOffsets(numGPUs + 1, 0);
-            for (size_t i = 0; i < numGPUs; ++i) {
-                auto keysForGPU = static_cast<size_t>(
-                    static_cast<double>(chunkSizes[i]) /
-                    static_cast<double>(
-                        std::accumulate(chunkSizes.begin(), chunkSizes.end(), size_t(0))
-                    ) *
-                    totalChunkSize
-                );
-
-                chunkOffsets[i + 1] = chunkOffsets[i] + keysForGPU;
-            }
-            chunkOffsets[numGPUs] = totalChunkSize;
-
-            parallelForGPUs([&](size_t gpuId) {
-                size_t localChunkStart = chunkOffsets[gpuId];
-                size_t localChunkEnd = chunkOffsets[gpuId + 1];
-                size_t localChunkSize = localChunkEnd - localChunkStart;
-
-                if (localChunkSize <= 0) {
-                    return;
-                }
-
-                thrust::device_vector<T> d_localKeys(
-                    h_keys.begin() + processedCount + localChunkStart,
-                    h_keys.begin() + processedCount + localChunkEnd
-                );
-
-                thrust::device_vector<size_t> d_sendCounts(numGPUs);
-                thrust::device_vector<size_t> d_sendOffsets(numGPUs);
-                partitionByGPU(d_localKeys, d_sendCounts, d_sendOffsets);
-
-                thrust::device_vector<size_t> d_recvCounts(numGPUs);
-
-                exchangeCounts(gpuId, d_sendCounts, d_recvCounts);
-
-                thrust::device_vector<size_t> d_recvOffsets(numGPUs);
-                thrust::exclusive_scan(
-                    thrust::device,
-                    d_recvCounts.begin(),
-                    d_recvCounts.end(),
-                    d_recvOffsets.begin(),
-                    0
-                );
-                size_t totalToReceive = thrust::reduce(
-                    thrust::device, d_recvCounts.begin(), d_recvCounts.end(), size_t(0)
-                );
-
-                if (totalToReceive == 0) {
-                    return;
-                }
-
-                thrust::device_vector<T> d_receivedKeys(totalToReceive);
-                NCCL_CALL(ncclGroupStart());
-                for (size_t peerId = 0; peerId < numGPUs; ++peerId) {
-                    if (d_sendCounts[peerId] > 0) {
-                        NCCL_CALL(ncclSend(
-                            d_localKeys.data().get() + d_sendOffsets[peerId],
-                            d_sendCounts[peerId] * sizeof(T),
-                            ncclChar,
-                            peerId,
-                            comms[gpuId],
-                            streams[gpuId]
-                        ));
-                    }
-                    if (d_recvCounts[peerId] > 0) {
-                        NCCL_CALL(ncclRecv(
-                            d_receivedKeys.data().get() + d_recvOffsets[peerId],
-                            d_recvCounts[peerId] * sizeof(T),
-                            ncclChar,
-                            peerId,
-                            comms[gpuId],
-                            streams[gpuId]
-                        ));
-                    }
-                }
-                NCCL_CALL(ncclGroupEnd());
-
-                filters[gpuId]->insertMany(d_receivedKeys, streams[gpuId]);
-            });
-
-            synchronizeAllGPUs();
-            processedCount += totalChunkSize;
-        }
-
-        return totalOccupiedSlots();
+        return executeOperation<true, false>(
+            h_keys,
+            nullptr,
+            [](CuckooFilter<Config>* filter,
+               const thrust::device_vector<T>& keys,
+               thrust::device_vector<bool>& /*unused_results*/,
+               cudaStream_t stream) { filter->insertMany(keys, stream); }
+        );
     }
 
+    /**
+     * @brief Checks for the presence of multiple keys in the filter.
+     * @param h_keys The keys to check.
+     * @param h_output A host vector to store the results (true if present, false otherwise).
+     */
     void containsMany(const thrust::host_vector<T>& h_keys, thrust::host_vector<bool>& h_output) {
-        queryAndReorder<false>(
+        executeOperation<false, true>(
             h_keys,
             &h_output,
             [](CuckooFilter<Config>* filter,
@@ -533,8 +455,14 @@ class CuckooFilterMultiGPU {
         );
     }
 
+    /**
+     * @brief Deletes multiple keys from the filter.
+     * @param h_keys The keys to delete.
+     * @param h_output A host vector to store the results (true if a key was found and deleted).
+     * @return The total number of occupied slots across all GPUs after deletion.
+     */
     size_t deleteMany(const thrust::host_vector<T>& h_keys, thrust::host_vector<bool>& h_output) {
-        return queryAndReorder<true>(
+        return executeOperation<true, true>(
             h_keys,
             &h_output,
             [](CuckooFilter<Config>* filter,
