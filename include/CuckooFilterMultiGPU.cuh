@@ -472,7 +472,7 @@ class CuckooFilterMultiGPU {
         );
     }
 
-    float loadFactor() {
+    [[nodiscard]] float loadFactor() const {
         return static_cast<float>(totalOccupiedSlots()) / static_cast<float>(totalCapacity());
     }
 

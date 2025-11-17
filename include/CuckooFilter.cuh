@@ -461,7 +461,7 @@ struct CuckooFilter {
         h_numOccupied = 0;
     }
 
-    float loadFactor() {
+    [[nodiscard]] float loadFactor() const {
         return static_cast<float>(occupiedSlots()) / (numBuckets * bucketSize);
     }
 

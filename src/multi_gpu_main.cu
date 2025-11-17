@@ -80,7 +80,7 @@ int main(int argc, char** argv) {
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
 
-    double loadFactor = filter.loadFactor();
+    float loadFactor = filter.loadFactor();
 
     std::cout << "Inserted " << count << " / " << n << " items in " << duration << " ms"
               << " (load factor = " << loadFactor << ")" << std::endl;
@@ -122,11 +122,8 @@ int main(int argc, char** argv) {
     size_t falsePositives = countOnes(h_fprOutput.data(), fprTestSize);
 
     double fpr = static_cast<double>(falsePositives) / static_cast<double>(fprTestSize) * 100.0;
-    double theoreticalFPR2 =
-        static_cast<double>(2 * Config::bucketSize * loadFactor) / (1ULL << Config::bitsPerTag);
-
     double theoreticalFPR =
-        1 - std::pow(1 - std::pow(2, -Config::bitsPerTag), 2 * Config::bucketSize * loadFactor);
+        (2.0 * Config::bucketSize * loadFactor) / (std::pow(2, int(Config::bitsPerTag)));
 
     std::cout << "False Positive Rate: " << falsePositives << " / " << fprTestSize << " = " << fpr
               << "% (theoretical " << 100 * theoreticalFPR << "% for f = " << Config::bitsPerTag
