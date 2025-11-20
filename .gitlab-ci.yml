@@ -11,8 +11,6 @@ docs:
   before_script:
     - apk add --no-cache doxygen graphviz ttf-freefont
   script:
-    # Generate Doxyfile directly without Meson
-    - sed 's/@project_name@/GPU-Accelerated Cuckoo Filter/g; s|@doc_out@|docs|g; s|@input_dir@|include|g' Doxyfile.in > Doxyfile
     - doxygen Doxyfile
   artifacts:
     paths:

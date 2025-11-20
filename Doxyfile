@@ -1,12 +1,12 @@
 # Project info
 PROJECT_NAME           = "GPU-Accelerated Cuckoo Filter"
-OUTPUT_DIRECTORY       = @doc_out@
+OUTPUT_DIRECTORY       = docs
 GENERATE_HTML          = YES
 GENERATE_LATEX         = NO
 FULL_PATH_NAMES        = NO
 
 # Inputs
-INPUT                  = @input_dir@
+INPUT                  = include
 FILE_PATTERNS          = *.cuh
 RECURSIVE              = YES
 EXTENSION_MAPPING      = cuh=C++
