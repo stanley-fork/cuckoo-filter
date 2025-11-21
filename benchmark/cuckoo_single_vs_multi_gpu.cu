@@ -188,36 +188,12 @@ BENCHMARK_DEFINE_F(MultiGPUFixture, Delete)(bm::State& state) {
     setCounters(state);
 }
 
-BENCHMARK_DEFINE_F(MultiGPUFixture, InsertQueryDelete)(bm::State& state) {
-    for (auto _ : state) {
-        filter->clear();
-        filter->synchronizeAllGPUs();
-
-        timer.start();
-
-        size_t inserted = filter->insertMany(h_keys);
-        filter->containsMany(h_keys, h_output);
-        size_t remaining = filter->deleteMany(h_keys, h_output);
-
-        filter->synchronizeAllGPUs();
-        double elapsed = timer.stop();
-
-        state.SetIterationTime(elapsed);
-        bm::DoNotOptimize(inserted);
-        bm::DoNotOptimize(remaining);
-        bm::DoNotOptimize(h_output.data());
-    }
-    setCounters(state);
-}
-
 REGISTER_BENCHMARK(SingleGPUFixture, Insert);
 REGISTER_BENCHMARK(SingleGPUFixture, Query);
 REGISTER_BENCHMARK(SingleGPUFixture, Delete);
-REGISTER_BENCHMARK(SingleGPUFixture, InsertQueryDelete);
 
 REGISTER_BENCHMARK(MultiGPUFixture, Insert);
 REGISTER_BENCHMARK(MultiGPUFixture, Query);
 REGISTER_BENCHMARK(MultiGPUFixture, Delete);
-REGISTER_BENCHMARK(MultiGPUFixture, InsertQueryDelete);
 
 BENCHMARK_MAIN();
