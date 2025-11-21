@@ -5,6 +5,7 @@
 #include <thrust/iterator/counting_iterator.h>
 #include <thrust/random.h>
 #include <thrust/transform.h>
+#include <chrono>
 #include <cstdint>
 #include <CuckooFilter.cuh>
 #include <fstream>
@@ -12,6 +13,24 @@
 #include <limits>
 #include <random>
 #include <string>
+
+class Timer {
+   public:
+    Timer() = default;
+
+    void start() {
+        startTime = std::chrono::high_resolution_clock::now();
+    }
+
+    double stop() {
+        auto endTime = std::chrono::high_resolution_clock::now();
+        std::chrono::duration<double> elapsed = endTime - startTime;
+        return elapsed.count();
+    }
+
+   private:
+    std::chrono::time_point<std::chrono::high_resolution_clock> startTime;
+};
 
 template <typename ConfigType>
 std::pair<size_t, size_t> calculateCapacityAndSize(size_t capacity, double loadFactor) {
@@ -129,4 +148,6 @@ void setCommonCounters(benchmark::State& state, size_t memory, size_t n) {
         benchmark::Counter::kDefaults,
         benchmark::Counter::kIs1024
     );
+    state.counters["fpr_percentage"] = 0.0;
+    state.counters["false_positives"] = 0.0;
 }

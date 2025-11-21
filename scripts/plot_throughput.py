@@ -3,41 +3,54 @@
 # requires-python = ">=3.12"
 # dependencies = [
 #   "matplotlib",
+#   "pandas",
 # ]
 # ///
-import json
+import re
 import sys
 from collections import defaultdict
 from pathlib import Path
-import re
+
 import matplotlib.pyplot as plt
+import pandas as pd
 
 
 def main():
     try:
-        data = json.load(sys.stdin)
-    except json.JSONDecodeError as e:
-        print(f"Error parsing JSON: {e}", file=sys.stderr)
+        df = pd.read_csv(sys.stdin)
+    except Exception as e:
+        print(f"Error parsing CSV: {e}", file=sys.stderr)
         sys.exit(1)
 
+    # Filter for median records only
+    df = df[df["name"].str.endswith("_median")]
+
     benchmark_data = defaultdict(dict)
-    for benchmark in data.get("benchmarks", []):
-        name = benchmark.get("name", "")
+    for _, row in df.iterrows():
+        name = row["name"]
         if "/" not in name:
             continue
 
-        base_name, size_str = name.rsplit("/", 1)
+        # Remove _median suffix and extract base_name and size
+        # Format: "CF_Insert/65536/min_time:0.500/repeats:10_median"
+        parts = name.split("/")
+        if len(parts) < 2:
+            continue
+
+        base_name = parts[0]
+        size_str = parts[1]
+
         suffix = base_name.rsplit("_", 1)[-1]
         if not re.fullmatch(r"(?:Query|Insert)(?:AddSub)?(<\d+>)?", suffix):
             continue
 
         try:
             size = int(size_str)
-            items_per_second = benchmark.get("items_per_second")
-            if items_per_second is not None:
+            items_per_second = row.get("items_per_second")
+            if pd.notna(items_per_second):
                 throughput_mops = items_per_second / 1_000_000
                 benchmark_data[base_name][size] = throughput_mops
-        except ValueError:
+        except (ValueError, KeyError):
             continue
 
     if not benchmark_data:

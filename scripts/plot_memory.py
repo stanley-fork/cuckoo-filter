@@ -3,33 +3,44 @@
 # requires-python = ">=3.12"
 # dependencies = [
 #   "matplotlib",
+#   "pandas",
 # ]
 # ///
 
-import json
 import sys
 from collections import defaultdict
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+import pandas as pd
 
 
 def main():
     try:
-        data = json.load(sys.stdin)
-    except json.JSONDecodeError as e:
-        print(f"Error parsing JSON: {e}", file=sys.stderr)
+        df = pd.read_csv(sys.stdin)
+    except Exception as e:
+        print(f"Error parsing CSV: {e}", file=sys.stderr)
         sys.exit(1)
+
+    # Filter for median records only
+    df = df[df["name"].str.endswith("_median")]
 
     memory_data = defaultdict(dict)
     bits_per_item_data = defaultdict(dict)
 
-    for benchmark in data.get("benchmarks", []):
-        name = benchmark.get("name", "")
+    for _, row in df.iterrows():
+        name = row["name"]
         if "/" not in name:
             continue
 
-        base_name, size_str = name.rsplit("/", 1)
+        # Extract base_name and size from name
+        parts = name.split("/")
+        if len(parts) < 2:
+            continue
+
+        base_name = parts[0]
+        size_str = parts[1]
+
         if (
             "Insert" not in base_name
             or "InsertAndQuery" in base_name
@@ -41,21 +52,15 @@ def main():
         try:
             size = int(size_str)
 
-            memory_bytes = None
-            bits_per_item = None
+            memory_bytes = row.get("memory_bytes")
+            bits_per_item = row.get("bits_per_item")
 
-            for counter_name, counter_value in benchmark.items():
-                if counter_name == "memory_bytes":
-                    memory_bytes = counter_value
-                elif counter_name == "bits_per_item":
-                    bits_per_item = counter_value
-
-            if memory_bytes is not None:
+            if pd.notna(memory_bytes):
                 memory_data[base_name][size] = memory_bytes
-            if bits_per_item is not None:
+            if pd.notna(bits_per_item):
                 bits_per_item_data[base_name][size] = bits_per_item
 
-        except ValueError:
+        except (ValueError, KeyError):
             continue
 
     if not memory_data and not bits_per_item_data:

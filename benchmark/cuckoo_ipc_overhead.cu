@@ -71,13 +71,17 @@ static void Local_Insert(bm::State& state) {
 
     size_t filterMemory = filter.sizeInBytes();
 
-    for (auto _ : state) {
-        state.PauseTiming();
-        filter.clear();
-        state.ResumeTiming();
+    Timer timer;
 
-        size_t inserted = adaptiveInsert(filter, d_keys);
+    for (auto _ : state) {
+        filter.clear();
         cudaDeviceSynchronize();
+
+        timer.start();
+        size_t inserted = adaptiveInsert(filter, d_keys);
+        double elapsed = timer.stop();
+
+        state.SetIterationTime(elapsed);
         bm::DoNotOptimize(inserted);
     }
 
@@ -101,13 +105,17 @@ static void IPC_Insert(bm::State& state) {
     constexpr size_t wordCount = Config::bucketSize / tagsPerWord;
     size_t filterMemory = numBuckets * wordCount * sizeof(uint64_t);
 
-    for (auto _ : state) {
-        state.PauseTiming();
-        client.clear();
-        state.ResumeTiming();
+    Timer timer;
 
-        size_t inserted = client.insertMany(d_keys);
+    for (auto _ : state) {
+        client.clear();
         cudaDeviceSynchronize();
+
+        timer.start();
+        size_t inserted = client.insertMany(d_keys);
+        double elapsed = timer.stop();
+
+        state.SetIterationTime(elapsed);
         bm::DoNotOptimize(inserted);
     }
 
@@ -126,9 +134,14 @@ static void Local_Query(bm::State& state) {
 
     size_t filterMemory = filter.sizeInBytes();
 
+    Timer timer;
+
     for (auto _ : state) {
+        timer.start();
         filter.containsMany(d_keys, d_output);
-        cudaDeviceSynchronize();
+        double elapsed = timer.stop();
+
+        state.SetIterationTime(elapsed);
         bm::DoNotOptimize(d_output.data().get());
     }
 
@@ -155,9 +168,14 @@ static void IPC_Query(bm::State& state) {
     constexpr size_t wordCount = Config::bucketSize / tagsPerWord;
     size_t filterMemory = numBuckets * wordCount * sizeof(uint64_t);
 
+    Timer timer;
+
     for (auto _ : state) {
+        timer.start();
         client.containsMany(d_keys, d_output);
-        cudaDeviceSynchronize();
+        double elapsed = timer.stop();
+
+        state.SetIterationTime(elapsed);
         bm::DoNotOptimize(d_output.data().get());
     }
 
@@ -174,14 +192,18 @@ static void Local_Delete(bm::State& state) {
 
     size_t filterMemory = filter.sizeInBytes();
 
+    Timer timer;
+
     for (auto _ : state) {
-        state.PauseTiming();
         filter.clear();
         filter.insertMany(d_keys);
-        state.ResumeTiming();
-
-        size_t remaining = filter.deleteMany(d_keys, d_output);
         cudaDeviceSynchronize();
+
+        timer.start();
+        size_t remaining = filter.deleteMany(d_keys, d_output);
+        double elapsed = timer.stop();
+
+        state.SetIterationTime(elapsed);
         bm::DoNotOptimize(remaining);
         bm::DoNotOptimize(d_output.data().get());
     }
@@ -207,14 +229,18 @@ static void IPC_Delete(bm::State& state) {
     constexpr size_t wordCount = Config::bucketSize / tagsPerWord;
     size_t filterMemory = numBuckets * wordCount * sizeof(uint64_t);
 
+    Timer timer;
+
     for (auto _ : state) {
-        state.PauseTiming();
         client.clear();
         client.insertMany(d_keys);
-        state.ResumeTiming();
-
-        size_t remaining = client.deleteMany(d_keys, d_output);
         cudaDeviceSynchronize();
+
+        timer.start();
+        size_t remaining = client.deleteMany(d_keys, d_output);
+        double elapsed = timer.stop();
+
+        state.SetIterationTime(elapsed);
         bm::DoNotOptimize(remaining);
         bm::DoNotOptimize(d_output.data().get());
     }
@@ -232,16 +258,18 @@ static void Local_InsertAndQuery(bm::State& state) {
 
     size_t filterMemory = filter.sizeInBytes();
 
+    Timer timer;
+
     for (auto _ : state) {
-        state.PauseTiming();
         filter.clear();
-        state.ResumeTiming();
-
-        size_t inserted = filter.insertMany(d_keys);
-        filter.containsMany(d_keys, d_output);
-
         cudaDeviceSynchronize();
 
+        timer.start();
+        size_t inserted = filter.insertMany(d_keys);
+        filter.containsMany(d_keys, d_output);
+        double elapsed = timer.stop();
+
+        state.SetIterationTime(elapsed);
         bm::DoNotOptimize(inserted);
         bm::DoNotOptimize(d_output.data().get());
     }
@@ -267,16 +295,18 @@ static void IPC_InsertAndQuery(bm::State& state) {
     constexpr size_t wordCount = Config::bucketSize / tagsPerWord;
     size_t filterMemory = numBuckets * wordCount * sizeof(uint64_t);
 
+    Timer timer;
+
     for (auto _ : state) {
-        state.PauseTiming();
         client.clear();
-        state.ResumeTiming();
-
-        size_t inserted = client.insertMany(d_keys);
-        client.containsMany(d_keys, d_output);
-
         cudaDeviceSynchronize();
 
+        timer.start();
+        size_t inserted = client.insertMany(d_keys);
+        client.containsMany(d_keys, d_output);
+        double elapsed = timer.stop();
+
+        state.SetIterationTime(elapsed);
         bm::DoNotOptimize(inserted);
         bm::DoNotOptimize(d_output.data().get());
     }
@@ -284,23 +314,73 @@ static void IPC_InsertAndQuery(bm::State& state) {
     setCommonCounters(state, filterMemory, n);
 }
 
-BENCHMARK(Local_Insert)->RangeMultiplier(2)->Range(1 << 16, 1 << 28)->Unit(bm::kMillisecond);
-BENCHMARK(IPC_Insert)->RangeMultiplier(2)->Range(1 << 16, 1 << 28)->Unit(bm::kMillisecond);
-BENCHMARK(Local_Query)->RangeMultiplier(2)->Range(1 << 16, 1 << 28)->Unit(bm::kMillisecond);
-BENCHMARK(IPC_Query)->RangeMultiplier(2)->Range(1 << 16, 1 << 28)->Unit(bm::kMillisecond);
-BENCHMARK(Local_Delete)->RangeMultiplier(2)->Range(1 << 16, 1 << 28)->Unit(bm::kMillisecond);
-BENCHMARK(IPC_Delete)->RangeMultiplier(2)->Range(1 << 16, 1 << 28)->Unit(bm::kMillisecond);
+BENCHMARK(Local_Insert)
+    ->RangeMultiplier(2)
+    ->Range(1 << 16, 1 << 28)
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
+BENCHMARK(IPC_Insert)
+    ->RangeMultiplier(2)
+    ->Range(1 << 16, 1 << 28)
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
+BENCHMARK(Local_Query)
+    ->RangeMultiplier(2)
+    ->Range(1 << 16, 1 << 28)
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
+BENCHMARK(IPC_Query)
+    ->RangeMultiplier(2)
+    ->Range(1 << 16, 1 << 28)
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
+BENCHMARK(Local_Delete)
+    ->RangeMultiplier(2)
+    ->Range(1 << 16, 1 << 28)
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
+BENCHMARK(IPC_Delete)
+    ->RangeMultiplier(2)
+    ->Range(1 << 16, 1 << 28)
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
 
 BENCHMARK(Local_InsertAndQuery)
     ->RangeMultiplier(2)
     ->Range(1 << 16, 1 << 28)
-    ->Unit(bm::kMillisecond);
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
 
 // clang-format off
 BENCHMARK(IPC_InsertAndQuery)
     ->RangeMultiplier(2)
     ->Range(1 << 16, 1 << 28)
-    ->Unit(bm::kMillisecond);
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
 // clang-format on
 
 int main(int argc, char** argv) {

@@ -23,13 +23,17 @@ static void CF_Insert(bm::State& state) {
 
     size_t filterMemory = filter.sizeInBytes();
 
-    for (auto _ : state) {
-        state.PauseTiming();
-        filter.clear();
-        state.ResumeTiming();
+    Timer timer;
 
-        size_t inserted = adaptiveInsert(filter, d_keys);
+    for (auto _ : state) {
+        filter.clear();
         cudaDeviceSynchronize();
+
+        timer.start();
+        size_t inserted = adaptiveInsert(filter, d_keys);
+        double elapsed = timer.stop();
+
+        state.SetIterationTime(elapsed);
         bm::DoNotOptimize(inserted);
     }
 
@@ -51,9 +55,14 @@ static void CF_Query(bm::State& state) {
 
     size_t filterMemory = filter.sizeInBytes();
 
+    Timer timer;
+
     for (auto _ : state) {
+        timer.start();
         filter.containsMany(d_keys, d_output);
-        cudaDeviceSynchronize();
+        double elapsed = timer.stop();
+
+        state.SetIterationTime(elapsed);
         bm::DoNotOptimize(d_output.data().get());
     }
 
@@ -73,14 +82,18 @@ static void CF_Delete(bm::State& state) {
 
     size_t filterMemory = filter.sizeInBytes();
 
+    Timer timer;
+
     for (auto _ : state) {
-        state.PauseTiming();
         filter.clear();
         adaptiveInsert(filter, d_keys);
-        state.ResumeTiming();
-
-        size_t remaining = filter.deleteMany(d_keys, d_output);
         cudaDeviceSynchronize();
+
+        timer.start();
+        size_t remaining = filter.deleteMany(d_keys, d_output);
+        double elapsed = timer.stop();
+
+        state.SetIterationTime(elapsed);
         bm::DoNotOptimize(remaining);
         bm::DoNotOptimize(d_output.data().get());
     }
@@ -101,16 +114,18 @@ static void CF_InsertAndQuery(bm::State& state) {
 
     size_t filterMemory = filter.sizeInBytes();
 
+    Timer timer;
+
     for (auto _ : state) {
-        state.PauseTiming();
         filter.clear();
-        state.ResumeTiming();
-
-        size_t inserted = adaptiveInsert(filter, d_keys);
-        filter.containsMany(d_keys, d_output);
-
         cudaDeviceSynchronize();
 
+        timer.start();
+        size_t inserted = adaptiveInsert(filter, d_keys);
+        filter.containsMany(d_keys, d_output);
+        double elapsed = timer.stop();
+
+        state.SetIterationTime(elapsed);
         bm::DoNotOptimize(inserted);
         bm::DoNotOptimize(d_output.data().get());
     }
@@ -131,17 +146,19 @@ static void CF_InsertQueryDelete(bm::State& state) {
 
     size_t filterMemory = filter.sizeInBytes();
 
-    for (auto _ : state) {
-        state.PauseTiming();
-        filter.clear();
-        state.ResumeTiming();
+    Timer timer;
 
+    for (auto _ : state) {
+        filter.clear();
+        cudaDeviceSynchronize();
+
+        timer.start();
         size_t inserted = adaptiveInsert(filter, d_keys);
         filter.containsMany(d_keys, d_output);
         size_t remaining = filter.deleteMany(d_keys, d_output);
+        double elapsed = timer.stop();
 
-        cudaDeviceSynchronize();
-
+        state.SetIterationTime(elapsed);
         bm::DoNotOptimize(inserted);
         bm::DoNotOptimize(remaining);
         bm::DoNotOptimize(d_output.data().get());
@@ -152,7 +169,7 @@ static void CF_InsertQueryDelete(bm::State& state) {
 }
 
 template <size_t bucketSize>
-static void CF_FalsePositiveRate(bm::State& state) {
+static void CF_FPR(bm::State& state) {
     using FPRConfig = CuckooConfig<uint64_t, 16, 500, 128, bucketSize>;
     auto [capacity, n] = calculateCapacityAndSize<FPRConfig>(state.range(0), TARGET_LOAD_FACTOR);
 
@@ -180,9 +197,14 @@ static void CF_FalsePositiveRate(bm::State& state) {
 
     size_t filterMemory = filter.sizeInBytes();
 
+    Timer timer;
+
     for (auto _ : state) {
+        timer.start();
         filter.containsMany(d_neverInserted, d_output);
-        cudaDeviceSynchronize();
+        double elapsed = timer.stop();
+
+        state.SetIterationTime(elapsed);
         bm::DoNotOptimize(d_output.data().get());
     }
 
@@ -204,100 +226,298 @@ static void CF_FalsePositiveRate(bm::State& state) {
     state.counters["bucket_size"] = bm::Counter(bucketSize);
 }
 
-BENCHMARK(CF_Insert<4>)->RangeMultiplier(2)->Range(1 << 16, 1ULL << 28)->Unit(bm::kMillisecond);
-BENCHMARK(CF_Insert<8>)->RangeMultiplier(2)->Range(1 << 16, 1ULL << 28)->Unit(bm::kMillisecond);
-BENCHMARK(CF_Insert<16>)->RangeMultiplier(2)->Range(1 << 16, 1ULL << 28)->Unit(bm::kMillisecond);
-BENCHMARK(CF_Insert<32>)->RangeMultiplier(2)->Range(1 << 16, 1ULL << 28)->Unit(bm::kMillisecond);
-BENCHMARK(CF_Insert<64>)->RangeMultiplier(2)->Range(1 << 16, 1ULL << 28)->Unit(bm::kMillisecond);
-BENCHMARK(CF_Insert<128>)->RangeMultiplier(2)->Range(1 << 16, 1ULL << 28)->Unit(bm::kMillisecond);
+BENCHMARK(CF_Insert<4>)
+    ->RangeMultiplier(2)
+    ->Range(1 << 16, 1ULL << 28)
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
+BENCHMARK(CF_Insert<8>)
+    ->RangeMultiplier(2)
+    ->Range(1 << 16, 1ULL << 28)
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
+BENCHMARK(CF_Insert<16>)
+    ->RangeMultiplier(2)
+    ->Range(1 << 16, 1ULL << 28)
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
+BENCHMARK(CF_Insert<32>)
+    ->RangeMultiplier(2)
+    ->Range(1 << 16, 1ULL << 28)
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
+BENCHMARK(CF_Insert<64>)
+    ->RangeMultiplier(2)
+    ->Range(1 << 16, 1ULL << 28)
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
+BENCHMARK(CF_Insert<128>)
+    ->RangeMultiplier(2)
+    ->Range(1 << 16, 1ULL << 28)
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
 
-BENCHMARK(CF_Query<4>)->RangeMultiplier(2)->Range(1 << 16, 1ULL << 28)->Unit(bm::kMillisecond);
-BENCHMARK(CF_Query<8>)->RangeMultiplier(2)->Range(1 << 16, 1ULL << 28)->Unit(bm::kMillisecond);
-BENCHMARK(CF_Query<16>)->RangeMultiplier(2)->Range(1 << 16, 1ULL << 28)->Unit(bm::kMillisecond);
-BENCHMARK(CF_Query<32>)->RangeMultiplier(2)->Range(1 << 16, 1ULL << 28)->Unit(bm::kMillisecond);
-BENCHMARK(CF_Query<64>)->RangeMultiplier(2)->Range(1 << 16, 1ULL << 28)->Unit(bm::kMillisecond);
-BENCHMARK(CF_Query<128>)->RangeMultiplier(2)->Range(1 << 16, 1ULL << 28)->Unit(bm::kMillisecond);
+BENCHMARK(CF_Query<4>)
+    ->RangeMultiplier(2)
+    ->Range(1 << 16, 1ULL << 28)
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
+BENCHMARK(CF_Query<8>)
+    ->RangeMultiplier(2)
+    ->Range(1 << 16, 1ULL << 28)
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
+BENCHMARK(CF_Query<16>)
+    ->RangeMultiplier(2)
+    ->Range(1 << 16, 1ULL << 28)
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
+BENCHMARK(CF_Query<32>)
+    ->RangeMultiplier(2)
+    ->Range(1 << 16, 1ULL << 28)
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
+BENCHMARK(CF_Query<64>)
+    ->RangeMultiplier(2)
+    ->Range(1 << 16, 1ULL << 28)
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
+BENCHMARK(CF_Query<128>)
+    ->RangeMultiplier(2)
+    ->Range(1 << 16, 1ULL << 28)
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
 
-BENCHMARK(CF_Delete<4>)->RangeMultiplier(2)->Range(1 << 16, 1ULL << 28)->Unit(bm::kMillisecond);
-BENCHMARK(CF_Delete<8>)->RangeMultiplier(2)->Range(1 << 16, 1ULL << 28)->Unit(bm::kMillisecond);
-BENCHMARK(CF_Delete<16>)->RangeMultiplier(2)->Range(1 << 16, 1ULL << 28)->Unit(bm::kMillisecond);
-BENCHMARK(CF_Delete<32>)->RangeMultiplier(2)->Range(1 << 16, 1ULL << 28)->Unit(bm::kMillisecond);
-BENCHMARK(CF_Delete<64>)->RangeMultiplier(2)->Range(1 << 16, 1ULL << 28)->Unit(bm::kMillisecond);
-BENCHMARK(CF_Delete<128>)->RangeMultiplier(2)->Range(1 << 16, 1ULL << 28)->Unit(bm::kMillisecond);
+BENCHMARK(CF_Delete<4>)
+    ->RangeMultiplier(2)
+    ->Range(1 << 16, 1ULL << 28)
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
+BENCHMARK(CF_Delete<8>)
+    ->RangeMultiplier(2)
+    ->Range(1 << 16, 1ULL << 28)
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
+BENCHMARK(CF_Delete<16>)
+    ->RangeMultiplier(2)
+    ->Range(1 << 16, 1ULL << 28)
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
+BENCHMARK(CF_Delete<32>)
+    ->RangeMultiplier(2)
+    ->Range(1 << 16, 1ULL << 28)
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
+BENCHMARK(CF_Delete<64>)
+    ->RangeMultiplier(2)
+    ->Range(1 << 16, 1ULL << 28)
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
+BENCHMARK(CF_Delete<128>)
+    ->RangeMultiplier(2)
+    ->Range(1 << 16, 1ULL << 28)
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
 
 BENCHMARK(CF_InsertAndQuery<4>)
     ->RangeMultiplier(2)
     ->Range(1 << 16, 1ULL << 28)
-    ->Unit(bm::kMillisecond);
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
 BENCHMARK(CF_InsertAndQuery<8>)
     ->RangeMultiplier(2)
     ->Range(1 << 16, 1ULL << 28)
-    ->Unit(bm::kMillisecond);
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
 BENCHMARK(CF_InsertAndQuery<16>)
     ->RangeMultiplier(2)
     ->Range(1 << 16, 1ULL << 28)
-    ->Unit(bm::kMillisecond);
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
 BENCHMARK(CF_InsertAndQuery<32>)
     ->RangeMultiplier(2)
     ->Range(1 << 16, 1ULL << 28)
-    ->Unit(bm::kMillisecond);
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
 BENCHMARK(CF_InsertAndQuery<64>)
     ->RangeMultiplier(2)
     ->Range(1 << 16, 1ULL << 28)
-    ->Unit(bm::kMillisecond);
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
 BENCHMARK(CF_InsertAndQuery<128>)
     ->RangeMultiplier(2)
     ->Range(1 << 16, 1ULL << 28)
-    ->Unit(bm::kMillisecond);
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
 
 BENCHMARK(CF_InsertQueryDelete<4>)
     ->RangeMultiplier(2)
     ->Range(1 << 16, 1ULL << 28)
-    ->Unit(bm::kMillisecond);
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
 BENCHMARK(CF_InsertQueryDelete<8>)
     ->RangeMultiplier(2)
     ->Range(1 << 16, 1ULL << 28)
-    ->Unit(bm::kMillisecond);
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
 BENCHMARK(CF_InsertQueryDelete<16>)
     ->RangeMultiplier(2)
     ->Range(1 << 16, 1ULL << 28)
-    ->Unit(bm::kMillisecond);
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
 BENCHMARK(CF_InsertQueryDelete<32>)
     ->RangeMultiplier(2)
     ->Range(1 << 16, 1ULL << 28)
-    ->Unit(bm::kMillisecond);
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
 BENCHMARK(CF_InsertQueryDelete<64>)
     ->RangeMultiplier(2)
     ->Range(1 << 16, 1ULL << 28)
-    ->Unit(bm::kMillisecond);
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
 BENCHMARK(CF_InsertQueryDelete<128>)
     ->RangeMultiplier(2)
     ->Range(1 << 16, 1ULL << 28)
-    ->Unit(bm::kMillisecond);
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
 
-BENCHMARK(CF_FalsePositiveRate<4>)
+BENCHMARK(CF_FPR<4>)
     ->RangeMultiplier(2)
     ->Range(1 << 16, 1ULL << 28)
-    ->Unit(bm::kMillisecond);
-BENCHMARK(CF_FalsePositiveRate<8>)
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
+BENCHMARK(CF_FPR<8>)
     ->RangeMultiplier(2)
     ->Range(1 << 16, 1ULL << 28)
-    ->Unit(bm::kMillisecond);
-BENCHMARK(CF_FalsePositiveRate<16>)
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
+BENCHMARK(CF_FPR<16>)
     ->RangeMultiplier(2)
     ->Range(1 << 16, 1ULL << 28)
-    ->Unit(bm::kMillisecond);
-BENCHMARK(CF_FalsePositiveRate<32>)
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
+BENCHMARK(CF_FPR<32>)
     ->RangeMultiplier(2)
     ->Range(1 << 16, 1ULL << 28)
-    ->Unit(bm::kMillisecond);
-BENCHMARK(CF_FalsePositiveRate<64>)
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
+BENCHMARK(CF_FPR<64>)
     ->RangeMultiplier(2)
     ->Range(1 << 16, 1ULL << 28)
-    ->Unit(bm::kMillisecond);
-BENCHMARK(CF_FalsePositiveRate<128>)
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
+BENCHMARK(CF_FPR<128>)
     ->RangeMultiplier(2)
     ->Range(1 << 16, 1ULL << 28)
-    ->Unit(bm::kMillisecond);
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
 
 BENCHMARK_MAIN();

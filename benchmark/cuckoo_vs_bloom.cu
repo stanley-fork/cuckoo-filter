@@ -35,13 +35,17 @@ static void CF_Insert(bm::State& state) {
 
     size_t filterMemory = filter.sizeInBytes();
 
-    for (auto _ : state) {
-        state.PauseTiming();
-        filter.clear();
-        state.ResumeTiming();
+    Timer timer;
 
-        size_t inserted = adaptiveInsert(filter, d_keys);
+    for (auto _ : state) {
+        filter.clear();
         cudaDeviceSynchronize();
+
+        timer.start();
+        size_t inserted = adaptiveInsert(filter, d_keys);
+        double elapsed = timer.stop();
+
+        state.SetIterationTime(elapsed);
         bm::DoNotOptimize(inserted);
     }
 
@@ -60,9 +64,14 @@ static void CF_Query(bm::State& state) {
 
     size_t filterMemory = filter.sizeInBytes();
 
+    Timer timer;
+
     for (auto _ : state) {
+        timer.start();
         filter.containsMany(d_keys, d_output);
-        cudaDeviceSynchronize();
+        double elapsed = timer.stop();
+
+        state.SetIterationTime(elapsed);
         bm::DoNotOptimize(d_output.data().get());
     }
 
@@ -79,14 +88,18 @@ static void CF_Delete(bm::State& state) {
 
     size_t filterMemory = filter.sizeInBytes();
 
+    Timer timer;
+
     for (auto _ : state) {
-        state.PauseTiming();
         filter.clear();
         adaptiveInsert(filter, d_keys);
-        state.ResumeTiming();
-
-        size_t remaining = filter.deleteMany(d_keys, d_output);
         cudaDeviceSynchronize();
+
+        timer.start();
+        size_t remaining = filter.deleteMany(d_keys, d_output);
+        double elapsed = timer.stop();
+
+        state.SetIterationTime(elapsed);
         bm::DoNotOptimize(remaining);
         bm::DoNotOptimize(d_output.data().get());
     }
@@ -108,13 +121,17 @@ static void BBF_Insert(bm::State& state) {
     size_t filterMemory = filter.block_extent() * BloomFilter::words_per_block *
                           sizeof(typename BloomFilter::word_type);
 
-    for (auto _ : state) {
-        state.PauseTiming();
-        filter.clear();
-        state.ResumeTiming();
+    Timer timer;
 
-        filter.add(d_keys.begin(), d_keys.end());
+    for (auto _ : state) {
+        filter.clear();
         cudaDeviceSynchronize();
+
+        timer.start();
+        filter.add(d_keys.begin(), d_keys.end());
+        double elapsed = timer.stop();
+
+        state.SetIterationTime(elapsed);
     }
 
     setCommonCounters(state, filterMemory, n);
@@ -137,13 +154,18 @@ static void BBF_Query(bm::State& state) {
     size_t filterMemory = filter.block_extent() * BloomFilter::words_per_block *
                           sizeof(typename BloomFilter::word_type);
 
+    Timer timer;
+
     for (auto _ : state) {
+        timer.start();
         filter.contains(
             d_keys.begin(),
             d_keys.end(),
             reinterpret_cast<bool*>(thrust::raw_pointer_cast(d_output.data()))
         );
-        cudaDeviceSynchronize();
+        double elapsed = timer.stop();
+
+        state.SetIterationTime(elapsed);
         bm::DoNotOptimize(d_output.data().get());
     }
 
@@ -160,16 +182,18 @@ static void CF_InsertAndQuery(bm::State& state) {
 
     size_t filterMemory = filter.sizeInBytes();
 
+    Timer timer;
+
     for (auto _ : state) {
-        state.PauseTiming();
         filter.clear();
-        state.ResumeTiming();
-
-        size_t inserted = adaptiveInsert(filter, d_keys);
-        filter.containsMany(d_keys, d_output);
-
         cudaDeviceSynchronize();
 
+        timer.start();
+        size_t inserted = adaptiveInsert(filter, d_keys);
+        filter.containsMany(d_keys, d_output);
+        double elapsed = timer.stop();
+
+        state.SetIterationTime(elapsed);
         bm::DoNotOptimize(inserted);
         bm::DoNotOptimize(d_output.data().get());
     }
@@ -187,17 +211,19 @@ static void CF_InsertQueryDelete(bm::State& state) {
 
     size_t filterMemory = filter.sizeInBytes();
 
-    for (auto _ : state) {
-        state.PauseTiming();
-        filter.clear();
-        state.ResumeTiming();
+    Timer timer;
 
+    for (auto _ : state) {
+        filter.clear();
+        cudaDeviceSynchronize();
+
+        timer.start();
         size_t inserted = adaptiveInsert(filter, d_keys);
         filter.containsMany(d_keys, d_output);
         size_t remaining = filter.deleteMany(d_keys, d_output);
+        double elapsed = timer.stop();
 
-        cudaDeviceSynchronize();
-
+        state.SetIterationTime(elapsed);
         bm::DoNotOptimize(inserted);
         bm::DoNotOptimize(remaining);
         bm::DoNotOptimize(d_output.data().get());
@@ -221,27 +247,29 @@ static void BBF_InsertAndQuery(bm::State& state) {
     size_t filterMemory = filter.block_extent() * BloomFilter::words_per_block *
                           sizeof(typename BloomFilter::word_type);
 
-    for (auto _ : state) {
-        state.PauseTiming();
-        filter.clear();
-        state.ResumeTiming();
+    Timer timer;
 
+    for (auto _ : state) {
+        filter.clear();
+        cudaDeviceSynchronize();
+
+        timer.start();
         filter.add(d_keys.begin(), d_keys.end());
         filter.contains(
             d_keys.begin(),
             d_keys.end(),
             reinterpret_cast<bool*>(thrust::raw_pointer_cast(d_output.data()))
         );
+        double elapsed = timer.stop();
 
-        cudaDeviceSynchronize();
-
+        state.SetIterationTime(elapsed);
         bm::DoNotOptimize(d_output.data().get());
     }
 
     setCommonCounters(state, filterMemory, n);
 }
 
-static void CF_FalsePositiveRate(bm::State& state) {
+static void CF_FPR(bm::State& state) {
     auto [capacity, n] = calculateCapacityAndSize<Config>(state.range(0), TARGET_LOAD_FACTOR);
 
     thrust::device_vector<uint64_t> d_keys(n);
@@ -270,9 +298,14 @@ static void CF_FalsePositiveRate(bm::State& state) {
 
     size_t filterMemory = filter.sizeInBytes();
 
+    Timer timer;
+
     for (auto _ : state) {
+        timer.start();
         filter.containsMany(d_neverInserted, d_output);
-        cudaDeviceSynchronize();
+        double elapsed = timer.stop();
+
+        state.SetIterationTime(elapsed);
         bm::DoNotOptimize(d_output.data().get());
     }
 
@@ -293,7 +326,7 @@ static void CF_FalsePositiveRate(bm::State& state) {
     );
 }
 
-static void BBF_FalsePositiveRate(bm::State& state) {
+static void BBF_FPR(bm::State& state) {
     auto [capacity, n] = calculateCapacityAndSize<Config>(state.range(0), TARGET_LOAD_FACTOR);
 
     using BloomFilter = cuco::bloom_filter<uint64_t>;
@@ -326,9 +359,14 @@ static void BBF_FalsePositiveRate(bm::State& state) {
     size_t filterMemory = filter.block_extent() * BloomFilter::words_per_block *
                           sizeof(typename BloomFilter::word_type);
 
+    Timer timer;
+
     for (auto _ : state) {
+        timer.start();
         filter.contains(d_neverInserted.begin(), d_neverInserted.end(), d_output.begin());
-        cudaDeviceSynchronize();
+        double elapsed = timer.stop();
+
+        state.SetIterationTime(elapsed);
         bm::DoNotOptimize(d_output.data().get());
     }
 
@@ -349,35 +387,90 @@ static void BBF_FalsePositiveRate(bm::State& state) {
     );
 }
 
-BENCHMARK(CF_Insert)->RangeMultiplier(2)->Range(1 << 16, 1ULL << 28)->Unit(bm::kMillisecond);
-BENCHMARK(BBF_Insert)->RangeMultiplier(2)->Range(1 << 16, 1ULL << 28)->Unit(bm::kMillisecond);
+BENCHMARK(CF_Insert)
+    ->RangeMultiplier(2)
+    ->Range(1 << 16, 1ULL << 28)
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
+BENCHMARK(BBF_Insert)
+    ->RangeMultiplier(2)
+    ->Range(1 << 16, 1ULL << 28)
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
 
-BENCHMARK(CF_Query)->RangeMultiplier(2)->Range(1 << 16, 1ULL << 28)->Unit(bm::kMillisecond);
-BENCHMARK(BBF_Query)->RangeMultiplier(2)->Range(1 << 16, 1ULL << 28)->Unit(bm::kMillisecond);
+BENCHMARK(CF_Query)
+    ->RangeMultiplier(2)
+    ->Range(1 << 16, 1ULL << 28)
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
+BENCHMARK(BBF_Query)
+    ->RangeMultiplier(2)
+    ->Range(1 << 16, 1ULL << 28)
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
 
-BENCHMARK(CF_Delete)->RangeMultiplier(2)->Range(1 << 16, 1ULL << 28)->Unit(bm::kMillisecond);
+BENCHMARK(CF_Delete)
+    ->RangeMultiplier(2)
+    ->Range(1 << 16, 1ULL << 28)
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
 
 BENCHMARK(CF_InsertAndQuery)
     ->RangeMultiplier(2)
     ->Range(1 << 16, 1ULL << 28)
-    ->Unit(bm::kMillisecond);
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
 BENCHMARK(BBF_InsertAndQuery)
     ->RangeMultiplier(2)
     ->Range(1 << 16, 1ULL << 28)
-    ->Unit(bm::kMillisecond);
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
 
 BENCHMARK(CF_InsertQueryDelete)
     ->RangeMultiplier(2)
     ->Range(1 << 16, 1ULL << 28)
-    ->Unit(bm::kMillisecond);
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
 
-BENCHMARK(CF_FalsePositiveRate)
+BENCHMARK(CF_FPR)
     ->RangeMultiplier(2)
     ->Range(1 << 16, 1ULL << 28)
-    ->Unit(bm::kMillisecond);
-BENCHMARK(BBF_FalsePositiveRate)
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
+BENCHMARK(BBF_FPR)
     ->RangeMultiplier(2)
     ->Range(1 << 16, 1ULL << 28)
-    ->Unit(bm::kMillisecond);
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
 
 BENCHMARK_MAIN();

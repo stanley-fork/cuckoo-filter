@@ -41,13 +41,17 @@ static void GPU_CF_Insert(bm::State& state) {
 
     size_t filterMemory = filter.sizeInBytes();
 
-    for (auto _ : state) {
-        state.PauseTiming();
-        filter.clear();
-        state.ResumeTiming();
+    Timer timer;
 
-        size_t inserted = adaptiveInsert(filter, d_keys);
+    for (auto _ : state) {
+        filter.clear();
         cudaDeviceSynchronize();
+
+        timer.start();
+        size_t inserted = adaptiveInsert(filter, d_keys);
+        double elapsed = timer.stop();
+
+        state.SetIterationTime(elapsed);
         bm::DoNotOptimize(inserted);
     }
 
@@ -66,9 +70,14 @@ static void GPU_CF_Query(bm::State& state) {
 
     size_t filterMemory = filter.sizeInBytes();
 
+    Timer timer;
+
     for (auto _ : state) {
+        timer.start();
         filter.containsMany(d_keys, d_output);
-        cudaDeviceSynchronize();
+        double elapsed = timer.stop();
+
+        state.SetIterationTime(elapsed);
         bm::DoNotOptimize(d_output.data().get());
     }
 
@@ -85,16 +94,18 @@ static void GPU_CF_InsertAndQuery(bm::State& state) {
 
     size_t filterMemory = filter.sizeInBytes();
 
+    Timer timer;
+
     for (auto _ : state) {
-        state.PauseTiming();
         filter.clear();
-        state.ResumeTiming();
-
-        size_t inserted = adaptiveInsert(filter, d_keys);
-        filter.containsMany(d_keys, d_output);
-
         cudaDeviceSynchronize();
 
+        timer.start();
+        size_t inserted = adaptiveInsert(filter, d_keys);
+        filter.containsMany(d_keys, d_output);
+        double elapsed = timer.stop();
+
+        state.SetIterationTime(elapsed);
         bm::DoNotOptimize(inserted);
         bm::DoNotOptimize(d_output.data().get());
     }
@@ -133,9 +144,14 @@ static void GPU_CF_FPR(bm::State& state) {
 
     size_t filterMemory = filter.sizeInBytes();
 
+    Timer timer;
+
     for (auto _ : state) {
+        timer.start();
         filter.containsMany(d_neverInserted, d_output);
-        cudaDeviceSynchronize();
+        double elapsed = timer.stop();
+
+        state.SetIterationTime(elapsed);
         bm::DoNotOptimize(d_output.data().get());
     }
 
@@ -175,17 +191,21 @@ static void CPU_CF_Insert(bm::State& state) {
     size_t n_threads = 8;
     size_t n_tasks = 1;
 
-    for (auto _ : state) {
-        state.PauseTiming();
-        PartitionedCuckooFilter tempFilter(s, 1, n_threads, n_tasks);
-        auto construct_keys = keys;
-        state.ResumeTiming();
+    Timer timer;
 
-        bool success = tempFilter.construct(construct_keys.data(), construct_keys.size());
+    for (auto _ : state) {
+        PartitionedCuckooFilter tempFilter(s, n_partitions, n_threads, n_tasks);
+        auto constructKeys = keys;
+
+        timer.start();
+        bool success = tempFilter.construct(constructKeys.data(), constructKeys.size());
+        double elapsed = timer.stop();
+
+        state.SetIterationTime(elapsed);
         bm::DoNotOptimize(success);
     }
 
-    PartitionedCuckooFilter finalFilter(s, 1, n_threads, n_tasks);
+    PartitionedCuckooFilter finalFilter(s, n_partitions, n_threads, n_tasks);
     finalFilter.construct(keys.data(), keys.size());
     size_t filterMemory = finalFilter.size();
 
@@ -212,13 +232,19 @@ static void CPU_CF_Query(bm::State& state) {
     size_t n_threads = 8;
     size_t n_tasks = 1;
 
-    PartitionedCuckooFilter filter(s, 1, n_threads, n_tasks);
+    PartitionedCuckooFilter filter(s, n_partitions, n_threads, n_tasks);
     filter.construct(keys.data(), keys.size());
 
     size_t filterMemory = filter.size();
 
+    Timer timer;
+
     for (auto _ : state) {
+        timer.start();
         size_t found = filter.count(keys.data(), keys.size());
+        double elapsed = timer.stop();
+
+        state.SetIterationTime(elapsed);
         bm::DoNotOptimize(found);
     }
 
@@ -245,19 +271,22 @@ static void CPU_CF_InsertAndQuery(bm::State& state) {
     size_t n_threads = 8;
     size_t n_tasks = 1;
 
-    for (auto _ : state) {
-        state.PauseTiming();
-        PartitionedCuckooFilter filter(s, 1, n_threads, n_tasks);
-        state.ResumeTiming();
+    Timer timer;
 
+    for (auto _ : state) {
+        PartitionedCuckooFilter filter(s, n_partitions, n_threads, n_tasks);
+
+        timer.start();
         bool success = filter.construct(keys.data(), keys.size());
         size_t found = filter.count(keys.data(), keys.size());
+        double elapsed = timer.stop();
 
+        state.SetIterationTime(elapsed);
         bm::DoNotOptimize(success);
         bm::DoNotOptimize(found);
     }
 
-    PartitionedCuckooFilter finalFilter(s, 1, n_threads, n_tasks);
+    PartitionedCuckooFilter finalFilter(s, n_partitions, n_threads, n_tasks);
     finalFilter.construct(keys.data(), keys.size());
     size_t filterMemory = finalFilter.size();
 
@@ -283,21 +312,27 @@ static void CPU_CF_FPR(bm::State& state) {
     size_t n_threads = 8;
     size_t n_tasks = 1;
 
-    PartitionedCuckooFilter filter(s, 1, n_threads, n_tasks);
+    PartitionedCuckooFilter filter(s, n_partitions, n_threads, n_tasks);
     filter.construct(keys.data(), keys.size());
 
     size_t fprTestSize = std::min(n, size_t(1'000'000));
     auto neverInserted =
         generateKeysCPU<uint64_t>(fprTestSize, 99999, UINT32_MAX / 2 + 1, UINT32_MAX);
 
+    Timer timer;
+
     size_t falsePositives = 0;
     for (auto _ : state) {
+        timer.start();
         falsePositives = 0;
         for (const auto& k : neverInserted) {
             if (filter.contains(k)) {
                 ++falsePositives;
             }
         }
+        double elapsed = timer.stop();
+
+        state.SetIterationTime(elapsed);
         bm::DoNotOptimize(falsePositives);
     }
 
@@ -317,22 +352,72 @@ static void CPU_CF_FPR(bm::State& state) {
     );
 }
 
-BENCHMARK(GPU_CF_Insert)->RangeMultiplier(2)->Range(1 << 16, 1ULL << 28)->Unit(bm::kMillisecond);
-BENCHMARK(CPU_CF_Insert)->RangeMultiplier(2)->Range(1 << 16, 1ULL << 28)->Unit(bm::kMillisecond);
+BENCHMARK(GPU_CF_Insert)
+    ->RangeMultiplier(2)
+    ->Range(1 << 16, 1ULL << 28)
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
+BENCHMARK(CPU_CF_Insert)
+    ->RangeMultiplier(2)
+    ->Range(1 << 16, 1ULL << 28)
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
 
-BENCHMARK(GPU_CF_Query)->RangeMultiplier(2)->Range(1 << 16, 1ULL << 28)->Unit(bm::kMillisecond);
-BENCHMARK(CPU_CF_Query)->RangeMultiplier(2)->Range(1 << 16, 1ULL << 28)->Unit(bm::kMillisecond);
+BENCHMARK(GPU_CF_Query)
+    ->RangeMultiplier(2)
+    ->Range(1 << 16, 1ULL << 28)
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
+BENCHMARK(CPU_CF_Query)
+    ->RangeMultiplier(2)
+    ->Range(1 << 16, 1ULL << 28)
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
 
 BENCHMARK(GPU_CF_InsertAndQuery)
     ->RangeMultiplier(2)
     ->Range(1 << 16, 1ULL << 28)
-    ->Unit(bm::kMillisecond);
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
 BENCHMARK(CPU_CF_InsertAndQuery)
     ->RangeMultiplier(2)
     ->Range(1 << 16, 1ULL << 28)
-    ->Unit(bm::kMillisecond);
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
 
-BENCHMARK(GPU_CF_FPR)->RangeMultiplier(2)->Range(1 << 16, 1ULL << 28)->Unit(bm::kMillisecond);
-BENCHMARK(CPU_CF_FPR)->RangeMultiplier(2)->Range(1 << 16, 1ULL << 28)->Unit(bm::kMillisecond);
+BENCHMARK(GPU_CF_FPR)
+    ->RangeMultiplier(2)
+    ->Range(1 << 16, 1ULL << 28)
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
+BENCHMARK(CPU_CF_FPR)
+    ->RangeMultiplier(2)
+    ->Range(1 << 16, 1ULL << 28)
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
 
 BENCHMARK_MAIN();

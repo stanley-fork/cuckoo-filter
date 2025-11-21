@@ -24,13 +24,17 @@ static void GPU_CF_Insert(bm::State& state) {
 
     size_t filterMemory = filter.sizeInBytes();
 
-    for (auto _ : state) {
-        state.PauseTiming();
-        filter.clear();
-        state.ResumeTiming();
+    Timer timer;
 
-        size_t inserted = adaptiveInsert(filter, d_keys);
+    for (auto _ : state) {
+        filter.clear();
         cudaDeviceSynchronize();
+
+        timer.start();
+        size_t inserted = adaptiveInsert(filter, d_keys);
+        double elapsed = timer.stop();
+
+        state.SetIterationTime(elapsed);
         bm::DoNotOptimize(inserted);
     }
 
@@ -50,9 +54,14 @@ static void GPU_CF_Query(bm::State& state) {
     size_t filterMemory = filter.sizeInBytes();
     size_t capacity = filter.capacity();
 
+    Timer timer;
+
     for (auto _ : state) {
+        timer.start();
         filter.containsMany(d_keys, d_output);
-        cudaDeviceSynchronize();
+        double elapsed = timer.stop();
+
+        state.SetIterationTime(elapsed);
         bm::DoNotOptimize(d_output.data().get());
     }
 
@@ -69,14 +78,18 @@ static void GPU_CF_Delete(bm::State& state) {
 
     size_t filterMemory = filter.sizeInBytes();
 
+    Timer timer;
+
     for (auto _ : state) {
-        state.PauseTiming();
         filter.clear();
         adaptiveInsert(filter, d_keys);
-        state.ResumeTiming();
-
-        size_t remaining = filter.deleteMany(d_keys, d_output);
         cudaDeviceSynchronize();
+
+        timer.start();
+        size_t remaining = filter.deleteMany(d_keys, d_output);
+        double elapsed = timer.stop();
+
+        state.SetIterationTime(elapsed);
         bm::DoNotOptimize(remaining);
         bm::DoNotOptimize(d_output.data().get());
     }
@@ -94,17 +107,19 @@ static void GPU_CF_InsertQueryDelete(bm::State& state) {
 
     size_t filterMemory = filter.sizeInBytes();
 
-    for (auto _ : state) {
-        state.PauseTiming();
-        filter.clear();
-        state.ResumeTiming();
+    Timer timer;
 
+    for (auto _ : state) {
+        filter.clear();
+        cudaDeviceSynchronize();
+
+        timer.start();
         size_t inserted = adaptiveInsert(filter, d_keys);
         filter.containsMany(d_keys, d_output);
         size_t remaining = filter.deleteMany(d_keys, d_output);
+        double elapsed = timer.stop();
 
-        cudaDeviceSynchronize();
-
+        state.SetIterationTime(elapsed);
         bm::DoNotOptimize(inserted);
         bm::DoNotOptimize(remaining);
         bm::DoNotOptimize(d_output.data().get());
@@ -121,17 +136,21 @@ static void CPU_CF_Insert(bm::State& state) {
 
     size_t filterMemory = filter.SizeInBytes();
 
-    for (auto _ : state) {
-        state.PauseTiming();
-        cuckoofilter::CuckooFilter<uint32_t, CPU_BITS_PER_ITEM> tempFilter(capacity);
-        state.ResumeTiming();
+    Timer timer;
 
+    for (auto _ : state) {
+        cuckoofilter::CuckooFilter<uint32_t, CPU_BITS_PER_ITEM> tempFilter(capacity);
+
+        timer.start();
         size_t inserted = 0;
         for (const auto& key : keys) {
             if (tempFilter.Add(key) == cuckoofilter::Ok) {
                 inserted++;
             }
         }
+        double elapsed = timer.stop();
+
+        state.SetIterationTime(elapsed);
         bm::DoNotOptimize(inserted);
     }
 
@@ -150,13 +169,19 @@ static void CPU_CF_Query(bm::State& state) {
 
     size_t filterMemory = filter.SizeInBytes();
 
+    Timer timer;
+
     for (auto _ : state) {
+        timer.start();
         size_t found = 0;
         for (const auto& key : keys) {
             if (filter.Contain(key) == cuckoofilter::Ok) {
                 found++;
             }
         }
+        double elapsed = timer.stop();
+
+        state.SetIterationTime(elapsed);
         bm::DoNotOptimize(found);
     }
 
@@ -171,20 +196,24 @@ static void CPU_CF_Delete(bm::State& state) {
 
     size_t filterMemory = filter.SizeInBytes();
 
+    Timer timer;
+
     for (auto _ : state) {
-        state.PauseTiming();
         cuckoofilter::CuckooFilter<uint32_t, CPU_BITS_PER_ITEM> tempFilter(capacity);
         for (const auto& key : keys) {
             tempFilter.Add(key);
         }
-        state.ResumeTiming();
 
+        timer.start();
         size_t deleted = 0;
         for (const auto& key : keys) {
             if (tempFilter.Delete(key) == cuckoofilter::Ok) {
                 deleted++;
             }
         }
+        double elapsed = timer.stop();
+
+        state.SetIterationTime(elapsed);
         bm::DoNotOptimize(deleted);
     }
 
@@ -199,11 +228,12 @@ static void CPU_CF_InsertQueryDelete(bm::State& state) {
 
     size_t filterMemory = filter.SizeInBytes();
 
-    for (auto _ : state) {
-        state.PauseTiming();
-        cuckoofilter::CuckooFilter<uint32_t, CPU_BITS_PER_ITEM> tempFilter(capacity);
-        state.ResumeTiming();
+    Timer timer;
 
+    for (auto _ : state) {
+        cuckoofilter::CuckooFilter<uint32_t, CPU_BITS_PER_ITEM> tempFilter(capacity);
+
+        timer.start();
         size_t inserted = 0;
         for (const auto& key : keys) {
             if (tempFilter.Add(key) == cuckoofilter::Ok) {
@@ -224,7 +254,9 @@ static void CPU_CF_InsertQueryDelete(bm::State& state) {
                 deleted++;
             }
         }
+        double elapsed = timer.stop();
 
+        state.SetIterationTime(elapsed);
         bm::DoNotOptimize(inserted);
         bm::DoNotOptimize(found);
         bm::DoNotOptimize(deleted);
@@ -233,7 +265,7 @@ static void CPU_CF_InsertQueryDelete(bm::State& state) {
     setCommonCounters(state, filterMemory, n);
 }
 
-static void GPU_CF_FalsePositiveRate(bm::State& state) {
+static void GPU_CF_FPR(bm::State& state) {
     using FPRConfig = CuckooConfig<uint64_t, 16, 500, 128, 4>;
 
     auto [capacity, n] = calculateCapacityAndSize<FPRConfig>(state.range(0), TARGET_LOAD_FACTOR);
@@ -264,9 +296,14 @@ static void GPU_CF_FalsePositiveRate(bm::State& state) {
 
     size_t filterMemory = filter.sizeInBytes();
 
+    Timer timer;
+
     for (auto _ : state) {
+        timer.start();
         filter.containsMany(d_neverInserted, d_output);
-        cudaDeviceSynchronize();
+        double elapsed = timer.stop();
+
+        state.SetIterationTime(elapsed);
         bm::DoNotOptimize(d_output.data().get());
     }
 
@@ -287,7 +324,7 @@ static void GPU_CF_FalsePositiveRate(bm::State& state) {
     );
 }
 
-static void CPU_CF_FalsePositiveRate(bm::State& state) {
+static void CPU_CF_FPR(bm::State& state) {
     auto [capacity, n] = calculateCapacityAndSize<Config>(state.range(0), TARGET_LOAD_FACTOR);
 
     auto keys = generateKeysCPU<uint64_t>(n, 1, UINT32_MAX);
@@ -299,14 +336,20 @@ static void CPU_CF_FalsePositiveRate(bm::State& state) {
     size_t fprTestSize = std::min(n, size_t(1'000'000));
     auto neverInserted = generateKeysCPU<uint64_t>(fprTestSize, 99999, UINT32_MAX + 1, UINT64_MAX);
 
+    Timer timer;
+
     size_t falsePositives = 0;
     for (auto _ : state) {
+        timer.start();
         falsePositives = 0;
         for (const auto& k : neverInserted) {
             if (filter.Contain(k) == cuckoofilter::Ok) {
                 ++falsePositives;
             }
         }
+        double elapsed = timer.stop();
+
+        state.SetIterationTime(elapsed);
         bm::DoNotOptimize(falsePositives);
     }
 
@@ -326,31 +369,89 @@ static void CPU_CF_FalsePositiveRate(bm::State& state) {
     );
 }
 
-BENCHMARK(GPU_CF_Insert)->RangeMultiplier(2)->Range(1 << 16, 1ULL << 28)->Unit(bm::kMillisecond);
-BENCHMARK(CPU_CF_Insert)->RangeMultiplier(2)->Range(1 << 16, 1ULL << 28)->Unit(bm::kMillisecond);
+BENCHMARK(GPU_CF_Insert)
+    ->RangeMultiplier(2)
+    ->Range(1 << 16, 1ULL << 28)
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
+BENCHMARK(CPU_CF_Insert)
+    ->RangeMultiplier(2)
+    ->Range(1 << 16, 1ULL << 28)
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
 
-BENCHMARK(GPU_CF_Query)->RangeMultiplier(2)->Range(1 << 16, 1ULL << 28)->Unit(bm::kMillisecond);
-BENCHMARK(CPU_CF_Query)->RangeMultiplier(2)->Range(1 << 16, 1ULL << 28)->Unit(bm::kMillisecond);
+BENCHMARK(GPU_CF_Query)
+    ->RangeMultiplier(2)
+    ->Range(1 << 16, 1ULL << 28)
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
+BENCHMARK(CPU_CF_Query)
+    ->RangeMultiplier(2)
+    ->Range(1 << 16, 1ULL << 28)
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
 
-BENCHMARK(GPU_CF_Delete)->RangeMultiplier(2)->Range(1 << 16, 1ULL << 28)->Unit(bm::kMillisecond);
-BENCHMARK(CPU_CF_Delete)->RangeMultiplier(2)->Range(1 << 16, 1ULL << 28)->Unit(bm::kMillisecond);
+BENCHMARK(GPU_CF_Delete)
+    ->RangeMultiplier(2)
+    ->Range(1 << 16, 1ULL << 28)
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
+BENCHMARK(CPU_CF_Delete)
+    ->RangeMultiplier(2)
+    ->Range(1 << 16, 1ULL << 28)
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
 
 BENCHMARK(GPU_CF_InsertQueryDelete)
     ->RangeMultiplier(2)
     ->Range(1 << 16, 1ULL << 28)
-    ->Unit(bm::kMillisecond);
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
 BENCHMARK(CPU_CF_InsertQueryDelete)
     ->RangeMultiplier(2)
     ->Range(1 << 16, 1ULL << 28)
-    ->Unit(bm::kMillisecond);
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
 
-BENCHMARK(GPU_CF_FalsePositiveRate)
+BENCHMARK(GPU_CF_FPR)
     ->RangeMultiplier(2)
     ->Range(1 << 16, 1ULL << 28)
-    ->Unit(bm::kMillisecond);
-BENCHMARK(CPU_CF_FalsePositiveRate)
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
+BENCHMARK(CPU_CF_FPR)
     ->RangeMultiplier(2)
     ->Range(1 << 16, 1ULL << 28)
-    ->Unit(bm::kMillisecond);
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
 
 BENCHMARK_MAIN();

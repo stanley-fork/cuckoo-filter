@@ -7,22 +7,25 @@
 #     "seaborn"
 # ]
 # ///
+import re
+import sys
 from pathlib import Path
-import pandas as pd
+
 import matplotlib.pyplot as plt
 import numpy as np
-import sys
+import pandas as pd
 import seaborn as sns
-import json
-import re
 
-data = json.load(sys.stdin)
-df = pd.DataFrame.from_records(data["benchmarks"])
+df = pd.read_csv(sys.stdin)
+
+# Filter for median records only
+df = df[df["name"].str.endswith("_median")]
 
 
 def parse_benchmark_name(name):
-    # Pattern: BM_CuckooFilter_<Operation><<BucketSize>>/<InputSize>
-    match = re.match(r"BM_CuckooFilter_(\w+)<\d+>/(\d+)", name)
+    # Pattern: CF_<Operation><<BucketSize>>/<InputSize>/min_time:<MinTime>/repeats:<Repetitions>_median
+    # Extract the operation and input size
+    match = re.match(r"CF_(\w+)<\d+>/(\d+)", name)
     if match:
         operation = match.group(1)
         input_size = int(match.group(2))

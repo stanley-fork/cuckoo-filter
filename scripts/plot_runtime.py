@@ -3,41 +3,52 @@
 # requires-python = ">=3.12"
 # dependencies = [
 #   "matplotlib",
+#   "pandas",
 # ]
 # ///
 
-import json
 import sys
 from collections import defaultdict
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+import pandas as pd
 
 
 def main():
     try:
-        data = json.load(sys.stdin)
-    except json.JSONDecodeError as e:
-        print(f"Error parsing JSON: {e}", file=sys.stderr)
+        df = pd.read_csv(sys.stdin)
+    except Exception as e:
+        print(f"Error parsing CSV: {e}", file=sys.stderr)
         sys.exit(1)
+
+    # Filter for median records only
+    df = df[df["name"].str.endswith("_median")]
 
     benchmark_data = defaultdict(dict)
 
-    for benchmark in data.get("benchmarks", []):
-        name = benchmark.get("name", "")
+    for _, row in df.iterrows():
+        name = row["name"]
         if "/" not in name:
             continue
 
-        base_name, size_str = name.rsplit("/", 1)
+        # Extract base_name and size from name
+        parts = name.split("/")
+        if len(parts) < 2:
+            continue
 
-        if "FalsePositiveRate" in base_name or "InsertQueryDelete" in base_name:
+        base_name = parts[0]
+        size_str = parts[1]
+
+        if "FPR" in base_name or "InsertQueryDelete" in base_name:
             continue
 
         try:
             size = int(size_str)
-            real_time = benchmark.get("real_time", 0)
-            benchmark_data[base_name][size] = real_time
-        except ValueError:
+            real_time = row.get("real_time", 0)
+            if pd.notna(real_time):
+                benchmark_data[base_name][size] = real_time
+        except (ValueError, KeyError):
             continue
 
     if not benchmark_data:

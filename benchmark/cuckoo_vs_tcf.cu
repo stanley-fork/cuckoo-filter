@@ -32,13 +32,17 @@ static void CF_Insert(bm::State& state) {
 
     size_t filterMemory = filter.sizeInBytes();
 
-    for (auto _ : state) {
-        state.PauseTiming();
-        filter.clear();
-        state.ResumeTiming();
+    Timer timer;
 
-        size_t inserted = adaptiveInsert(filter, d_keys);
+    for (auto _ : state) {
+        filter.clear();
         cudaDeviceSynchronize();
+
+        timer.start();
+        size_t inserted = adaptiveInsert(filter, d_keys);
+        double elapsed = timer.stop();
+
+        state.SetIterationTime(elapsed);
         bm::DoNotOptimize(inserted);
     }
 
@@ -57,9 +61,14 @@ static void CF_Query(bm::State& state) {
 
     size_t filterMemory = filter.sizeInBytes();
 
+    Timer timer;
+
     for (auto _ : state) {
+        timer.start();
         filter.containsMany(d_keys, d_output);
-        cudaDeviceSynchronize();
+        double elapsed = timer.stop();
+
+        state.SetIterationTime(elapsed);
         bm::DoNotOptimize(d_output.data().get());
     }
 
@@ -76,14 +85,18 @@ static void CF_Delete(bm::State& state) {
 
     size_t filterMemory = filter.sizeInBytes();
 
+    Timer timer;
+
     for (auto _ : state) {
-        state.PauseTiming();
         filter.clear();
         adaptiveInsert(filter, d_keys);
-        state.ResumeTiming();
-
-        size_t remaining = filter.deleteMany(d_keys, d_output);
         cudaDeviceSynchronize();
+
+        timer.start();
+        size_t remaining = filter.deleteMany(d_keys, d_output);
+        double elapsed = timer.stop();
+
+        state.SetIterationTime(elapsed);
         bm::DoNotOptimize(remaining);
         bm::DoNotOptimize(d_output.data().get());
     }
@@ -101,16 +114,18 @@ static void CF_InsertAndQuery(bm::State& state) {
 
     size_t filterMemory = filter.sizeInBytes();
 
+    Timer timer;
+
     for (auto _ : state) {
-        state.PauseTiming();
         filter.clear();
-        state.ResumeTiming();
-
-        size_t inserted = adaptiveInsert(filter, d_keys);
-        filter.containsMany(d_keys, d_output);
-
         cudaDeviceSynchronize();
 
+        timer.start();
+        size_t inserted = adaptiveInsert(filter, d_keys);
+        filter.containsMany(d_keys, d_output);
+        double elapsed = timer.stop();
+
+        state.SetIterationTime(elapsed);
         bm::DoNotOptimize(inserted);
         bm::DoNotOptimize(d_output.data().get());
     }
@@ -128,17 +143,19 @@ static void CF_InsertQueryDelete(bm::State& state) {
 
     size_t filterMemory = filter.sizeInBytes();
 
-    for (auto _ : state) {
-        state.PauseTiming();
-        filter.clear();
-        state.ResumeTiming();
+    Timer timer;
 
+    for (auto _ : state) {
+        filter.clear();
+        cudaDeviceSynchronize();
+
+        timer.start();
         size_t inserted = adaptiveInsert(filter, d_keys);
         filter.containsMany(d_keys, d_output);
         size_t remaining = filter.deleteMany(d_keys, d_output);
+        double elapsed = timer.stop();
 
-        cudaDeviceSynchronize();
-
+        state.SetIterationTime(elapsed);
         bm::DoNotOptimize(inserted);
         bm::DoNotOptimize(remaining);
         bm::DoNotOptimize(d_output.data().get());
@@ -176,9 +193,14 @@ static void CF_FPR(bm::State& state) {
 
     size_t filterMemory = filter.sizeInBytes();
 
+    Timer timer;
+
     for (auto _ : state) {
+        timer.start();
         filter.containsMany(d_neverInserted, d_output);
-        cudaDeviceSynchronize();
+        double elapsed = timer.stop();
+
+        state.SetIterationTime(elapsed);
         bm::DoNotOptimize(d_output.data().get());
     }
 
@@ -210,18 +232,19 @@ static void TCF_Insert(bm::State& state) {
 
     size_t filterMemory = capacity * sizeof(uint16_t);
 
+    Timer timer;
+
     for (auto _ : state) {
-        state.PauseTiming();
         TCFType* filter = TCFType::host_build_tcf(capacity);
         cudaMemset(d_misses, 0, sizeof(uint64_t));
-        state.ResumeTiming();
-
-        filter->bulk_insert(thrust::raw_pointer_cast(d_keys.data()), n, d_misses);
         cudaDeviceSynchronize();
 
-        state.PauseTiming();
+        timer.start();
+        filter->bulk_insert(thrust::raw_pointer_cast(d_keys.data()), n, d_misses);
+        double elapsed = timer.stop();
+
+        state.SetIterationTime(elapsed);
         TCFType::host_free_tcf(filter);
-        state.ResumeTiming();
     }
 
     cudaFree(d_misses);
@@ -243,9 +266,14 @@ static void TCF_Query(bm::State& state) {
 
     size_t filterMemory = capacity * sizeof(uint16_t);
 
+    Timer timer;
+
     for (auto _ : state) {
+        timer.start();
         bool* d_output = filter->bulk_query(thrust::raw_pointer_cast(d_keys.data()), n);
-        cudaDeviceSynchronize();
+        double elapsed = timer.stop();
+
+        state.SetIterationTime(elapsed);
         bm::DoNotOptimize(d_output);
         cudaFree(d_output);
     }
@@ -266,22 +294,23 @@ static void TCF_Delete(bm::State& state) {
 
     size_t filterMemory = capacity * sizeof(uint16_t);
 
+    Timer timer;
+
     for (auto _ : state) {
-        state.PauseTiming();
         TCFType* filter = TCFType::host_build_tcf(capacity);
         cudaMemset(d_misses, 0, sizeof(uint64_t));
         filter->bulk_insert(thrust::raw_pointer_cast(d_keys.data()), n, d_misses);
-        state.ResumeTiming();
-
-        bool* d_output = filter->bulk_delete(thrust::raw_pointer_cast(d_keys.data()), n);
         cudaDeviceSynchronize();
 
+        timer.start();
+        bool* d_output = filter->bulk_delete(thrust::raw_pointer_cast(d_keys.data()), n);
+        double elapsed = timer.stop();
+
+        state.SetIterationTime(elapsed);
         bm::DoNotOptimize(d_output);
 
-        state.PauseTiming();
         cudaFree(d_output);
         TCFType::host_free_tcf(filter);
-        state.ResumeTiming();
     }
 
     cudaFree(d_misses);
@@ -299,23 +328,23 @@ static void TCF_InsertAndQuery(bm::State& state) {
 
     size_t filterMemory = capacity * sizeof(uint16_t);
 
+    Timer timer;
+
     for (auto _ : state) {
-        state.PauseTiming();
         TCFType* filter = TCFType::host_build_tcf(capacity);
         cudaMemset(d_misses, 0, sizeof(uint64_t));
-        state.ResumeTiming();
-
-        filter->bulk_insert(thrust::raw_pointer_cast(d_keys.data()), n, d_misses);
-        bool* d_output = filter->bulk_query(thrust::raw_pointer_cast(d_keys.data()), n);
-
         cudaDeviceSynchronize();
 
+        timer.start();
+        filter->bulk_insert(thrust::raw_pointer_cast(d_keys.data()), n, d_misses);
+        bool* d_output = filter->bulk_query(thrust::raw_pointer_cast(d_keys.data()), n);
+        double elapsed = timer.stop();
+
+        state.SetIterationTime(elapsed);
         bm::DoNotOptimize(d_output);
 
-        state.PauseTiming();
         cudaFree(d_output);
         TCFType::host_free_tcf(filter);
-        state.ResumeTiming();
     }
 
     cudaFree(d_misses);
@@ -333,26 +362,26 @@ static void TCF_InsertQueryDelete(bm::State& state) {
 
     size_t filterMemory = capacity * sizeof(uint16_t);
 
+    Timer timer;
+
     for (auto _ : state) {
-        state.PauseTiming();
         TCFType* filter = TCFType::host_build_tcf(capacity);
         cudaMemset(d_misses, 0, sizeof(uint64_t));
-        state.ResumeTiming();
-
-        filter->bulk_insert(thrust::raw_pointer_cast(d_keys.data()), n, d_misses);
-        bool* d_query_output = filter->bulk_query(thrust::raw_pointer_cast(d_keys.data()), n);
-        bool* d_delete_output = filter->bulk_delete(thrust::raw_pointer_cast(d_keys.data()), n);
-
         cudaDeviceSynchronize();
 
-        bm::DoNotOptimize(d_query_output);
-        bm::DoNotOptimize(d_delete_output);
+        timer.start();
+        filter->bulk_insert(thrust::raw_pointer_cast(d_keys.data()), n, d_misses);
+        bool* d_queryOutput = filter->bulk_query(thrust::raw_pointer_cast(d_keys.data()), n);
+        bool* d_deleteOutput = filter->bulk_delete(thrust::raw_pointer_cast(d_keys.data()), n);
+        double elapsed = timer.stop();
 
-        state.PauseTiming();
-        cudaFree(d_query_output);
-        cudaFree(d_delete_output);
+        state.SetIterationTime(elapsed);
+        bm::DoNotOptimize(d_queryOutput);
+        bm::DoNotOptimize(d_deleteOutput);
+
+        cudaFree(d_queryOutput);
+        cudaFree(d_deleteOutput);
         TCFType::host_free_tcf(filter);
-        state.ResumeTiming();
     }
 
     cudaFree(d_misses);
@@ -391,18 +420,20 @@ static void TCF_FPR(bm::State& state) {
 
     size_t filterMemory = capacity * sizeof(uint16_t);
 
+    Timer timer;
+
     for (auto _ : state) {
+        timer.start();
         bool* d_output =
             filter->bulk_query(thrust::raw_pointer_cast(d_neverInserted.data()), fprTestSize);
-        cudaDeviceSynchronize();
+        double elapsed = timer.stop();
 
-        state.PauseTiming();
-        thrust::device_ptr<bool> d_output_ptr(d_output);
-        size_t falsePositives = thrust::reduce(
-            d_output_ptr, d_output_ptr + fprTestSize, 0ULL, cuda::std::plus<size_t>()
-        );
+        state.SetIterationTime(elapsed);
+
+        thrust::device_ptr<bool> d_outputPtr(d_output);
+        size_t falsePositives =
+            thrust::reduce(d_outputPtr, d_outputPtr + fprTestSize, 0ULL, cuda::std::plus<size_t>());
         cudaFree(d_output);
-        state.ResumeTiming();
 
         bm::DoNotOptimize(falsePositives);
     }
@@ -411,9 +442,9 @@ static void TCF_FPR(bm::State& state) {
     bool* d_output =
         filter->bulk_query(thrust::raw_pointer_cast(d_neverInserted.data()), fprTestSize);
     cudaDeviceSynchronize();
-    thrust::device_ptr<bool> d_output_ptr(d_output);
+    thrust::device_ptr<bool> d_outputPtr(d_output);
     size_t falsePositives =
-        thrust::reduce(d_output_ptr, d_output_ptr + fprTestSize, 0ULL, cuda::std::plus<size_t>());
+        thrust::reduce(d_outputPtr, d_outputPtr + fprTestSize, 0ULL, cuda::std::plus<size_t>());
     cudaFree(d_output);
 
     double fpr = static_cast<double>(falsePositives) / static_cast<double>(fprTestSize);
@@ -434,34 +465,106 @@ static void TCF_FPR(bm::State& state) {
     TCFType::host_free_tcf(filter);
 }
 
-BENCHMARK(CF_Insert)->RangeMultiplier(2)->Range(1 << 16, 1ULL << 28)->Unit(bm::kMillisecond);
-BENCHMARK(TCF_Insert)->RangeMultiplier(2)->Range(1 << 16, 1ULL << 28)->Unit(bm::kMillisecond);
+BENCHMARK(CF_Insert)
+    ->RangeMultiplier(2)
+    ->Range(1 << 16, 1ULL << 28)
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
+BENCHMARK(TCF_Insert)
+    ->RangeMultiplier(2)
+    ->Range(1 << 16, 1ULL << 28)
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
 
-BENCHMARK(CF_Query)->RangeMultiplier(2)->Range(1 << 16, 1ULL << 28)->Unit(bm::kMillisecond);
-BENCHMARK(TCF_Query)->RangeMultiplier(2)->Range(1 << 16, 1ULL << 28)->Unit(bm::kMillisecond);
+BENCHMARK(CF_Query)
+    ->RangeMultiplier(2)
+    ->Range(1 << 16, 1ULL << 28)
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
+BENCHMARK(TCF_Query)
+    ->RangeMultiplier(2)
+    ->Range(1 << 16, 1ULL << 28)
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
 
-BENCHMARK(CF_Delete)->RangeMultiplier(2)->Range(1 << 16, 1ULL << 28)->Unit(bm::kMillisecond);
-BENCHMARK(TCF_Delete)->RangeMultiplier(2)->Range(1 << 16, 1ULL << 28)->Unit(bm::kMillisecond);
+BENCHMARK(CF_Delete)
+    ->RangeMultiplier(2)
+    ->Range(1 << 16, 1ULL << 28)
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
+BENCHMARK(TCF_Delete)
+    ->RangeMultiplier(2)
+    ->Range(1 << 16, 1ULL << 28)
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
 
 BENCHMARK(CF_InsertAndQuery)
     ->RangeMultiplier(2)
     ->Range(1 << 16, 1ULL << 28)
-    ->Unit(bm::kMillisecond);
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
 BENCHMARK(TCF_InsertAndQuery)
     ->RangeMultiplier(2)
     ->Range(1 << 16, 1ULL << 28)
-    ->Unit(bm::kMillisecond);
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
 
 BENCHMARK(CF_InsertQueryDelete)
     ->RangeMultiplier(2)
     ->Range(1 << 16, 1ULL << 28)
-    ->Unit(bm::kMillisecond);
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
 BENCHMARK(TCF_InsertQueryDelete)
     ->RangeMultiplier(2)
     ->Range(1 << 16, 1ULL << 28)
-    ->Unit(bm::kMillisecond);
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
 
-BENCHMARK(CF_FPR)->RangeMultiplier(2)->Range(1 << 16, 1ULL << 28)->Unit(bm::kMillisecond);
-BENCHMARK(TCF_FPR)->RangeMultiplier(2)->Range(1 << 16, 1ULL << 28)->Unit(bm::kMillisecond);
+BENCHMARK(CF_FPR)
+    ->RangeMultiplier(2)
+    ->Range(1 << 16, 1ULL << 28)
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
+BENCHMARK(TCF_FPR)
+    ->RangeMultiplier(2)
+    ->Range(1 << 16, 1ULL << 28)
+    ->Unit(bm::kMillisecond)
+    ->UseManualTime()
+    ->MinTime(0.5)
+    ->Repetitions(5)
+    ->ReportAggregatesOnly(true);
 
 BENCHMARK_MAIN();

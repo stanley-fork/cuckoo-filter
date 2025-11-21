@@ -3,56 +3,61 @@
 # requires-python = ">=3.12"
 # dependencies = [
 #   "matplotlib",
+#   "pandas",
 # ]
 # ///
-import json
 import sys
 from collections import defaultdict
 from pathlib import Path
+
 import matplotlib.pyplot as plt
+import pandas as pd
 
 
 def main():
     try:
-        data = json.load(sys.stdin)
-    except json.JSONDecodeError as e:
-        print(f"Error parsing JSON: {e}", file=sys.stderr)
+        df = pd.read_csv(sys.stdin)
+    except Exception as e:
+        print(f"Error parsing CSV: {e}", file=sys.stderr)
         sys.exit(1)
+
+    # Filter for median records only
+    df = df[df["name"].str.endswith("_median")]
 
     fpr_data = defaultdict(dict)
     false_positives_data = defaultdict(dict)
 
-    for benchmark in data.get("benchmarks", []):
-        name = benchmark.get("name", "")
+    for _, row in df.iterrows():
+        name = row["name"]
         if "/" not in name:
             continue
 
-        base_name, size_str = name.rsplit("/", 1)
+        # Extract base_name and size from name
+        parts = name.split("/")
+        if len(parts) < 2:
+            continue
 
-        if "FalsePositiveRate" not in base_name:
+        base_name = parts[0]
+        size_str = parts[1]
+
+        if "FalsePositiveRate" not in base_name and "FPR" not in base_name:
             continue
 
         try:
             size = int(size_str)
-            fpr_percentage = None
-            false_positives = None
+            fpr_percentage = row.get("fpr_percentage")
+            false_positives = row.get("false_positives")
 
-            for counter_name, counter_value in benchmark.items():
-                if counter_name == "fpr_percentage":
-                    fpr_percentage = counter_value
-                elif counter_name == "false_positives":
-                    false_positives = counter_value
-
-            if fpr_percentage is not None:
+            if pd.notna(fpr_percentage):
                 fpr_data[base_name][size] = fpr_percentage
-            if false_positives is not None:
+            if pd.notna(false_positives):
                 false_positives_data[base_name][size] = false_positives
 
-        except ValueError:
+        except (ValueError, KeyError):
             continue
 
     if not fpr_data and not false_positives_data:
-        print("No false positive rate data found in JSON", file=sys.stderr)
+        print("No false positive rate data found in csv", file=sys.stderr)
         sys.exit(1)
 
     script_dir = Path(__file__).parent
