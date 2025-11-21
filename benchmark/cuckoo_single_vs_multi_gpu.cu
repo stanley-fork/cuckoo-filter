@@ -116,28 +116,6 @@ BENCHMARK_DEFINE_F(SingleGPUFixture, Delete)(bm::State& state) {
     setCounters(state);
 }
 
-BENCHMARK_DEFINE_F(SingleGPUFixture, InsertQueryDelete)(bm::State& state) {
-    for (auto _ : state) {
-        filter->clear();
-        cudaDeviceSynchronize();
-
-        timer.start();
-
-        size_t inserted = adaptiveInsert(*filter, d_keys);
-        filter->containsMany(d_keys, d_output);
-        size_t remaining = filter->deleteMany(d_keys, d_output);
-
-        cudaDeviceSynchronize();
-        double elapsed = timer.stop();
-
-        state.SetIterationTime(elapsed);
-        bm::DoNotOptimize(inserted);
-        bm::DoNotOptimize(remaining);
-        bm::DoNotOptimize(d_output.data().get());
-    }
-    setCounters(state);
-}
-
 BENCHMARK_DEFINE_F(MultiGPUFixture, Insert)(bm::State& state) {
     for (auto _ : state) {
         filter->clear();
