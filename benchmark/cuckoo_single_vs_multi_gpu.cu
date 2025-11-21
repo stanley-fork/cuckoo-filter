@@ -13,7 +13,7 @@ namespace bm = benchmark;
 using Config = CuckooConfig<uint64_t, 16, 500, 128, 16>;
 
 template <typename ConfigType, double loadFactor = 0.95>
-class MultiGPUFixture : public benchmark::Fixture {
+class MultiGPUFixture_ : public benchmark::Fixture {
     using benchmark::Fixture::SetUp;
     using benchmark::Fixture::TearDown;
 
@@ -63,10 +63,10 @@ class MultiGPUFixture : public benchmark::Fixture {
     Timer timer;
 };
 
-using SingleGPUCFFixture = CuckooFilterFixture<Config, 0.95>;
-using MultiGPUCFFixture = MultiGPUFixture<Config>;
+using SingleGPUFixture = CuckooFilterFixture<Config, 0.95>;
+using MultiGPUFixture = MultiGPUFixture_<Config>;
 
-BENCHMARK_DEFINE_F(SingleGPUCFFixture, Insert)(bm::State& state) {
+BENCHMARK_DEFINE_F(SingleGPUFixture, Insert)(bm::State& state) {
     for (auto _ : state) {
         filter->clear();
         cudaDeviceSynchronize();
@@ -82,7 +82,7 @@ BENCHMARK_DEFINE_F(SingleGPUCFFixture, Insert)(bm::State& state) {
     setCounters(state);
 }
 
-BENCHMARK_DEFINE_F(SingleGPUCFFixture, Query)(bm::State& state) {
+BENCHMARK_DEFINE_F(SingleGPUFixture, Query)(bm::State& state) {
     adaptiveInsert(*filter, d_keys);
     cudaDeviceSynchronize();
 
@@ -98,7 +98,7 @@ BENCHMARK_DEFINE_F(SingleGPUCFFixture, Query)(bm::State& state) {
     setCounters(state);
 }
 
-BENCHMARK_DEFINE_F(SingleGPUCFFixture, Delete)(bm::State& state) {
+BENCHMARK_DEFINE_F(SingleGPUFixture, Delete)(bm::State& state) {
     for (auto _ : state) {
         filter->clear();
         adaptiveInsert(*filter, d_keys);
@@ -116,7 +116,7 @@ BENCHMARK_DEFINE_F(SingleGPUCFFixture, Delete)(bm::State& state) {
     setCounters(state);
 }
 
-BENCHMARK_DEFINE_F(SingleGPUCFFixture, InsertQueryDelete)(bm::State& state) {
+BENCHMARK_DEFINE_F(SingleGPUFixture, InsertQueryDelete)(bm::State& state) {
     for (auto _ : state) {
         filter->clear();
         cudaDeviceSynchronize();
@@ -138,7 +138,7 @@ BENCHMARK_DEFINE_F(SingleGPUCFFixture, InsertQueryDelete)(bm::State& state) {
     setCounters(state);
 }
 
-BENCHMARK_DEFINE_F(MultiGPUCFFixture, Insert)(bm::State& state) {
+BENCHMARK_DEFINE_F(MultiGPUFixture, Insert)(bm::State& state) {
     for (auto _ : state) {
         filter->clear();
         filter->synchronizeAllGPUs();
@@ -154,7 +154,7 @@ BENCHMARK_DEFINE_F(MultiGPUCFFixture, Insert)(bm::State& state) {
     setCounters(state);
 }
 
-BENCHMARK_DEFINE_F(MultiGPUCFFixture, Query)(bm::State& state) {
+BENCHMARK_DEFINE_F(MultiGPUFixture, Query)(bm::State& state) {
     filter->insertMany(h_keys);
     filter->synchronizeAllGPUs();
 
@@ -170,7 +170,7 @@ BENCHMARK_DEFINE_F(MultiGPUCFFixture, Query)(bm::State& state) {
     setCounters(state);
 }
 
-BENCHMARK_DEFINE_F(MultiGPUCFFixture, Delete)(bm::State& state) {
+BENCHMARK_DEFINE_F(MultiGPUFixture, Delete)(bm::State& state) {
     for (auto _ : state) {
         filter->clear();
         filter->insertMany(h_keys);
@@ -188,7 +188,7 @@ BENCHMARK_DEFINE_F(MultiGPUCFFixture, Delete)(bm::State& state) {
     setCounters(state);
 }
 
-BENCHMARK_DEFINE_F(MultiGPUCFFixture, InsertQueryDelete)(bm::State& state) {
+BENCHMARK_DEFINE_F(MultiGPUFixture, InsertQueryDelete)(bm::State& state) {
     for (auto _ : state) {
         filter->clear();
         filter->synchronizeAllGPUs();
@@ -210,14 +210,14 @@ BENCHMARK_DEFINE_F(MultiGPUCFFixture, InsertQueryDelete)(bm::State& state) {
     setCounters(state);
 }
 
-REGISTER_BENCHMARK(SingleGPUCFFixture, Insert);
-REGISTER_BENCHMARK(SingleGPUCFFixture, Query);
-REGISTER_BENCHMARK(SingleGPUCFFixture, Delete);
-REGISTER_BENCHMARK(SingleGPUCFFixture, InsertQueryDelete);
+REGISTER_BENCHMARK(SingleGPUFixture, Insert);
+REGISTER_BENCHMARK(SingleGPUFixture, Query);
+REGISTER_BENCHMARK(SingleGPUFixture, Delete);
+REGISTER_BENCHMARK(SingleGPUFixture, InsertQueryDelete);
 
-REGISTER_BENCHMARK(MultiGPUCFFixture, Insert);
-REGISTER_BENCHMARK(MultiGPUCFFixture, Query);
-REGISTER_BENCHMARK(MultiGPUCFFixture, Delete);
-REGISTER_BENCHMARK(MultiGPUCFFixture, InsertQueryDelete);
+REGISTER_BENCHMARK(MultiGPUFixture, Insert);
+REGISTER_BENCHMARK(MultiGPUFixture, Query);
+REGISTER_BENCHMARK(MultiGPUFixture, Delete);
+REGISTER_BENCHMARK(MultiGPUFixture, InsertQueryDelete);
 
 BENCHMARK_MAIN();
