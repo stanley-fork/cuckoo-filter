@@ -14,6 +14,7 @@
 #include <helpers.cuh>
 #include <iostream>
 #include <random>
+#include <string_view>
 #include <vector>
 
 int main(int argc, char** argv) {
@@ -37,7 +38,7 @@ int main(int argc, char** argv) {
     size_t capacity = 1ULL << exponent;
     size_t n = capacity * targetLoadFactor;
 
-    std::cout << "Using " << Config::AltBucketPolicy::name << std::endl;
+    std::cout << std::format("Using {}\n", std::string_view(Config::AltBucketPolicy::name));
 
     thrust::device_vector<uint64_t> d_input(n);
     thrust::device_vector<uint8_t> d_output(n);
@@ -64,8 +65,9 @@ int main(int argc, char** argv) {
 
     float loadFactor = filter.loadFactor();
 
-    std::cout << "Inserted " << count << " / " << n << " items in " << duration << " ms"
-              << " (load factor = " << loadFactor << ")" << std::endl;
+    std::cout << std::format(
+        "Inserted {} / {} items in {} ms (load factor = {})\n", count, n, duration, loadFactor
+    );
 
     start = std::chrono::high_resolution_clock::now();
     filter.containsMany(d_input, d_output);
@@ -75,12 +77,12 @@ int main(int argc, char** argv) {
     thrust::host_vector<uint8_t> output = d_output;
 
     size_t found = countOnes(reinterpret_cast<bool*>(thrust::raw_pointer_cast(output.data())), n);
-    std::cout << "Found " << found << " / " << n << " items in " << duration << " ms" << std::endl;
+    std::cout << std::format("Found {} / {} items in {} ms\n", found, n, duration);
 
     // size_t occupiedSlots = filter.countOccupiedSlots();
-    // std::cout << "Occupied slots: " << occupiedSlots << std::endl;
+    // std::cout << std::format("Occupied slots: {}\n", occupiedSlots);
 
-    size_t fprTestSize = std::min(n, size_t(1000000));
+    size_t fprTestSize = std::min(n, size_t(1'000'000));
     thrust::device_vector<uint64_t> d_neverInserted(fprTestSize);
     thrust::device_vector<uint8_t> d_fprOutput(fprTestSize);
 
@@ -112,9 +114,16 @@ int main(int argc, char** argv) {
     double theoreticalFPR =
         (2.0 * Config::bucketSize * loadFactor) / (std::pow(2, int(Config::bitsPerTag)));
 
-    std::cout << "False Positive Rate: " << falsePositives << " / " << fprTestSize << " = " << fpr
-              << "% (theoretical " << 100 * theoreticalFPR << "% for f = " << Config::bitsPerTag
-              << ", b = " << filter.bucketSize << ", α = " << loadFactor << ")" << std::endl;
+    std::cout << std::format(
+        "False Positive Rate: {} / {} = {}% (theoretical {}% for f = {}, b = {}, α = {})\n",
+        falsePositives,
+        fprTestSize,
+        fpr,
+        100 * theoreticalFPR,
+        Config::bitsPerTag,
+        filter.bucketSize,
+        loadFactor
+    );
 
     size_t deleteCount = n / 2;
     thrust::device_vector<uint64_t> d_deleteKeys(
@@ -132,14 +141,21 @@ int main(int argc, char** argv) {
     size_t deleted = countOnes(
         reinterpret_cast<bool*>(thrust::raw_pointer_cast(deleteOutput.data())), deleteCount
     );
-    std::cout << "Deleted " << deleted << " / " << deleteCount << " items in " << duration << " ms"
-              << " (load factor = " << filter.loadFactor() << ")" << std::endl;
+
+    std::cout << std::format(
+        "Deleted {} / {} items in {} ms (load factor = {})\n",
+        deleted,
+        deleteCount,
+        duration,
+        filter.loadFactor()
+    );
 
     filter.containsMany(d_deleteKeys, d_deleteOutput);
     deleteOutput = d_deleteOutput;
     size_t stillFound = countOnes(
         reinterpret_cast<bool*>(thrust::raw_pointer_cast(deleteOutput.data())), deleteCount
     );
-    std::cout << "After deletion, " << stillFound << " / " << deleteCount
-              << " deleted items still found" << std::endl;
+    std::cout << std::format(
+        "After deletion, {} / {} deleted items still found\n", stillFound, deleteCount
+    );
 }

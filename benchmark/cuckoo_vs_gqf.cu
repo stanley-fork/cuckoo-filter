@@ -464,7 +464,6 @@ int main(int argc, char** argv) {
     ::benchmark::Shutdown();
 
     fflush(stdout);
-    std::cout << std::flush;
 
     std::_Exit(0);
 }

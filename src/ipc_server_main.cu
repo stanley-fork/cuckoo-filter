@@ -21,7 +21,7 @@ void handleSignal(int signal) {
 
 int main(int argc, char** argv) {
     if (argc != 2) {
-        std::cerr << "Usage: " << argv[0] << " <capacity>" << std::endl;
+        std::cerr << std::format("Usage: {} <capacity>\n", argv[0]);
         return 1;
     }
 
@@ -43,7 +43,7 @@ int main(int argc, char** argv) {
         }
 
     } catch (const std::exception& e) {
-        std::cerr << "Server failed to start: " << e.what() << std::endl;
+        std::cerr << std::format("Server failed to start: {}\n", e.what());
         return 1;
     }
 }

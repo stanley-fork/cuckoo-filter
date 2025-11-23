@@ -9,8 +9,10 @@
 #include <ctime>
 #include <cuda/std/cstddef>
 #include <cuda/std/cstdint>
+#include <format>
 #include <iostream>
 #include <random>
+#include <string_view>
 #include "CuckooFilterMultiGPU.cuh"
 #include "hash_strategies.cuh"
 #include "helpers.cuh"
@@ -41,19 +43,23 @@ int main(int argc, char** argv) {
     if (numGPUsToUse == -1) {
         numGPUsToUse = deviceCount;
     } else if (numGPUsToUse > deviceCount) {
-        std::cerr << "Requested " << numGPUsToUse << " GPUs but only " << deviceCount
-                  << " available. Using " << deviceCount << " GPUs." << std::endl;
+        std::cerr << std::format(
+            "Requested {} GPUs but only {} available. Using {} GPUs.\n",
+            numGPUsToUse,
+            deviceCount,
+            deviceCount
+        );
         numGPUsToUse = deviceCount;
     }
 
-    std::cout << "Using " << numGPUsToUse << (numGPUsToUse == 1 ? " GPU" : " GPUs") << std::endl;
+    std::cout << std::format("Using {} {}\n", numGPUsToUse, (numGPUsToUse == 1 ? "GPU" : "GPUs"));
 
     using Config = CuckooConfig<uint64_t, 16, 500, 128, 16, XorAltBucketPolicy>;
 
     size_t capacity = 1ULL << exponent;
     auto n = static_cast<size_t>(capacity * targetLoadFactor);
 
-    std::cout << "Using " << Config::AltBucketPolicy::name << std::endl;
+    std::cout << std::format("Using {}\n", std::string_view(Config::AltBucketPolicy::name));
 
     thrust::device_vector<uint64_t> d_input(n);
 
@@ -82,8 +88,9 @@ int main(int argc, char** argv) {
 
     float loadFactor = filter.loadFactor();
 
-    std::cout << "Inserted " << count << " / " << n << " items in " << duration << " ms"
-              << " (load factor = " << loadFactor << ")" << std::endl;
+    std::cout << std::format(
+        "Inserted {} / {} items in {} ms (load factor = {})\n", count, n, duration, loadFactor
+    );
 
     thrust::host_vector<bool> h_output(n);
 
@@ -93,7 +100,7 @@ int main(int argc, char** argv) {
     duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
 
     size_t found = countOnes(h_output.data(), n);
-    std::cout << "Found " << found << " / " << n << " items in " << duration << " ms" << std::endl;
+    std::cout << std::format("Found {} / {} items in {} ms\n", found, n, duration);
 
     size_t fprTestSize = std::min(n, size_t(1000000));
     thrust::device_vector<uint64_t> d_neverInserted(fprTestSize);
@@ -125,9 +132,16 @@ int main(int argc, char** argv) {
     double theoreticalFPR =
         (2.0 * Config::bucketSize * loadFactor) / (std::pow(2, int(Config::bitsPerTag)));
 
-    std::cout << "False Positive Rate: " << falsePositives << " / " << fprTestSize << " = " << fpr
-              << "% (theoretical " << 100 * theoreticalFPR << "% for f = " << Config::bitsPerTag
-              << ", b = " << Config::bucketSize << ", α = " << loadFactor << ")" << std::endl;
+    std::cout << std::format(
+        "False Positive Rate: {} / {} = {}% (theoretical {}% for f = {}, b = {}, α = {})\n",
+        falsePositives,
+        fprTestSize,
+        fpr,
+        100 * theoreticalFPR,
+        Config::bitsPerTag,
+        Config::bucketSize,
+        loadFactor
+    );
 
     size_t deleteCount = n / 2;
     thrust::host_vector<uint64_t> h_deleteKeys(deleteCount);
@@ -143,18 +157,25 @@ int main(int argc, char** argv) {
     duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
 
     size_t deleted = countOnes(h_deleteOutput.data(), deleteCount);
-    std::cout << "Deleted " << deleted << " / " << deleteCount << " items in " << duration << " ms"
-              << " (load factor = " << filter.loadFactor() << ")" << std::endl;
+
+    std::cout << std::format(
+        "Deleted {} / {} items in {} ms (load factor = {})\n",
+        deleted,
+        deleteCount,
+        duration,
+        filter.loadFactor()
+    );
 
     filter.containsMany(h_deleteKeys, h_deleteOutput);
     size_t stillFound = countOnes(h_deleteOutput.data(), deleteCount);
-    std::cout << "After deletion, " << stillFound << " / " << deleteCount
-              << " deleted items still found" << std::endl;
+    std::cout << std::format(
+        "After deletion, {} / {} deleted items still found\n\n", stillFound, deleteCount
+    );
 
-    std::cout << "\nStatistics:" << std::endl;
-    std::cout << "  Total GPUs: " << numGPUsToUse << std::endl;
-    std::cout << "  Total capacity: " << filter.totalCapacity() << std::endl;
-    std::cout << "  Total occupied: " << filter.totalOccupiedSlots() << std::endl;
+    std::cout << "Statistics:\n";
+    std::cout << std::format("  Total GPUs: {}\n", numGPUsToUse);
+    std::cout << std::format("  Total capacity: {}\n", filter.totalCapacity());
+    std::cout << std::format("  Total occupied: {}\n", filter.totalOccupiedSlots());
 
     return 0;
 }

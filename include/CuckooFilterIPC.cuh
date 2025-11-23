@@ -241,7 +241,7 @@ class CuckooFilterIPCServer {
             try {
                 processRequest(req);
             } catch (const std::exception& e) {
-                std::cerr << "Error processing request: " << e.what() << std::endl;
+                std::cerr << std::format("Error processing request: {}\n", e.what());
                 req->result = 0;
             }
 
@@ -404,14 +404,12 @@ class CuckooFilterIPCServer {
         if (force) {
             size_t cancelled = queue->cancelPendingRequests();
             if (cancelled > 0) {
-                std::cout << "Force shutdown: cancelled " << cancelled << " pending requests"
-                          << std::endl;
+                std::cout << std::format("Force shutdown: cancelled {} pending requests\n", cancelled);
             }
         } else {
             size_t pending = queue->pendingRequests();
             if (pending > 0) {
-                std::cout << "Graceful shutdown: draining " << pending << " pending requests..."
-                          << std::endl;
+                std::cout << std::format("Graceful shutdown: draining {} pending requests...\n", pending);
             }
         }
 
