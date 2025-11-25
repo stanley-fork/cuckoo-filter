@@ -62,88 +62,6 @@ class TCFFixture : public benchmark::Fixture {
 
 using CFFixture = CuckooFilterFixture<Config, TCF_LOAD_FACTOR>;
 
-BENCHMARK_DEFINE_F(CFFixture, Insert)(bm::State& state) {
-    for (auto _ : state) {
-        filter->clear();
-        cudaDeviceSynchronize();
-
-        timer.start();
-        size_t inserted = adaptiveInsert(*filter, d_keys);
-        double elapsed = timer.stop();
-
-        state.SetIterationTime(elapsed);
-        bm::DoNotOptimize(inserted);
-    }
-    setCounters(state);
-}
-
-BENCHMARK_DEFINE_F(CFFixture, Query)(bm::State& state) {
-    adaptiveInsert(*filter, d_keys);
-
-    for (auto _ : state) {
-        timer.start();
-        filter->containsMany(d_keys, d_output);
-        double elapsed = timer.stop();
-
-        state.SetIterationTime(elapsed);
-        bm::DoNotOptimize(d_output.data().get());
-    }
-    setCounters(state);
-}
-
-BENCHMARK_DEFINE_F(CFFixture, Delete)(bm::State& state) {
-    for (auto _ : state) {
-        filter->clear();
-        adaptiveInsert(*filter, d_keys);
-        cudaDeviceSynchronize();
-
-        timer.start();
-        size_t remaining = filter->deleteMany(d_keys, d_output);
-        double elapsed = timer.stop();
-
-        state.SetIterationTime(elapsed);
-        bm::DoNotOptimize(remaining);
-        bm::DoNotOptimize(d_output.data().get());
-    }
-    setCounters(state);
-}
-
-BENCHMARK_DEFINE_F(CFFixture, InsertAndQuery)(bm::State& state) {
-    for (auto _ : state) {
-        filter->clear();
-        cudaDeviceSynchronize();
-
-        timer.start();
-        size_t inserted = adaptiveInsert(*filter, d_keys);
-        filter->containsMany(d_keys, d_output);
-        double elapsed = timer.stop();
-
-        state.SetIterationTime(elapsed);
-        bm::DoNotOptimize(inserted);
-        bm::DoNotOptimize(d_output.data().get());
-    }
-    setCounters(state);
-}
-
-BENCHMARK_DEFINE_F(CFFixture, InsertQueryDelete)(bm::State& state) {
-    for (auto _ : state) {
-        filter->clear();
-        cudaDeviceSynchronize();
-
-        timer.start();
-        size_t inserted = adaptiveInsert(*filter, d_keys);
-        filter->containsMany(d_keys, d_output);
-        size_t remaining = filter->deleteMany(d_keys, d_output);
-        double elapsed = timer.stop();
-
-        state.SetIterationTime(elapsed);
-        bm::DoNotOptimize(inserted);
-        bm::DoNotOptimize(remaining);
-        bm::DoNotOptimize(d_output.data().get());
-    }
-    setCounters(state);
-}
-
 static void CF_FPR(bm::State& state) {
     Timer timer;
     auto [capacity, n] = calculateCapacityAndSize(state.range(0), TCF_LOAD_FACTOR);
@@ -244,49 +162,6 @@ BENCHMARK_DEFINE_F(TCFFixture, Delete)(bm::State& state) {
     setCounters(state);
 }
 
-BENCHMARK_DEFINE_F(TCFFixture, InsertAndQuery)(bm::State& state) {
-    for (auto _ : state) {
-        TCFType* filter = TCFType::host_build_tcf(capacity);
-        cudaMemset(d_misses, 0, sizeof(uint64_t));
-        cudaDeviceSynchronize();
-
-        timer.start();
-        filter->bulk_insert(thrust::raw_pointer_cast(d_keys.data()), n, d_misses);
-        bool* d_output = filter->bulk_query(thrust::raw_pointer_cast(d_keys.data()), n);
-        double elapsed = timer.stop();
-
-        state.SetIterationTime(elapsed);
-        bm::DoNotOptimize(d_output);
-
-        cudaFree(d_output);
-        TCFType::host_free_tcf(filter);
-    }
-    setCounters(state);
-}
-
-BENCHMARK_DEFINE_F(TCFFixture, InsertQueryDelete)(bm::State& state) {
-    for (auto _ : state) {
-        TCFType* filter = TCFType::host_build_tcf(capacity);
-        cudaMemset(d_misses, 0, sizeof(uint64_t));
-        cudaDeviceSynchronize();
-
-        timer.start();
-        filter->bulk_insert(thrust::raw_pointer_cast(d_keys.data()), n, d_misses);
-        bool* d_queryOutput = filter->bulk_query(thrust::raw_pointer_cast(d_keys.data()), n);
-        bool* d_deleteOutput = filter->bulk_delete(thrust::raw_pointer_cast(d_keys.data()), n);
-        double elapsed = timer.stop();
-
-        state.SetIterationTime(elapsed);
-        bm::DoNotOptimize(d_queryOutput);
-        bm::DoNotOptimize(d_deleteOutput);
-
-        cudaFree(d_queryOutput);
-        cudaFree(d_deleteOutput);
-        TCFType::host_free_tcf(filter);
-    }
-    setCounters(state);
-}
-
 static void TCF_FPR(bm::State& state) {
     Timer timer;
     auto [capacity, n] = calculateCapacityAndSize(state.range(0), TCF_LOAD_FACTOR);
@@ -351,34 +226,10 @@ static void TCF_FPR(bm::State& state) {
     cudaFree(d_misses);
 }
 
-REGISTER_BENCHMARK(CFFixture, Insert);
-REGISTER_BENCHMARK(TCFFixture, Insert);
-
-REGISTER_BENCHMARK(CFFixture, Query);
-REGISTER_BENCHMARK(TCFFixture, Query);
-
-REGISTER_BENCHMARK(CFFixture, Delete);
-REGISTER_BENCHMARK(TCFFixture, Delete);
-
-REGISTER_BENCHMARK(CFFixture, InsertAndQuery);
-REGISTER_BENCHMARK(TCFFixture, InsertAndQuery);
-
-REGISTER_BENCHMARK(CFFixture, InsertQueryDelete);
-REGISTER_BENCHMARK(TCFFixture, InsertQueryDelete);
+DEFINE_AND_REGISTER_CORE_BENCHMARKS(CFFixture);
+REGISTER_CORE_BENCHMARKS(TCFFixture);
 
 REGISTER_FUNCTION_BENCHMARK(CF_FPR);
 REGISTER_FUNCTION_BENCHMARK(TCF_FPR);
 
-int main(int argc, char** argv) {
-    ::benchmark::Initialize(&argc, argv);
-    if (::benchmark::ReportUnrecognizedArguments(argc, argv)) {
-        return 1;
-    }
-
-    ::benchmark::RunSpecifiedBenchmarks();
-    ::benchmark::Shutdown();
-
-    fflush(stdout);
-
-    std::_Exit(0);
-}
+STANDARD_BENCHMARK_MAIN();

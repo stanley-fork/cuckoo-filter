@@ -81,52 +81,6 @@ class PartitionedCFFixture : public benchmark::Fixture {
     Timer timer;
 };
 
-BENCHMARK_DEFINE_F(GPUCFFixture, Insert)(bm::State& state) {
-    for (auto _ : state) {
-        filter->clear();
-        cudaDeviceSynchronize();
-
-        timer.start();
-        size_t inserted = adaptiveInsert(*filter, d_keys);
-        double elapsed = timer.stop();
-
-        state.SetIterationTime(elapsed);
-        bm::DoNotOptimize(inserted);
-    }
-    setCounters(state);
-}
-
-BENCHMARK_DEFINE_F(GPUCFFixture, Query)(bm::State& state) {
-    adaptiveInsert(*filter, d_keys);
-
-    for (auto _ : state) {
-        timer.start();
-        filter->containsMany(d_keys, d_output);
-        double elapsed = timer.stop();
-
-        state.SetIterationTime(elapsed);
-        bm::DoNotOptimize(d_output.data().get());
-    }
-    setCounters(state);
-}
-
-BENCHMARK_DEFINE_F(GPUCFFixture, InsertAndQuery)(bm::State& state) {
-    for (auto _ : state) {
-        filter->clear();
-        cudaDeviceSynchronize();
-
-        timer.start();
-        size_t inserted = adaptiveInsert(*filter, d_keys);
-        filter->containsMany(d_keys, d_output);
-        double elapsed = timer.stop();
-
-        state.SetIterationTime(elapsed);
-        bm::DoNotOptimize(inserted);
-        bm::DoNotOptimize(d_output.data().get());
-    }
-    setCounters(state);
-}
-
 static void GPUCF_FPR(bm::State& state) {
     Timer timer;
     auto [capacity, n] = calculateCapacityAndSize(state.range(0), TARGET_LOAD_FACTOR);
@@ -213,27 +167,6 @@ BENCHMARK_DEFINE_F(PartitionedCFFixture, Query)(bm::State& state) {
     setCounters(state, filterMemory);
 }
 
-BENCHMARK_DEFINE_F(PartitionedCFFixture, InsertAndQuery)(bm::State& state) {
-    for (auto _ : state) {
-        PartitionedCuckooFilter filter(s, n_partitions, n_threads, n_tasks);
-
-        timer.start();
-        bool success = filter.construct(keys.data(), keys.size());
-        size_t found = filter.count(keys.data(), keys.size());
-        double elapsed = timer.stop();
-
-        state.SetIterationTime(elapsed);
-        bm::DoNotOptimize(success);
-        bm::DoNotOptimize(found);
-    }
-
-    PartitionedCuckooFilter finalFilter(s, n_partitions, n_threads, n_tasks);
-    finalFilter.construct(keys.data(), keys.size());
-    size_t filterMemory = finalFilter.size();
-
-    setCounters(state, filterMemory);
-}
-
 static void PartitionedCF_FPR(bm::State& state) {
     Timer timer;
     auto [capacity, n] = calculateCapacityAndSize(state.range(0), TARGET_LOAD_FACTOR);
@@ -291,28 +224,11 @@ static void PartitionedCF_FPR(bm::State& state) {
     );
 }
 
-REGISTER_BENCHMARK(GPUCFFixture, Insert);
-REGISTER_BENCHMARK(PartitionedCFFixture, Insert);
+DEFINE_AND_REGISTER_INSERT_QUERY(GPUCFFixture)
 
-REGISTER_BENCHMARK(GPUCFFixture, Query);
-REGISTER_BENCHMARK(PartitionedCFFixture, Query);
-
-REGISTER_BENCHMARK(GPUCFFixture, InsertAndQuery);
-REGISTER_BENCHMARK(PartitionedCFFixture, InsertAndQuery);
+REGISTER_INSERT_QUERY(PartitionedCFFixture)
 
 REGISTER_FUNCTION_BENCHMARK(GPUCF_FPR);
 REGISTER_FUNCTION_BENCHMARK(PartitionedCF_FPR);
 
-int main(int argc, char** argv) {
-    ::benchmark::Initialize(&argc, argv);
-    if (::benchmark::ReportUnrecognizedArguments(argc, argv)) {
-        return 1;
-    }
-
-    ::benchmark::RunSpecifiedBenchmarks();
-    ::benchmark::Shutdown();
-
-    fflush(stdout);
-
-    std::_Exit(0);
-}
+STANDARD_BENCHMARK_MAIN();

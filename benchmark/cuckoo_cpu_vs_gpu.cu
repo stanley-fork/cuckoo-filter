@@ -47,71 +47,6 @@ class CPUCuckooFilterFixture : public benchmark::Fixture {
     Timer timer;
 };
 
-BENCHMARK_DEFINE_F(GPUCFFixture, Insert)(bm::State& state) {
-    for (auto _ : state) {
-        filter->clear();
-        cudaDeviceSynchronize();
-
-        timer.start();
-        size_t inserted = adaptiveInsert(*filter, d_keys);
-        double elapsed = timer.stop();
-
-        state.SetIterationTime(elapsed);
-        bm::DoNotOptimize(inserted);
-    }
-    setCounters(state);
-}
-
-BENCHMARK_DEFINE_F(GPUCFFixture, Query)(bm::State& state) {
-    adaptiveInsert(*filter, d_keys);
-
-    for (auto _ : state) {
-        timer.start();
-        filter->containsMany(d_keys, d_output);
-        double elapsed = timer.stop();
-
-        state.SetIterationTime(elapsed);
-        bm::DoNotOptimize(d_output.data().get());
-    }
-    setCounters(state);
-}
-
-BENCHMARK_DEFINE_F(GPUCFFixture, Delete)(bm::State& state) {
-    for (auto _ : state) {
-        filter->clear();
-        adaptiveInsert(*filter, d_keys);
-        cudaDeviceSynchronize();
-
-        timer.start();
-        size_t remaining = filter->deleteMany(d_keys, d_output);
-        double elapsed = timer.stop();
-
-        state.SetIterationTime(elapsed);
-        bm::DoNotOptimize(remaining);
-        bm::DoNotOptimize(d_output.data().get());
-    }
-    setCounters(state);
-}
-
-BENCHMARK_DEFINE_F(GPUCFFixture, InsertQueryDelete)(bm::State& state) {
-    for (auto _ : state) {
-        filter->clear();
-        cudaDeviceSynchronize();
-
-        timer.start();
-        size_t inserted = adaptiveInsert(*filter, d_keys);
-        filter->containsMany(d_keys, d_output);
-        size_t remaining = filter->deleteMany(d_keys, d_output);
-        double elapsed = timer.stop();
-
-        state.SetIterationTime(elapsed);
-        bm::DoNotOptimize(inserted);
-        bm::DoNotOptimize(remaining);
-        bm::DoNotOptimize(d_output.data().get());
-    }
-    setCounters(state);
-}
-
 using CPUCFFixture = CPUCuckooFilterFixture<uint64_t, CPU_BITS_PER_ITEM>;
 
 BENCHMARK_DEFINE_F(CPUCFFixture, Insert)(bm::State& state) {
@@ -309,31 +244,10 @@ static void CPUCF_FPR(bm::State& state) {
     );
 }
 
-REGISTER_BENCHMARK(GPUCFFixture, Insert);
-REGISTER_BENCHMARK(CPUCFFixture, Insert);
-
-REGISTER_BENCHMARK(GPUCFFixture, Query);
-REGISTER_BENCHMARK(CPUCFFixture, Query);
-
-REGISTER_BENCHMARK(GPUCFFixture, Delete);
-REGISTER_BENCHMARK(CPUCFFixture, Delete);
-
-REGISTER_BENCHMARK(GPUCFFixture, InsertQueryDelete);
-REGISTER_BENCHMARK(CPUCFFixture, InsertQueryDelete);
+DEFINE_AND_REGISTER_CORE_BENCHMARKS(GPUCFFixture)
+REGISTER_CORE_BENCHMARKS(CPUCFFixture)
 
 REGISTER_FUNCTION_BENCHMARK(GPUCF_FPR);
 REGISTER_FUNCTION_BENCHMARK(CPUCF_FPR);
 
-int main(int argc, char** argv) {
-    ::benchmark::Initialize(&argc, argv);
-    if (::benchmark::ReportUnrecognizedArguments(argc, argv)) {
-        return 1;
-    }
-
-    ::benchmark::RunSpecifiedBenchmarks();
-    ::benchmark::Shutdown();
-
-    fflush(stdout);
-
-    std::_Exit(0);
-}
+BENCHMARK_MAIN();

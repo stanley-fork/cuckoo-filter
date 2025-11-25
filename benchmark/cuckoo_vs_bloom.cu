@@ -70,88 +70,6 @@ class BloomFilterFixture : public benchmark::Fixture {
 
 using CFFixture = CuckooFilterFixture<Config>;
 
-BENCHMARK_DEFINE_F(CFFixture, Insert)(bm::State& state) {
-    for (auto _ : state) {
-        filter->clear();
-        cudaDeviceSynchronize();
-
-        timer.start();
-        size_t inserted = adaptiveInsert(*filter, d_keys);
-        double elapsed = timer.stop();
-
-        state.SetIterationTime(elapsed);
-        bm::DoNotOptimize(inserted);
-    }
-    setCounters(state);
-}
-
-BENCHMARK_DEFINE_F(CFFixture, Query)(bm::State& state) {
-    adaptiveInsert(*filter, d_keys);
-
-    for (auto _ : state) {
-        timer.start();
-        filter->containsMany(d_keys, d_output);
-        double elapsed = timer.stop();
-
-        state.SetIterationTime(elapsed);
-        bm::DoNotOptimize(d_output.data().get());
-    }
-    setCounters(state);
-}
-
-BENCHMARK_DEFINE_F(CFFixture, Delete)(bm::State& state) {
-    for (auto _ : state) {
-        filter->clear();
-        adaptiveInsert(*filter, d_keys);
-        cudaDeviceSynchronize();
-
-        timer.start();
-        size_t remaining = filter->deleteMany(d_keys, d_output);
-        double elapsed = timer.stop();
-
-        state.SetIterationTime(elapsed);
-        bm::DoNotOptimize(remaining);
-        bm::DoNotOptimize(d_output.data().get());
-    }
-    setCounters(state);
-}
-
-BENCHMARK_DEFINE_F(CFFixture, InsertAndQuery)(bm::State& state) {
-    for (auto _ : state) {
-        filter->clear();
-        cudaDeviceSynchronize();
-
-        timer.start();
-        size_t inserted = adaptiveInsert(*filter, d_keys);
-        filter->containsMany(d_keys, d_output);
-        double elapsed = timer.stop();
-
-        state.SetIterationTime(elapsed);
-        bm::DoNotOptimize(inserted);
-        bm::DoNotOptimize(d_output.data().get());
-    }
-    setCounters(state);
-}
-
-BENCHMARK_DEFINE_F(CFFixture, InsertQueryDelete)(bm::State& state) {
-    for (auto _ : state) {
-        filter->clear();
-        cudaDeviceSynchronize();
-
-        timer.start();
-        size_t inserted = adaptiveInsert(*filter, d_keys);
-        filter->containsMany(d_keys, d_output);
-        size_t remaining = filter->deleteMany(d_keys, d_output);
-        double elapsed = timer.stop();
-
-        state.SetIterationTime(elapsed);
-        bm::DoNotOptimize(inserted);
-        bm::DoNotOptimize(remaining);
-        bm::DoNotOptimize(d_output.data().get());
-    }
-    setCounters(state);
-}
-
 using BBFFixture = BloomFilterFixture<>;
 
 BENCHMARK_DEFINE_F(BBFFixture, Insert)(bm::State& state) {
@@ -301,32 +219,10 @@ static void BBF_FPR(bm::State& state) {
     );
 }
 
-REGISTER_BENCHMARK(CFFixture, Insert);
-REGISTER_BENCHMARK(BBFFixture, Insert);
-
-REGISTER_BENCHMARK(CFFixture, Query);
-REGISTER_BENCHMARK(BBFFixture, Query);
-
-REGISTER_BENCHMARK(CFFixture, Delete);
-
-REGISTER_BENCHMARK(CFFixture, InsertAndQuery);
-REGISTER_BENCHMARK(BBFFixture, InsertAndQuery);
-
-REGISTER_BENCHMARK(CFFixture, InsertQueryDelete);
+DEFINE_AND_REGISTER_INSERT_QUERY(CFFixture)
+REGISTER_INSERT_QUERY(BBFFixture)
 
 REGISTER_FUNCTION_BENCHMARK(CF_FPR);
 REGISTER_FUNCTION_BENCHMARK(BBF_FPR);
 
-int main(int argc, char** argv) {
-    ::benchmark::Initialize(&argc, argv);
-    if (::benchmark::ReportUnrecognizedArguments(argc, argv)) {
-        return 1;
-    }
-
-    ::benchmark::RunSpecifiedBenchmarks();
-    ::benchmark::Shutdown();
-
-    fflush(stdout);
-
-    std::_Exit(0);
-}
+STANDARD_BENCHMARK_MAIN();

@@ -34,10 +34,10 @@ static void startIPCServerProcess(size_t capacity) {
 
     g_serverPid = fork();
     if (g_serverPid == 0) {
-        std::string capacity_str = std::to_string(capacity);
+        std::string capacityStr = std::to_string(capacity);
 
         char* const argv[] = {
-            (char*)"./build/cuckoo-filter-ipc-server", (char*)capacity_str.c_str(), nullptr
+            (char*)"./build/cuckoo-filter-ipc-server", (char*)capacityStr.c_str(), nullptr
         };
 
         execvp(argv[0], argv);
@@ -110,20 +110,6 @@ class IPCCFFixture : public benchmark::Fixture {
     Timer timer;
 };
 
-BENCHMARK_DEFINE_F(LocalCFFixture, Insert)(bm::State& state) {
-    for (auto _ : state) {
-        filter->clear();
-        cudaDeviceSynchronize();
-
-        timer.start();
-        size_t inserted = adaptiveInsert(*filter, d_keys);
-        double elapsed = timer.stop();
-
-        state.SetIterationTime(elapsed);
-        bm::DoNotOptimize(inserted);
-    }
-    setCounters(state);
-}
 
 BENCHMARK_DEFINE_F(IPCCFFixture, Insert)(bm::State& state) {
     for (auto _ : state) {
@@ -140,20 +126,6 @@ BENCHMARK_DEFINE_F(IPCCFFixture, Insert)(bm::State& state) {
     setCounters(state);
 }
 
-BENCHMARK_DEFINE_F(LocalCFFixture, Query)(bm::State& state) {
-    adaptiveInsert(*filter, d_keys);
-
-    for (auto _ : state) {
-        timer.start();
-        filter->containsMany(d_keys, d_output);
-        double elapsed = timer.stop();
-
-        state.SetIterationTime(elapsed);
-        bm::DoNotOptimize(d_output.data().get());
-    }
-    setCounters(state);
-}
-
 BENCHMARK_DEFINE_F(IPCCFFixture, Query)(bm::State& state) {
     client->clear();
     client->insertMany(d_keys);
@@ -164,23 +136,6 @@ BENCHMARK_DEFINE_F(IPCCFFixture, Query)(bm::State& state) {
         double elapsed = timer.stop();
 
         state.SetIterationTime(elapsed);
-        bm::DoNotOptimize(d_output.data().get());
-    }
-    setCounters(state);
-}
-
-BENCHMARK_DEFINE_F(LocalCFFixture, Delete)(bm::State& state) {
-    for (auto _ : state) {
-        filter->clear();
-        filter->insertMany(d_keys);
-        cudaDeviceSynchronize();
-
-        timer.start();
-        size_t remaining = filter->deleteMany(d_keys, d_output);
-        double elapsed = timer.stop();
-
-        state.SetIterationTime(elapsed);
-        bm::DoNotOptimize(remaining);
         bm::DoNotOptimize(d_output.data().get());
     }
     setCounters(state);
@@ -203,23 +158,6 @@ BENCHMARK_DEFINE_F(IPCCFFixture, Delete)(bm::State& state) {
     setCounters(state);
 }
 
-BENCHMARK_DEFINE_F(LocalCFFixture, InsertAndQuery)(bm::State& state) {
-    for (auto _ : state) {
-        filter->clear();
-        cudaDeviceSynchronize();
-
-        timer.start();
-        size_t inserted = filter->insertMany(d_keys);
-        filter->containsMany(d_keys, d_output);
-        double elapsed = timer.stop();
-
-        state.SetIterationTime(elapsed);
-        bm::DoNotOptimize(inserted);
-        bm::DoNotOptimize(d_output.data().get());
-    }
-    setCounters(state);
-}
-
 BENCHMARK_DEFINE_F(IPCCFFixture, InsertAndQuery)(bm::State& state) {
     for (auto _ : state) {
         client->clear();
@@ -237,17 +175,8 @@ BENCHMARK_DEFINE_F(IPCCFFixture, InsertAndQuery)(bm::State& state) {
     setCounters(state);
 }
 
-REGISTER_BENCHMARK(LocalCFFixture, Insert);
-REGISTER_BENCHMARK(IPCCFFixture, Insert);
-
-REGISTER_BENCHMARK(LocalCFFixture, Query);
-REGISTER_BENCHMARK(IPCCFFixture, Query);
-
-REGISTER_BENCHMARK(LocalCFFixture, Delete);
-REGISTER_BENCHMARK(IPCCFFixture, Delete);
-
-REGISTER_BENCHMARK(LocalCFFixture, InsertAndQuery);
-REGISTER_BENCHMARK(IPCCFFixture, InsertAndQuery);
+DEFINE_AND_REGISTER_CORE_BENCHMARKS(LocalCFFixture)
+REGISTER_CORE_BENCHMARKS(IPCCFFixture);
 
 int main(int argc, char** argv) {
     ::benchmark::Initialize(&argc, argv);

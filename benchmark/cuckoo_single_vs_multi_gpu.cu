@@ -66,56 +66,6 @@ class MultiGPUFixture_ : public benchmark::Fixture {
 using SingleGPUFixture = CuckooFilterFixture<Config, 0.95>;
 using MultiGPUFixture = MultiGPUFixture_<Config>;
 
-BENCHMARK_DEFINE_F(SingleGPUFixture, Insert)(bm::State& state) {
-    for (auto _ : state) {
-        filter->clear();
-        cudaDeviceSynchronize();
-
-        timer.start();
-        size_t inserted = adaptiveInsert(*filter, d_keys);
-        cudaDeviceSynchronize();
-        double elapsed = timer.stop();
-
-        state.SetIterationTime(elapsed);
-        bm::DoNotOptimize(inserted);
-    }
-    setCounters(state);
-}
-
-BENCHMARK_DEFINE_F(SingleGPUFixture, Query)(bm::State& state) {
-    adaptiveInsert(*filter, d_keys);
-    cudaDeviceSynchronize();
-
-    for (auto _ : state) {
-        timer.start();
-        filter->containsMany(d_keys, d_output);
-        cudaDeviceSynchronize();
-        double elapsed = timer.stop();
-
-        state.SetIterationTime(elapsed);
-        bm::DoNotOptimize(d_output.data().get());
-    }
-    setCounters(state);
-}
-
-BENCHMARK_DEFINE_F(SingleGPUFixture, Delete)(bm::State& state) {
-    for (auto _ : state) {
-        filter->clear();
-        adaptiveInsert(*filter, d_keys);
-        cudaDeviceSynchronize();
-
-        timer.start();
-        size_t remaining = filter->deleteMany(d_keys, d_output);
-        cudaDeviceSynchronize();
-        double elapsed = timer.stop();
-
-        state.SetIterationTime(elapsed);
-        bm::DoNotOptimize(remaining);
-        bm::DoNotOptimize(d_output.data().get());
-    }
-    setCounters(state);
-}
-
 BENCHMARK_DEFINE_F(MultiGPUFixture, Insert)(bm::State& state) {
     for (auto _ : state) {
         filter->clear();
@@ -166,12 +116,7 @@ BENCHMARK_DEFINE_F(MultiGPUFixture, Delete)(bm::State& state) {
     setCounters(state);
 }
 
-REGISTER_BENCHMARK(SingleGPUFixture, Insert);
-REGISTER_BENCHMARK(SingleGPUFixture, Query);
-REGISTER_BENCHMARK(SingleGPUFixture, Delete);
+DEFINE_AND_REGISTER_CORE_BENCHMARKS(SingleGPUFixture)
+REGISTER_CORE_BENCHMARKS(MultiGPUFixture)
 
-REGISTER_BENCHMARK(MultiGPUFixture, Insert);
-REGISTER_BENCHMARK(MultiGPUFixture, Query);
-REGISTER_BENCHMARK(MultiGPUFixture, Delete);
-
-BENCHMARK_MAIN();
+STANDARD_BENCHMARK_MAIN();

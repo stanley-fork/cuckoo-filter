@@ -65,7 +65,6 @@ endif
 
 if get_option('BUILD_BENCHMARKS') == true
     benchmark_dep = subproject('google-benchmark').get_variable('google_benchmark_dep')
-    benchmark_main_dep = subproject('google-benchmark').get_variable('google_benchmark_main_dep')
     cpu_cuckoo_dep = subproject('cpu-cuckoo').get_variable('cpu_cuckoo_dep')
 
     cmake = import('cmake')
@@ -105,7 +104,6 @@ if get_option('BUILD_BENCHMARKS') == true
 
     bench_deps = [
         benchmark_dep,
-        benchmark_main_dep,
         cpu_cuckoo_dep,
     ]
 

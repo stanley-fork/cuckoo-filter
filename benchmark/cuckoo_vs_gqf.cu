@@ -82,88 +82,6 @@ class QFFixture : public benchmark::Fixture {
     Timer timer;
 };
 
-BENCHMARK_DEFINE_F(CFFixture, Insert)(bm::State& state) {
-    for (auto _ : state) {
-        filter->clear();
-        cudaDeviceSynchronize();
-
-        timer.start();
-        size_t inserted = adaptiveInsert(*filter, d_keys);
-        double elapsed = timer.stop();
-
-        state.SetIterationTime(elapsed);
-        bm::DoNotOptimize(inserted);
-    }
-    setCounters(state);
-}
-
-BENCHMARK_DEFINE_F(CFFixture, Query)(bm::State& state) {
-    adaptiveInsert(*filter, d_keys);
-
-    for (auto _ : state) {
-        timer.start();
-        filter->containsMany(d_keys, d_output);
-        double elapsed = timer.stop();
-
-        state.SetIterationTime(elapsed);
-        bm::DoNotOptimize(d_output.data().get());
-    }
-    setCounters(state);
-}
-
-BENCHMARK_DEFINE_F(CFFixture, Delete)(bm::State& state) {
-    for (auto _ : state) {
-        filter->clear();
-        adaptiveInsert(*filter, d_keys);
-        cudaDeviceSynchronize();
-
-        timer.start();
-        size_t remaining = filter->deleteMany(d_keys, d_output);
-        double elapsed = timer.stop();
-
-        state.SetIterationTime(elapsed);
-        bm::DoNotOptimize(remaining);
-        bm::DoNotOptimize(d_output.data().get());
-    }
-    setCounters(state);
-}
-
-BENCHMARK_DEFINE_F(CFFixture, InsertAndQuery)(bm::State& state) {
-    for (auto _ : state) {
-        filter->clear();
-        cudaDeviceSynchronize();
-
-        timer.start();
-        size_t inserted = adaptiveInsert(*filter, d_keys);
-        filter->containsMany(d_keys, d_output);
-        double elapsed = timer.stop();
-
-        state.SetIterationTime(elapsed);
-        bm::DoNotOptimize(inserted);
-        bm::DoNotOptimize(d_output.data().get());
-    }
-    setCounters(state);
-}
-
-BENCHMARK_DEFINE_F(CFFixture, InsertQueryDelete)(bm::State& state) {
-    for (auto _ : state) {
-        filter->clear();
-        cudaDeviceSynchronize();
-
-        timer.start();
-        size_t inserted = adaptiveInsert(*filter, d_keys);
-        filter->containsMany(d_keys, d_output);
-        size_t remaining = filter->deleteMany(d_keys, d_output);
-        double elapsed = timer.stop();
-
-        state.SetIterationTime(elapsed);
-        bm::DoNotOptimize(inserted);
-        bm::DoNotOptimize(remaining);
-        bm::DoNotOptimize(d_output.data().get());
-    }
-    setCounters(state);
-}
-
 static void CF_FPR(bm::State& state) {
     Timer timer;
     auto [capacity, n] = calculateCapacityAndSize(state.range(0), 0.95);
@@ -301,57 +219,6 @@ BENCHMARK_DEFINE_F(QFFixture, Delete)(bm::State& state) {
     }
     setCounters(state);
 }
-BENCHMARK_DEFINE_F(QFFixture, BuildAndQuery)(bm::State& state) {
-    for (auto _ : state) {
-        cudaMemset(qf.table, 0, filterMemory);
-        cudaDeviceSynchronize();
-
-        timer.start();
-        float buildTime = bulkBuildSegmentedLayouts(
-            qf, static_cast<int>(n), thrust::raw_pointer_cast(d_keys.data()), false
-        );
-        float queryTime = launchSortedLookups(
-            qf,
-            static_cast<int>(n),
-            thrust::raw_pointer_cast(d_keys.data()),
-            thrust::raw_pointer_cast(d_results.data())
-        );
-        double elapsed = timer.stop();
-
-        state.SetIterationTime(elapsed);
-        bm::DoNotOptimize(buildTime);
-        bm::DoNotOptimize(queryTime);
-        bm::DoNotOptimize(d_results.data().get());
-    }
-    setCounters(state);
-}
-BENCHMARK_DEFINE_F(QFFixture, BuildQueryDelete)(bm::State& state) {
-    for (auto _ : state) {
-        cudaMemset(qf.table, 0, filterMemory);
-        cudaDeviceSynchronize();
-
-        timer.start();
-        float buildTime = bulkBuildSegmentedLayouts(
-            qf, static_cast<int>(n), thrust::raw_pointer_cast(d_keys.data()), false
-        );
-        float queryTime = launchSortedLookups(
-            qf,
-            static_cast<int>(n),
-            thrust::raw_pointer_cast(d_keys.data()),
-            thrust::raw_pointer_cast(d_results.data())
-        );
-        float deleteTime =
-            superclusterDeletes(qf, static_cast<int>(n), thrust::raw_pointer_cast(d_keys.data()));
-        double elapsed = timer.stop();
-
-        state.SetIterationTime(elapsed);
-        bm::DoNotOptimize(buildTime);
-        bm::DoNotOptimize(queryTime);
-        bm::DoNotOptimize(deleteTime);
-        bm::DoNotOptimize(d_results.data().get());
-    }
-    setCounters(state);
-}
 
 static void QF_FPR(bm::State& state) {
     Timer timer;
@@ -429,41 +296,19 @@ static void QF_FPR(bm::State& state) {
     BENCHMARK_REGISTER_F(CFFixture, BenchName) \
     BENCHMARK_CONFIG_QF
 
-#define REGISTER_QF_FIXTURE_BENCHMARK(BenchName) \
-    BENCHMARK_REGISTER_F(QFFixture, BenchName)   \
-    BENCHMARK_CONFIG_QF
+// I'm lazy, this is an easy way to replace the config
+#undef BENCHMARK_CONFIG
+#define BENCHMARK_CONFIG BENCHMARK_CONFIG_QF
 
-#define REGISTER_FUNCTION_BENCHMARK_QF(FuncName) \
-    BENCHMARK(FuncName)                          \
-    BENCHMARK_CONFIG
+DEFINE_AND_REGISTER_CORE_BENCHMARKS(CFFixture)
 
-REGISTER_CF_BENCHMARK(Insert);
-REGISTER_CF_BENCHMARK(Query);
-REGISTER_CF_BENCHMARK(Delete);
-REGISTER_CF_BENCHMARK(InsertAndQuery);
-REGISTER_CF_BENCHMARK(InsertQueryDelete);
+REGISTER_BENCHMARK(QFFixture, BulkBuild);
+REGISTER_BENCHMARK(QFFixture, Insert);
+REGISTER_BENCHMARK(QFFixture, QuerySorted);
+REGISTER_BENCHMARK(QFFixture, QueryUnsorted);
+REGISTER_BENCHMARK(QFFixture, Delete);
 
-REGISTER_QF_FIXTURE_BENCHMARK(BulkBuild);
-REGISTER_QF_FIXTURE_BENCHMARK(Insert);
-REGISTER_QF_FIXTURE_BENCHMARK(QuerySorted);
-REGISTER_QF_FIXTURE_BENCHMARK(QueryUnsorted);
-REGISTER_QF_FIXTURE_BENCHMARK(Delete);
-REGISTER_QF_FIXTURE_BENCHMARK(BuildAndQuery);
-REGISTER_QF_FIXTURE_BENCHMARK(BuildQueryDelete);
+REGISTER_FUNCTION_BENCHMARK(CF_FPR);
+REGISTER_FUNCTION_BENCHMARK(QF_FPR);
 
-REGISTER_FUNCTION_BENCHMARK_QF(CF_FPR);
-REGISTER_FUNCTION_BENCHMARK_QF(QF_FPR);
-
-int main(int argc, char** argv) {
-    ::benchmark::Initialize(&argc, argv);
-    if (::benchmark::ReportUnrecognizedArguments(argc, argv)) {
-        return 1;
-    }
-
-    ::benchmark::RunSpecifiedBenchmarks();
-    ::benchmark::Shutdown();
-
-    fflush(stdout);
-
-    std::_Exit(0);
-}
+STANDARD_BENCHMARK_MAIN();

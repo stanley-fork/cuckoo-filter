@@ -52,126 +52,28 @@ class BucketSizeFixture : public benchmark::Fixture {
     Timer timer;
 };
 
-#define DEFINE_BUCKET_SIZE_BENCHMARKS(BSize)                                     \
-    using BSFixture##BSize = BucketSizeFixture<BSize>;                           \
-                                                                                 \
-    BENCHMARK_DEFINE_F(BSFixture##BSize, Insert)(bm::State & state) {            \
-        for (auto _ : state) {                                                   \
-            filter->clear();                                                     \
-            cudaDeviceSynchronize();                                             \
-                                                                                 \
-            timer.start();                                                       \
-            size_t inserted = adaptiveInsert(*filter, d_keys);                   \
-            double elapsed = timer.stop();                                       \
-                                                                                 \
-            state.SetIterationTime(elapsed);                                     \
-            bm::DoNotOptimize(inserted);                                         \
-        }                                                                        \
-        setCounters(state);                                                      \
-    }                                                                            \
-                                                                                 \
-    BENCHMARK_DEFINE_F(BSFixture##BSize, Query)(bm::State & state) {             \
-        adaptiveInsert(*filter, d_keys);                                         \
-                                                                                 \
-        for (auto _ : state) {                                                   \
-            timer.start();                                                       \
-            filter->containsMany(d_keys, d_output);                              \
-            double elapsed = timer.stop();                                       \
-                                                                                 \
-            state.SetIterationTime(elapsed);                                     \
-            bm::DoNotOptimize(d_output.data().get());                            \
-        }                                                                        \
-        setCounters(state);                                                      \
-    }                                                                            \
-                                                                                 \
-    BENCHMARK_DEFINE_F(BSFixture##BSize, Delete)(bm::State & state) {            \
-        for (auto _ : state) {                                                   \
-            filter->clear();                                                     \
-            adaptiveInsert(*filter, d_keys);                                     \
-            cudaDeviceSynchronize();                                             \
-                                                                                 \
-            timer.start();                                                       \
-            size_t remaining = filter->deleteMany(d_keys, d_output);             \
-            double elapsed = timer.stop();                                       \
-                                                                                 \
-            state.SetIterationTime(elapsed);                                     \
-            bm::DoNotOptimize(remaining);                                        \
-            bm::DoNotOptimize(d_output.data().get());                            \
-        }                                                                        \
-        setCounters(state);                                                      \
-    }                                                                            \
-                                                                                 \
-    BENCHMARK_DEFINE_F(BSFixture##BSize, InsertAndQuery)(bm::State & state) {    \
-        for (auto _ : state) {                                                   \
-            filter->clear();                                                     \
-            cudaDeviceSynchronize();                                             \
-                                                                                 \
-            timer.start();                                                       \
-            size_t inserted = adaptiveInsert(*filter, d_keys);                   \
-            filter->containsMany(d_keys, d_output);                              \
-            double elapsed = timer.stop();                                       \
-                                                                                 \
-            state.SetIterationTime(elapsed);                                     \
-            bm::DoNotOptimize(inserted);                                         \
-            bm::DoNotOptimize(d_output.data().get());                            \
-        }                                                                        \
-        setCounters(state);                                                      \
-    }                                                                            \
-                                                                                 \
-    BENCHMARK_DEFINE_F(BSFixture##BSize, InsertQueryDelete)(bm::State & state) { \
-        for (auto _ : state) {                                                   \
-            filter->clear();                                                     \
-            cudaDeviceSynchronize();                                             \
-                                                                                 \
-            timer.start();                                                       \
-            size_t inserted = adaptiveInsert(*filter, d_keys);                   \
-            filter->containsMany(d_keys, d_output);                              \
-            size_t remaining = filter->deleteMany(d_keys, d_output);             \
-            double elapsed = timer.stop();                                       \
-                                                                                 \
-            state.SetIterationTime(elapsed);                                     \
-            bm::DoNotOptimize(inserted);                                         \
-            bm::DoNotOptimize(remaining);                                        \
-            bm::DoNotOptimize(d_output.data().get());                            \
-        }                                                                        \
-        setCounters(state);                                                      \
-    }
-
-DEFINE_BUCKET_SIZE_BENCHMARKS(4)
-DEFINE_BUCKET_SIZE_BENCHMARKS(8)
-DEFINE_BUCKET_SIZE_BENCHMARKS(16)
-DEFINE_BUCKET_SIZE_BENCHMARKS(32)
-DEFINE_BUCKET_SIZE_BENCHMARKS(64)
-DEFINE_BUCKET_SIZE_BENCHMARKS(128)
-
 #define REGISTER_BUCKET_BENCHMARK(BSize, BenchName)   \
     BENCHMARK_REGISTER_F(BSFixture##BSize, BenchName) \
     BENCHMARK_CONFIG
 
-#define REGISTER_ALL_FOR_BUCKET_SIZE(BSize)           \
-    REGISTER_BUCKET_BENCHMARK(BSize, Insert);         \
-    REGISTER_BUCKET_BENCHMARK(BSize, Query);          \
-    REGISTER_BUCKET_BENCHMARK(BSize, Delete);         \
-    REGISTER_BUCKET_BENCHMARK(BSize, InsertAndQuery); \
-    REGISTER_BUCKET_BENCHMARK(BSize, InsertQueryDelete);
+#define REGISTER_ALL_FOR_BUCKET_SIZE(BSize)   \
+    REGISTER_BUCKET_BENCHMARK(BSize, Insert); \
+    REGISTER_BUCKET_BENCHMARK(BSize, Query);  \
+    REGISTER_BUCKET_BENCHMARK(BSize, Delete);
 
-REGISTER_ALL_FOR_BUCKET_SIZE(4);
-REGISTER_ALL_FOR_BUCKET_SIZE(8);
-REGISTER_ALL_FOR_BUCKET_SIZE(16);
-REGISTER_ALL_FOR_BUCKET_SIZE(32);
-REGISTER_ALL_FOR_BUCKET_SIZE(64);
-REGISTER_ALL_FOR_BUCKET_SIZE(128);
+#define DEFINE_BUCKET_SIZE_BENCHMARKS(BSize)           \
+    using BSFixture##BSize = BucketSizeFixture<BSize>; \
+    DEFINE_CORE_BENCHMARKS(BSFixture##BSize)
 
-int main(int argc, char** argv) {
-    ::benchmark::Initialize(&argc, argv);
-    if (::benchmark::ReportUnrecognizedArguments(argc, argv)) {
-        return 1;
-    }
+#define DEFINE_AND_REGISTER_BUCKET_SIZE_BENCHMARKS(BSize) \
+    DEFINE_BUCKET_SIZE_BENCHMARKS(BSize)                  \
+    REGISTER_ALL_FOR_BUCKET_SIZE(BSize)
 
-    ::benchmark::RunSpecifiedBenchmarks();
-    ::benchmark::Shutdown();
+DEFINE_AND_REGISTER_BUCKET_SIZE_BENCHMARKS(4)
+DEFINE_AND_REGISTER_BUCKET_SIZE_BENCHMARKS(8)
+DEFINE_AND_REGISTER_BUCKET_SIZE_BENCHMARKS(16)
+DEFINE_AND_REGISTER_BUCKET_SIZE_BENCHMARKS(32)
+DEFINE_AND_REGISTER_BUCKET_SIZE_BENCHMARKS(64)
+DEFINE_AND_REGISTER_BUCKET_SIZE_BENCHMARKS(128)
 
-    fflush(stdout);
-
-    std::_Exit(0);
-}
+BENCHMARK_MAIN();

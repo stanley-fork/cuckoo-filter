@@ -162,6 +162,93 @@ void setCommonCounters(benchmark::State& state, size_t memory, size_t n) {
     state.counters["false_positives"] = 0.0;
 }
 
+template <typename Fixture>
+void benchmarkInsertBody(Fixture& fixture, benchmark::State& state) {
+    for (auto _ : state) {
+        fixture.filter->clear();
+        cudaDeviceSynchronize();
+
+        fixture.timer.start();
+        size_t inserted = adaptiveInsert(*fixture.filter, fixture.d_keys);
+        double elapsed = fixture.timer.stop();
+
+        state.SetIterationTime(elapsed);
+        benchmark::DoNotOptimize(inserted);
+    }
+    fixture.setCounters(state);
+}
+
+template <typename Fixture>
+void benchmarkQueryBody(Fixture& fixture, benchmark::State& state) {
+    adaptiveInsert(*fixture.filter, fixture.d_keys);
+
+    for (auto _ : state) {
+        fixture.timer.start();
+        fixture.filter->containsMany(fixture.d_keys, fixture.d_output);
+        double elapsed = fixture.timer.stop();
+
+        state.SetIterationTime(elapsed);
+        benchmark::DoNotOptimize(fixture.d_output.data().get());
+    }
+    fixture.setCounters(state);
+}
+
+template <typename Fixture>
+void benchmarkDeleteBody(Fixture& fixture, benchmark::State& state) {
+    for (auto _ : state) {
+        fixture.filter->clear();
+        adaptiveInsert(*fixture.filter, fixture.d_keys);
+        cudaDeviceSynchronize();
+
+        fixture.timer.start();
+        size_t remaining = fixture.filter->deleteMany(fixture.d_keys, fixture.d_output);
+        double elapsed = fixture.timer.stop();
+
+        state.SetIterationTime(elapsed);
+        benchmark::DoNotOptimize(remaining);
+        benchmark::DoNotOptimize(fixture.d_output.data().get());
+    }
+    fixture.setCounters(state);
+}
+
+template <typename Fixture>
+void benchmarkInsertAndQueryBody(Fixture& fixture, benchmark::State& state) {
+    for (auto _ : state) {
+        fixture.filter->clear();
+        cudaDeviceSynchronize();
+
+        fixture.timer.start();
+        size_t inserted = adaptiveInsert(*fixture.filter, fixture.d_keys);
+        fixture.filter->containsMany(fixture.d_keys, fixture.d_output);
+        double elapsed = fixture.timer.stop();
+
+        state.SetIterationTime(elapsed);
+        benchmark::DoNotOptimize(inserted);
+        benchmark::DoNotOptimize(fixture.d_output.data().get());
+    }
+    fixture.setCounters(state);
+}
+
+template <typename Fixture>
+void benchmarkInsertQueryDeleteBody(Fixture& fixture, benchmark::State& state) {
+    for (auto _ : state) {
+        fixture.filter->clear();
+        cudaDeviceSynchronize();
+
+        fixture.timer.start();
+        size_t inserted = adaptiveInsert(*fixture.filter, fixture.d_keys);
+        fixture.filter->containsMany(fixture.d_keys, fixture.d_output);
+        size_t remaining = fixture.filter->deleteMany(fixture.d_keys, fixture.d_output);
+        double elapsed = fixture.timer.stop();
+
+        state.SetIterationTime(elapsed);
+        benchmark::DoNotOptimize(inserted);
+        benchmark::DoNotOptimize(remaining);
+        benchmark::DoNotOptimize(fixture.d_output.data().get());
+    }
+    fixture.setCounters(state);
+}
+
 template <typename ConfigType, double loadFactor = 0.95>
 class CuckooFilterFixture : public benchmark::Fixture {
     using benchmark::Fixture::SetUp;
@@ -220,3 +307,81 @@ class CuckooFilterFixture : public benchmark::Fixture {
 #define REGISTER_FUNCTION_BENCHMARK(FuncName) \
     BENCHMARK(FuncName)                       \
     BENCHMARK_CONFIG
+
+#define DEFINE_FILTER_INSERT_BENCHMARK(FixtureName) \
+    BENCHMARK_DEFINE_F(FixtureName, Insert)         \
+    (benchmark::State & state) {                    \
+        benchmarkInsertBody(*this, state);          \
+    }
+
+#define DEFINE_FILTER_QUERY_BENCHMARK(FixtureName) \
+    BENCHMARK_DEFINE_F(FixtureName, Query)         \
+    (benchmark::State & state) {                   \
+        benchmarkQueryBody(*this, state);          \
+    }
+
+#define DEFINE_FILTER_DELETE_BENCHMARK(FixtureName) \
+    BENCHMARK_DEFINE_F(FixtureName, Delete)         \
+    (benchmark::State & state) {                    \
+        benchmarkDeleteBody(*this, state);          \
+    }
+
+#define DEFINE_FILTER_INSERT_AND_QUERY_BENCHMARK(FixtureName) \
+    BENCHMARK_DEFINE_F(FixtureName, InsertAndQuery)           \
+    (benchmark::State & state) {                              \
+        benchmarkInsertAndQueryBody(*this, state);            \
+    }
+
+#define DEFINE_FILTER_INSERT_QUERY_DELETE_BENCHMARK(FixtureName) \
+    BENCHMARK_DEFINE_F(FixtureName, InsertQueryDelete)           \
+    (benchmark::State & state) {                                 \
+        benchmarkInsertQueryDeleteBody(*this, state);            \
+    }
+
+#define DEFINE_CORE_BENCHMARKS(FixtureName)     \
+    DEFINE_FILTER_INSERT_BENCHMARK(FixtureName) \
+    DEFINE_FILTER_QUERY_BENCHMARK(FixtureName)  \
+    DEFINE_FILTER_DELETE_BENCHMARK(FixtureName)
+
+#define REGISTER_CORE_BENCHMARKS(FixtureName) \
+    REGISTER_BENCHMARK(FixtureName, Insert);  \
+    REGISTER_BENCHMARK(FixtureName, Query);   \
+    REGISTER_BENCHMARK(FixtureName, Delete);
+
+#define DEFINE_ALL_FILTER_BENCHMARKS(FixtureName)         \
+    DEFINE_CORE_BENCHMARKS(FixtureName)                   \
+    DEFINE_FILTER_INSERT_AND_QUERY_BENCHMARK(FixtureName) \
+    DEFINE_FILTER_INSERT_QUERY_DELETE_BENCHMARK(FixtureName)
+
+#define REGISTER_ALL_FILTER_BENCHMARKS(FixtureName)  \
+    REGISTER_CORE_BENCHMARKS(FixtureName)            \
+    REGISTER_BENCHMARK(FixtureName, InsertAndQuery); \
+    REGISTER_BENCHMARK(FixtureName, InsertQueryDelete)
+
+#define DEFINE_AND_REGISTER_CORE_BENCHMARKS(FixtureName) \
+    DEFINE_CORE_BENCHMARKS(FixtureName)                  \
+    REGISTER_CORE_BENCHMARKS(FixtureName)
+
+#define DEFINE_INSERT_QUERY(FixtureName)        \
+    DEFINE_FILTER_INSERT_BENCHMARK(FixtureName) \
+    DEFINE_FILTER_QUERY_BENCHMARK(FixtureName)
+
+#define REGISTER_INSERT_QUERY(FixtureName)   \
+    REGISTER_BENCHMARK(FixtureName, Insert); \
+    REGISTER_BENCHMARK(FixtureName, Query);
+
+#define DEFINE_AND_REGISTER_INSERT_QUERY(FixtureName) \
+    DEFINE_INSERT_QUERY(FixtureName)                  \
+    REGISTER_INSERT_QUERY(FixtureName)
+
+#define STANDARD_BENCHMARK_MAIN()                                   \
+    int main(int argc, char** argv) {                               \
+        ::benchmark::Initialize(&argc, argv);                       \
+        if (::benchmark::ReportUnrecognizedArguments(argc, argv)) { \
+            return 1;                                               \
+        }                                                           \
+        ::benchmark::RunSpecifiedBenchmarks();                      \
+        ::benchmark::Shutdown();                                    \
+        fflush(stdout);                                             \
+        std::_Exit(0);                                              \
+    }
