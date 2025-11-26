@@ -59,7 +59,7 @@ class PartitionedCFFixture : public benchmark::Fixture {
             }
         }
 
-        n_threads = 8;
+        n_threads = std::min(n_partitions, size_t(std::thread::hardware_concurrency() / 2));
         n_tasks = 1;
     }
 
@@ -184,7 +184,7 @@ static void PartitionedCF_FPR(bm::State& state) {
         }
     }
 
-    size_t n_threads = 8;
+    size_t n_threads = std::min(n_partitions, size_t(std::thread::hardware_concurrency() / 2));
     size_t n_tasks = 1;
 
     PartitionedCuckooFilter filter(s, n_partitions, n_threads, n_tasks);
