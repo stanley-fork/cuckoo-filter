@@ -20,10 +20,13 @@ app = typer.Typer(help="Plot load factor benchmark results")
 
 
 def extract_load_factor(name: str) -> Optional[float]:
-    """Extract load factor from benchmark name like CF_5/Insert or BBF_95/Query"""
-    match = re.search(r"_(\d+)/", name)
+    """Extract load factor from benchmark name like CF_5/Insert, BBF_95/Query, or CF_99_5/Insert"""
+    # Match patterns like _95/ or _99_5/ (where underscore represents decimal point)
+    match = re.search(r"_([\d_]+)/", name)
     if match:
-        return int(match.group(1)) / 100.0
+        # Replace underscore with decimal point (e.g., "99_5" -> "99.5")
+        value_str = match.group(1).replace("_", ".")
+        return float(value_str) / 100.0
     return None
 
 
