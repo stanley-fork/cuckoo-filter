@@ -180,8 +180,8 @@ if get_option('BUILD_BENCHMARKS') == true
     )
 
     executable(
-        'cache-benchmark',
-        './benchmark/cache_benchmark.cu',
+        'profiler-benchmark',
+        './benchmark/profiler_benchmark.cu',
         dependencies: [cli11_dep, cuco_dep, tcf_dep, benchmark_dep],
         include_directories: includes,
         cuda_args: cuda_args,
