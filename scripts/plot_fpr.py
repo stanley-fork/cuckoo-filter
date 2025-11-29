@@ -114,7 +114,7 @@ def main(
 
     ax.set_xlabel("Memory Size [bytes]", fontsize=14, fontweight="bold")
     ax.set_ylabel("False Positive Rate [%]", fontsize=14, fontweight="bold")
-    ax.set_xscale("log")
+    ax.set_xscale("log", base=2)
     ax.set_yscale("log")
     ax.grid(True, which="both", ls="--", alpha=0.3)
     ax.legend(fontsize=10, loc="center left", bbox_to_anchor=(1, 0.5), framealpha=1)
@@ -152,9 +152,10 @@ def main(
             marker=style.get("marker", "o"),
         )
 
+
     ax.set_xlabel("Memory Size [bytes]", fontsize=14, fontweight="bold")
     ax.set_ylabel("Bits per Item", fontsize=14, fontweight="bold")
-    ax.set_xscale("log")
+    ax.set_xscale("log", base=2)
     ax.grid(True, which="both", ls="--", alpha=0.3)
     ax.legend(fontsize=10, loc="center left", bbox_to_anchor=(1, 0.5), framealpha=1)
     ax.set_title(
