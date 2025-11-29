@@ -56,7 +56,7 @@ inline size_t adaptiveInsert(
     thrust::device_vector<typename FilterConfig::KeyType>& d_keys
 ) {
     // static size_t threshold = getGPUL2CacheSize() / (FilterConfig::bitsPerTag / CHAR_BIT);
-    static constexpr size_t threshold = 1 << 25;
+    static constexpr size_t threshold = 1 << 29;
 
     if (d_keys.size() < threshold) {
         return filter.insertMany(d_keys);
