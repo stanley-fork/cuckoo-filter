@@ -7,6 +7,7 @@
 #   "typer",
 # ]
 # ///
+import math
 import re
 from collections import defaultdict
 from pathlib import Path
@@ -17,6 +18,15 @@ import pandas as pd
 import typer
 
 app = typer.Typer(help="Plot load factor benchmark results")
+
+
+def extract_num_elements(name: str) -> Optional[int]:
+    """Extract number of elements from benchmark name like CF_5/Insert/4194304/..."""
+    # Match pattern like /Insert/4194304/ or /Query/4194304/
+    match = re.search(r"/(?:Insert|Query|QueryNegative|Delete)/(\d+)/", name)
+    if match:
+        return int(match.group(1))
+    return None
 
 
 def extract_load_factor(name: str) -> Optional[float]:
@@ -111,6 +121,8 @@ def main(
 
     # Dictionary structure: operation -> filter_type -> {load_factor: throughput}
     benchmark_data = defaultdict(lambda: defaultdict(dict))
+    # Track number of elements per operation
+    num_elements_per_operation = {}
 
     for _, row in df.iterrows():
         name = row["name"]
@@ -119,9 +131,14 @@ def main(
         load_factor = extract_load_factor(name)
         operation = extract_operation_type(name)
         lookup_type = extract_lookup_type(name)
+        num_elements = extract_num_elements(name)
 
         if filter_type is None or load_factor is None or operation is None:
             continue
+
+        # Store the number of elements for this operation (assumes all rows have same count)
+        if operation and num_elements and operation not in num_elements_per_operation:
+            num_elements_per_operation[operation] = num_elements
 
         # For Query operations, append lookup type to filter name
         if operation == "Query" and lookup_type:
@@ -211,8 +228,17 @@ def main(
         ax.set_xlim(0.0, 1.0)
         ax.grid(True, which="both", ls="--", alpha=0.3)
         ax.legend(fontsize=10, loc="center left", bbox_to_anchor=(1, 0.5), framealpha=1)
+
+        # Build title with element count if available
+        title = f"{operation} Performance"
+        if operation in num_elements_per_operation:
+            n = num_elements_per_operation[operation]
+            # Calculate power of 2
+            power = int(math.log2(n))
+            title += f" $\\left(n=2^{{{power}}}\\right)$"
+
         ax.set_title(
-            f"{operation} Performance",
+            title,
             fontsize=16,
             fontweight="bold",
         )

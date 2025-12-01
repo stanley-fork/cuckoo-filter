@@ -111,6 +111,10 @@ void benchmarkBloomQuery(size_t capacity, double loadFactor) {
 void benchmarkTcfInsert(size_t capacity, double loadFactor) {
     auto n = static_cast<size_t>(capacity * loadFactor);
 
+    constexpr double TCF_CAPACITY_FACTOR = 0.85;
+    auto requiredUsableCapacity = static_cast<size_t>(n / loadFactor);
+    capacity = static_cast<size_t>(requiredUsableCapacity / TCF_CAPACITY_FACTOR);
+
     thrust::device_vector<uint64_t> d_keys(n);
     generateKeysGPU(d_keys);
 
@@ -138,6 +142,10 @@ void benchmarkTcfInsert(size_t capacity, double loadFactor) {
 void benchmarkTcfQuery(size_t capacity, double loadFactor) {
     auto n = static_cast<size_t>(capacity * loadFactor);
 
+    constexpr double TCF_CAPACITY_FACTOR = 0.85;
+    auto requiredUsableCapacity = static_cast<size_t>(n / loadFactor);
+    capacity = static_cast<size_t>(requiredUsableCapacity / TCF_CAPACITY_FACTOR);
+
     thrust::device_vector<uint64_t> d_keys(n);
     generateKeysGPU(d_keys);
 
@@ -159,6 +167,10 @@ void benchmarkTcfQuery(size_t capacity, double loadFactor) {
 
 void benchmarkTcfDelete(size_t capacity, double loadFactor) {
     auto n = static_cast<size_t>(capacity * loadFactor);
+
+    constexpr double TCF_CAPACITY_FACTOR = 0.85;
+    auto requiredUsableCapacity = static_cast<size_t>(n / loadFactor);
+    capacity = static_cast<size_t>(requiredUsableCapacity / TCF_CAPACITY_FACTOR);
 
     thrust::device_vector<uint64_t> d_keys(n);
     generateKeysGPU(d_keys);
