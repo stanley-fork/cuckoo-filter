@@ -1,24 +1,22 @@
-project('gqf', 'cpp', 'cuda')
+project('gqf', 'cpp', 'cuda', default_options: ['optimization=3'])
 
-gqf_inc = include_directories('standardQuotientFilter/GPU_version')
+gqf_inc = include_directories('include')
 
-cmake = import('cmake')
-
-moderngpu_opts = cmake.subproject_options()
-moderngpu_opts.add_cmake_defines(
-    {
-        'BUILD_TESTING': 'OFF',
-    },
-)
-
-moderngpu_sub = cmake.subproject('moderngpu', options: moderngpu_opts)
-moderngpu_dep = moderngpu_sub.dependency('MODERNGPU')
+cuda_args = [
+    '--expt-extended-lambda',
+    '--expt-relaxed-constexpr',
+    '--generate-line-info',
+    '-gencode=arch=compute_120,code=sm_120',
+    '-gencode=arch=compute_75,code=compute_75',
+    '-rdc=true',
+    '-D QF_BITS_PER_SLOT=16',
+    '-D R_BITS=16'
+]
 
 gqf_lib = static_library(
-    'gqf_lib',
-    ['standardQuotientFilter/GPU_version/quotientFilter.cu'],
+    'gqf',
+    ['src/gqf.cu', 'src/hashutil.cu', './src/partitioned_counter.cu'],
     include_directories: gqf_inc,
-    dependencies: [moderngpu_dep],
-    cuda_args: ['--extended-lambda']
+    cuda_args: cuda_args,
 )
 gqf_dep = declare_dependency(include_directories: gqf_inc, link_with: gqf_lib)

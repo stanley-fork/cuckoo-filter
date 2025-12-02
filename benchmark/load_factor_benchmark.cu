@@ -12,12 +12,24 @@
 #include <cuco/bloom_filter.cuh>
 #include <cuda/std/cstdint>
 #include <filter.hpp>
+#include <gqf.cuh>
+#include <gqf_int.cuh>
 #include <hash_strategies.cuh>
 #include <helpers.cuh>
 #include <random>
 #include <thread>
 #include "benchmark_common.cuh"
 #include "parameter/parameter.hpp"
+
+size_t getQFSizeHost(QF* d_qf) {
+    QF h_qf;
+    cudaMemcpy(&h_qf, d_qf, sizeof(QF), cudaMemcpyDeviceToHost);
+
+    qfmetadata h_metadata;
+    cudaMemcpy(&h_metadata, h_qf.metadata, sizeof(qfmetadata), cudaMemcpyDeviceToHost);
+
+    return h_metadata.total_size_in_bytes;
+}
 
 namespace bm = benchmark;
 
@@ -272,11 +284,62 @@ class CPUCuckooFilterFixture : public benchmark::Fixture {
     Timer timer;
 };
 
+template <double loadFactor>
+class GQFFixtureLF : public benchmark::Fixture {
+    using benchmark::Fixture::SetUp;
+    using benchmark::Fixture::TearDown;
+
+   public:
+    void SetUp(const benchmark::State& state) override {
+        auto [cap, num] = calculateCapacityAndSize(state.range(0), loadFactor);
+        n = num;
+
+        q = static_cast<uint32_t>(std::log2(cap));
+        capacity = 1ULL << q;
+
+        d_keys.resize(n);
+        d_keysNegative.resize(n);
+        d_results.resize(n);
+
+        generateKeysGPURange(
+            d_keys, n, static_cast<uint64_t>(0), static_cast<uint64_t>(UINT32_MAX)
+        );
+        generateKeysGPURange(d_keysNegative, n, static_cast<uint64_t>(UINT32_MAX) + 1, UINT64_MAX);
+
+        qf_malloc_device(&qf, q, true);
+        filterMemory = getQFSizeHost(qf);
+    }
+
+    void TearDown(const benchmark::State&) override {
+        qf_destroy_device(qf);
+        d_keys.clear();
+        d_keys.shrink_to_fit();
+        d_keysNegative.clear();
+        d_keysNegative.shrink_to_fit();
+        d_results.clear();
+        d_results.shrink_to_fit();
+    }
+
+    void setCounters(benchmark::State& state) {
+        setCommonCounters(state, filterMemory, n);
+    }
+
+    size_t capacity;
+    uint32_t q;
+    size_t n;
+    size_t filterMemory;
+    thrust::device_vector<uint64_t> d_keys;
+    thrust::device_vector<uint64_t> d_keysNegative;
+    thrust::device_vector<uint64_t> d_results;
+    QF* qf;
+    Timer timer;
+};
+
 #define BENCHMARK_CONFIG_LF             \
     ->Arg(FIXED_CAPACITY)               \
         ->Unit(benchmark::kMillisecond) \
         ->UseManualTime()               \
-        ->MinTime(0.5)                  \
+        ->Iterations(10)                \
         ->Repetitions(5)                \
         ->ReportAggregatesOnly(true)
 
@@ -513,6 +576,72 @@ class CPUCuckooFilterFixture : public benchmark::Fixture {
     BENCHMARK_REGISTER_F(TCF_##ID, Query) BENCHMARK_CONFIG_LF;                                \
     BENCHMARK_REGISTER_F(TCF_##ID, QueryNegative) BENCHMARK_CONFIG_LF;                        \
     BENCHMARK_REGISTER_F(TCF_##ID, Delete) BENCHMARK_CONFIG_LF;                               \
+                                                                                              \
+    /* GQF */                                                                                 \
+    using GQF_##ID = GQFFixtureLF<(LF) * 0.01>;                                               \
+    BENCHMARK_DEFINE_F(GQF_##ID, Insert)(bm::State & state) {                                 \
+        for (auto _ : state) {                                                                \
+            qf_destroy_device(qf);                                                            \
+            cudaFree(qf);                                                                     \
+            qf_malloc_device(&qf, q, true);                                                   \
+            cudaDeviceSynchronize();                                                          \
+            timer.start();                                                                    \
+            bulk_insert(qf, n, thrust::raw_pointer_cast(d_keys.data()), 0);                   \
+            double elapsed = timer.stop();                                                    \
+            state.SetIterationTime(elapsed);                                                  \
+        }                                                                                     \
+        setCounters(state);                                                                   \
+    }                                                                                         \
+    BENCHMARK_DEFINE_F(GQF_##ID, Query)(bm::State & state) {                                  \
+        bulk_insert(qf, n, thrust::raw_pointer_cast(d_keys.data()), 0);                       \
+        for (auto _ : state) {                                                                \
+            timer.start();                                                                    \
+            bulk_get(                                                                         \
+                qf,                                                                           \
+                n,                                                                            \
+                thrust::raw_pointer_cast(d_keys.data()),                                      \
+                thrust::raw_pointer_cast(d_results.data())                                    \
+            );                                                                                \
+            double elapsed = timer.stop();                                                    \
+            state.SetIterationTime(elapsed);                                                  \
+            bm::DoNotOptimize(d_results.data().get());                                        \
+        }                                                                                     \
+        setCounters(state);                                                                   \
+    }                                                                                         \
+    BENCHMARK_DEFINE_F(GQF_##ID, QueryNegative)(bm::State & state) {                          \
+        bulk_insert(qf, n, thrust::raw_pointer_cast(d_keys.data()), 0);                       \
+        for (auto _ : state) {                                                                \
+            timer.start();                                                                    \
+            bulk_get(                                                                         \
+                qf,                                                                           \
+                n,                                                                            \
+                thrust::raw_pointer_cast(d_keysNegative.data()),                              \
+                thrust::raw_pointer_cast(d_results.data())                                    \
+            );                                                                                \
+            double elapsed = timer.stop();                                                    \
+            state.SetIterationTime(elapsed);                                                  \
+            bm::DoNotOptimize(d_results.data().get());                                        \
+        }                                                                                     \
+        setCounters(state);                                                                   \
+    }                                                                                         \
+    BENCHMARK_DEFINE_F(GQF_##ID, Delete)(bm::State & state) {                                 \
+        for (auto _ : state) {                                                                \
+            qf_destroy_device(qf);                                                            \
+            cudaFree(qf);                                                                     \
+            qf_malloc_device(&qf, q, true);                                                   \
+            bulk_insert(qf, n, thrust::raw_pointer_cast(d_keys.data()), 0);                   \
+            cudaDeviceSynchronize();                                                          \
+            timer.start();                                                                    \
+            bulk_delete(qf, n, thrust::raw_pointer_cast(d_keys.data()), 0);                   \
+            double elapsed = timer.stop();                                                    \
+            state.SetIterationTime(elapsed);                                                  \
+        }                                                                                     \
+        setCounters(state);                                                                   \
+    }                                                                                         \
+    BENCHMARK_REGISTER_F(GQF_##ID, Insert) BENCHMARK_CONFIG_LF;                               \
+    BENCHMARK_REGISTER_F(GQF_##ID, Query) BENCHMARK_CONFIG_LF;                                \
+    BENCHMARK_REGISTER_F(GQF_##ID, QueryNegative) BENCHMARK_CONFIG_LF;                        \
+    BENCHMARK_REGISTER_F(GQF_##ID, Delete) BENCHMARK_CONFIG_LF;                               \
                                                                                               \
     /* Partitioned Cuckoo Filter */                                                           \
     using PCF_##ID = PartitionedCFFixture<(LF) * 0.01>;                                       \

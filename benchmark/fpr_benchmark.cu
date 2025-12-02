@@ -12,6 +12,8 @@
 #include <cuco/bloom_filter.cuh>
 #include <cuda/std/cstdint>
 #include <filter.hpp>
+#include <gqf.cuh>
+#include <gqf_int.cuh>
 #include <hash_strategies.cuh>
 #include <helpers.cuh>
 #include <random>
@@ -24,6 +26,28 @@ namespace bm = benchmark;
 using Config = CuckooConfig<uint64_t, 16, 500, 128, 16, XorAltBucketPolicy>;
 using TCFType = host_bulk_tcf<uint64_t, uint16_t>;
 using BloomFilter = cuco::bloom_filter<uint64_t>;
+
+size_t getQFSizeHost(QF* d_qf) {
+    QF h_qf;
+    cudaMemcpy(&h_qf, d_qf, sizeof(QF), cudaMemcpyDeviceToHost);
+
+    qfmetadata h_metadata;
+    cudaMemcpy(&h_metadata, h_qf.metadata, sizeof(qfmetadata), cudaMemcpyDeviceToHost);
+
+    return h_metadata.total_size_in_bytes;
+}
+
+/**
+ * GQF doesn't return a bit vector, but rather a count for each key
+ */
+void convertGQFResults(thrust::device_vector<uint64_t>& d_results) {
+    thrust::device_ptr<uint64_t> d_resultsPtr(d_results.data().get());
+    thrust::transform(
+        d_resultsPtr, d_resultsPtr + d_results.size(), d_resultsPtr, [] __device__(uint64_t val) {
+            return val > 0;
+        }
+    );
+}
 
 using CPUFilterParam = filters::cuckoo::Standard4<Config::bitsPerTag>;
 using CPUOptimParam = filters::parameter::PowerOfTwoMurmurScalar64PartitionedMT;
@@ -267,10 +291,67 @@ static void PartitionedCF_FPR(bm::State& state) {
         ->Repetitions(3)          \
         ->ReportAggregatesOnly(true);
 
+static void GQF_FPR(bm::State& state) {
+    Timer timer;
+    size_t targetMemory = state.range(0);
+
+    // Estimate capacity based on target memory and bits per slot
+    // GQF uses QF_BITS_PER_SLOT (16) + metadata overhead
+    // We'll approximate capacity
+    size_t capacity = (targetMemory * 8) / QF_BITS_PER_SLOT;
+    auto n = static_cast<size_t>(capacity * LOAD_FACTOR);
+
+    auto q = static_cast<uint32_t>(std::log2(capacity));
+    capacity = 1ULL << q;
+
+    thrust::device_vector<uint64_t> d_keys(n);
+    generateKeysGPURange(d_keys, n, static_cast<uint64_t>(0), static_cast<uint64_t>(UINT32_MAX));
+
+    QF* qf;
+    qf_malloc_device(&qf, q, true);
+    bulk_insert(qf, n, thrust::raw_pointer_cast(d_keys.data()), 0);
+    cudaDeviceSynchronize();
+
+    size_t filterMemory = getQFSizeHost(qf);
+
+    thrust::device_vector<uint64_t> d_neverInserted(FPR_TEST_SIZE);
+    thrust::device_vector<uint64_t> d_results(FPR_TEST_SIZE);
+
+    generateKeysGPURange(
+        d_neverInserted, FPR_TEST_SIZE, static_cast<uint64_t>(UINT32_MAX) + 1, UINT64_MAX
+    );
+
+    for (auto _ : state) {
+        timer.start();
+        bulk_get(
+            qf,
+            FPR_TEST_SIZE,
+            thrust::raw_pointer_cast(d_neverInserted.data()),
+            thrust::raw_pointer_cast(d_results.data())
+        );
+        double elapsed = timer.stop();
+
+        state.SetIterationTime(elapsed);
+        bm::DoNotOptimize(d_results.data().get());
+    }
+
+    convertGQFResults(d_results);
+
+    size_t falsePositives =
+        thrust::reduce(d_results.begin(), d_results.end(), 0ULL, thrust::plus<size_t>());
+
+    double fpr = static_cast<double>(falsePositives) / static_cast<double>(FPR_TEST_SIZE);
+
+    setFPRCounters(state, filterMemory, n, fpr, falsePositives, FPR_TEST_SIZE);
+
+    qf_destroy_device(qf);
+}
+
 BENCHMARK(GPUCF_FPR) FPR_CONFIG;
 BENCHMARK(CPUCF_FPR) FPR_CONFIG;
 BENCHMARK(Bloom_FPR) FPR_CONFIG;
 BENCHMARK(TCF_FPR) FPR_CONFIG;
 BENCHMARK(PartitionedCF_FPR) FPR_CONFIG;
+BENCHMARK(GQF_FPR) FPR_CONFIG;
 
 BENCHMARK_MAIN();

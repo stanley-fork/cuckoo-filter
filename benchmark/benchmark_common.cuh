@@ -323,7 +323,7 @@ class CuckooFilterFixture : public benchmark::Fixture {
         ->Range(1 << 16, 1ULL << 28)    \
         ->Unit(benchmark::kMillisecond) \
         ->UseManualTime()               \
-        ->MinTime(0.5)                  \
+        ->Iterations(10)                \
         ->Repetitions(5)                \
         ->ReportAggregatesOnly(true)
 

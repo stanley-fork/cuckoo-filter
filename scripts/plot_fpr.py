@@ -28,6 +28,8 @@ def extract_filter_type(name: str) -> Optional[str]:
         return "Bloom Filter"
     elif "TCF_FPR" in name:
         return "TCF"
+    elif "GQF_FPR" in name:
+        return "GQF"
     elif "PartitionedCF_FPR" in name:
         return "Partitioned Cuckoo"
     return None
@@ -91,6 +93,7 @@ def main(
         "CPU Cuckoo": {"color": "#00B4D8", "marker": "o"},
         "Bloom Filter": {"color": "#A23B72", "marker": "s"},
         "TCF": {"color": "#C73E1D", "marker": "v"},
+        "GQF": {"color": "#F18F01", "marker": "^"},
         "Partitioned Cuckoo": {"color": "#6A994E", "marker": "D"},
     }
 
@@ -151,7 +154,6 @@ def main(
             color=style.get("color"),
             marker=style.get("marker", "o"),
         )
-
 
     ax.set_xlabel("Memory Size [bytes]", fontsize=14, fontweight="bold")
     ax.set_ylabel("Bits per Item", fontsize=14, fontweight="bold")

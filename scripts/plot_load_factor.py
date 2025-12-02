@@ -53,6 +53,8 @@ def extract_filter_type(name: str) -> Optional[str]:
         return "Quotient Filter"
     elif name.startswith("TCF_"):
         return "TCF"
+    elif name.startswith("GQF_"):
+        return "GQF"
     elif name.startswith("PCF_"):
         return "Partitioned Cuckoo"
     return None
@@ -169,6 +171,7 @@ def main(
         "Bloom Filter": {"color": "#A23B72", "marker": "s"},
         "Quotient Filter": {"color": "#F18F01", "marker": "^"},
         "TCF": {"color": "#C73E1D", "marker": "v"},
+        "GQF": {"color": "#F18F01", "marker": "^"},
         "Partitioned Cuckoo": {"color": "#6A994E", "marker": "D"},
     }
 

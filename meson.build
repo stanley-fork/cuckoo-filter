@@ -91,7 +91,7 @@ if get_option('BUILD_BENCHMARKS') == true
     partitioned_sub = cmake.subproject('partitioned-filters', options: partitioned_opts)
     partitioned_dep = partitioned_sub.dependency('filters')
 
-    gqf_dep = subproject('quotient-filters').get_variable('gqf_dep')
+    gqf_dep = subproject('gqf').get_variable('gqf_dep')
 
     tcf_opts = cmake.subproject_options()
     tcf_opts.add_cmake_defines(
@@ -173,7 +173,7 @@ if get_option('BUILD_BENCHMARKS') == true
     executable(
         'benchmark-load-factor',
         './benchmark/load_factor_benchmark.cu',
-        dependencies: bench_deps + [cuco_dep, tcf_dep, partitioned_dep, cpu_cuckoo_dep],
+        dependencies: bench_deps + [cuco_dep, tcf_dep, partitioned_dep, cpu_cuckoo_dep, gqf_dep],
         include_directories: includes,
         cuda_args: cuda_args + ['-w'],
         install: false,
@@ -182,7 +182,7 @@ if get_option('BUILD_BENCHMARKS') == true
     executable(
         'benchmark-fpr',
         './benchmark/fpr_benchmark.cu',
-        dependencies: bench_deps + [cuco_dep, tcf_dep, partitioned_dep, cpu_cuckoo_dep],
+        dependencies: bench_deps + [cuco_dep, tcf_dep, partitioned_dep, cpu_cuckoo_dep, gqf_dep],
         include_directories: includes,
         cuda_args: cuda_args + ['-w'],
         install: false,
@@ -191,7 +191,7 @@ if get_option('BUILD_BENCHMARKS') == true
     executable(
         'profiler-benchmark',
         './benchmark/profiler_benchmark.cu',
-        dependencies: [cli11_dep, cuco_dep, tcf_dep, benchmark_dep],
+        dependencies: [cli11_dep, cuco_dep, tcf_dep, benchmark_dep, gqf_dep],
         include_directories: includes,
         cuda_args: cuda_args,
         install: false,

@@ -7,6 +7,8 @@
 #include <cstdint>
 #include <CuckooFilter.cuh>
 #include <cuco/bloom_filter.cuh>
+#include <gqf.cuh>
+#include <gqf_int.cuh>
 #include <hash_strategies.cuh>
 #include <helpers.cuh>
 #include <iostream>
@@ -16,6 +18,16 @@
 using Config = CuckooConfig<uint64_t, 16, 500, 128, 16, XorAltBucketPolicy>;
 using TCFType = host_bulk_tcf<uint64_t, uint16_t>;
 using BloomFilter = cuco::bloom_filter<uint64_t>;
+
+size_t getQFSizeHost(QF* d_qf) {
+    QF h_qf;
+    cudaMemcpy(&h_qf, d_qf, sizeof(QF), cudaMemcpyDeviceToHost);
+
+    qfmetadata h_metadata;
+    cudaMemcpy(&h_metadata, h_qf.metadata, sizeof(qfmetadata), cudaMemcpyDeviceToHost);
+
+    return h_metadata.total_size_in_bytes;
+}
 
 template <typename Filter>
 size_t cucoNumBlocks(size_t n) {
@@ -191,6 +203,67 @@ void benchmarkTcfDelete(size_t capacity, double loadFactor) {
     cudaFree(d_misses);
 }
 
+void benchmarkGQFInsert(size_t capacity, double loadFactor) {
+    auto n = static_cast<size_t>(capacity * loadFactor);
+    auto q = static_cast<uint32_t>(std::log2(capacity));
+
+    thrust::device_vector<uint64_t> d_keys(n);
+    generateKeysGPU(d_keys);
+
+    QF* qf;
+    qf_malloc_device(&qf, q, true);
+
+    bulk_insert(qf, n, thrust::raw_pointer_cast(d_keys.data()), 0);
+    cudaDeviceSynchronize();
+
+    qf_destroy_device(qf);
+    qf_malloc_device(&qf, q, true);
+    cudaDeviceSynchronize();
+    bulk_insert(qf, n, thrust::raw_pointer_cast(d_keys.data()), 0);
+    cudaDeviceSynchronize();
+
+    qf_destroy_device(qf);
+}
+
+void benchmarkGQFQuery(size_t capacity, double loadFactor) {
+    auto n = static_cast<size_t>(capacity * loadFactor);
+    auto q = static_cast<uint32_t>(std::log2(capacity));
+
+    thrust::device_vector<uint64_t> d_keys(n);
+    thrust::device_vector<uint64_t> d_results(n);
+    generateKeysGPU(d_keys);
+
+    QF* qf;
+    qf_malloc_device(&qf, q, true);
+    bulk_insert(qf, n, thrust::raw_pointer_cast(d_keys.data()), 0);
+    cudaDeviceSynchronize();
+
+    bulk_get(
+        qf, n, thrust::raw_pointer_cast(d_keys.data()), thrust::raw_pointer_cast(d_results.data())
+    );
+    cudaDeviceSynchronize();
+
+    qf_destroy_device(qf);
+}
+
+void benchmarkGQFDelete(size_t capacity, double loadFactor) {
+    auto n = static_cast<size_t>(capacity * loadFactor);
+    auto q = static_cast<uint32_t>(std::log2(capacity));
+
+    thrust::device_vector<uint64_t> d_keys(n);
+    generateKeysGPU(d_keys);
+
+    QF* qf;
+    qf_malloc_device(&qf, q, true);
+    bulk_insert(qf, n, thrust::raw_pointer_cast(d_keys.data()), 0);
+    cudaDeviceSynchronize();
+
+    bulk_delete(qf, n, thrust::raw_pointer_cast(d_keys.data()), 0);
+    cudaDeviceSynchronize();
+
+    qf_destroy_device(qf);
+}
+
 int main(int argc, char** argv) {
     CLI::App app{"GPU Filter Cache Benchmark"};
 
@@ -199,9 +272,9 @@ int main(int argc, char** argv) {
     size_t exponent = 24;
     double loadFactor = 0.95;
 
-    app.add_option("filter", filter, "Filter type: cuckoo, bloom, tcf")
+    app.add_option("filter", filter, "Filter type: cuckoo, bloom, tcf, gqf")
         ->required()
-        ->check(CLI::IsMember({"cuckoo", "bloom", "tcf"}));
+        ->check(CLI::IsMember({"cuckoo", "bloom", "tcf", "gqf"}));
 
     app.add_option("operation", operation, "Operation: insert, query, delete")
         ->required()
@@ -253,6 +326,14 @@ int main(int argc, char** argv) {
             benchmarkTcfQuery(capacity, loadFactor);
         } else if (operation == "delete") {
             benchmarkTcfDelete(capacity, loadFactor);
+        }
+    } else if (filter == "gqf") {
+        if (operation == "insert") {
+            benchmarkGQFInsert(capacity, loadFactor);
+        } else if (operation == "query") {
+            benchmarkGQFQuery(capacity, loadFactor);
+        } else if (operation == "delete") {
+            benchmarkGQFDelete(capacity, loadFactor);
         }
     }
 
