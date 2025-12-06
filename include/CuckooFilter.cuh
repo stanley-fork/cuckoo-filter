@@ -938,7 +938,11 @@ struct CuckooFilter {
         } else if constexpr (Config::evictionPolicy == EvictionPolicy::DFS) {
             return insertWithEvictionDFS(fp, startBucket);
         } else {
-            static_assert(false, "Unhandled eviction policy");
+            static_assert(
+                Config::evictionPolicy == EvictionPolicy::DFS ||
+                    Config::evictionPolicy == EvictionPolicy::BFS,
+                "Unhandled eviction policy"
+            );
         }
     }
 
@@ -1097,7 +1101,11 @@ __global__ void insertKernelSorted(
                 } else if constexpr (Config::evictionPolicy == EvictionPolicy::DFS) {
                     success = filter->insertWithEvictionDFS(fp, startBucket);
                 } else {
-                    static_assert(false, "Unhandled eviction policy");
+                    static_assert(
+                        Config::evictionPolicy == EvictionPolicy::DFS ||
+                            Config::evictionPolicy == EvictionPolicy::BFS,
+                        "Unhandled eviction policy"
+                    );
                 }
             }
         }
