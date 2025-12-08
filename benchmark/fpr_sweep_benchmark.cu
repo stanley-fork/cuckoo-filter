@@ -142,6 +142,44 @@ static void GPUCF_FPR_Sweep(bm::State& state) {
 }
 
 template <size_t bitsPerTag, int loadFactorPercent>
+static void GPUCF_Insert_Sweep(bm::State& state) {
+    using Config = GPUCuckooConfig<bitsPerTag>;
+    constexpr double loadFactor = loadFactorPercent / 100.0;
+
+    GPUTimer timer;
+    auto n = static_cast<size_t>(FIXED_CAPACITY * loadFactor);
+
+    thrust::device_vector<uint64_t> d_keys(n);
+    generateKeysGPURange(d_keys, n, uint64_t(0), uint64_t(UINT32_MAX));
+
+    size_t filterMemory = 0;
+
+    for (auto _ : state) {
+        auto filter = std::make_unique<CuckooFilter<Config>>(FIXED_CAPACITY);
+        filterMemory = filter->sizeInBytes();
+
+        timer.start();
+        adaptiveInsert(*filter, d_keys);
+        double elapsed = timer.elapsed();
+
+        state.SetIterationTime(elapsed);
+        bm::DoNotOptimize(filter.get());
+    }
+
+    state.SetItemsProcessed(static_cast<int64_t>(state.iterations() * n));
+    state.counters["memory_bytes"] = benchmark::Counter(
+        static_cast<double>(filterMemory),
+        benchmark::Counter::kDefaults,
+        benchmark::Counter::kIs1024
+    );
+    state.counters["bits_per_item"] =
+        benchmark::Counter(static_cast<double>(filterMemory * 8) / static_cast<double>(n));
+    state.counters["num_items"] = benchmark::Counter(static_cast<double>(n));
+    state.counters["fingerprint_bits"] = benchmark::Counter(static_cast<double>(bitsPerTag));
+    state.counters["load_factor"] = benchmark::Counter(loadFactor * 100);
+}
+
+template <size_t bitsPerTag, int loadFactorPercent>
 static void CPUCF_FPR_Sweep(bm::State& state) {
     constexpr double loadFactor = loadFactorPercent / 100.0;
 
@@ -458,6 +496,140 @@ static void PartitionedCF_FPR_Sweep(bm::State& state) {
     );
 }
 
+template <int bitsPerElement, int loadFactorPercent>
+static void Bloom_Insert_Sweep(bm::State& state) {
+    constexpr double loadFactor = loadFactorPercent / 100.0;
+    constexpr size_t bitsPerBlock =
+        BloomFilter::words_per_block * sizeof(typename BloomFilter::word_type) * 8;
+
+    GPUTimer timer;
+    auto n = static_cast<size_t>(FIXED_CAPACITY * loadFactor);
+    size_t numBlocks = std::max(1UL, SDIV(n * bitsPerElement, bitsPerBlock));
+
+    thrust::device_vector<uint64_t> d_keys(n);
+    generateKeysGPURange(d_keys, n, uint64_t(0), uint64_t(UINT32_MAX));
+
+    size_t filterMemory = 0;
+
+    for (auto _ : state) {
+        auto filter = std::make_unique<BloomFilter>(numBlocks);
+        filterMemory = filter->block_extent() * BloomFilter::words_per_block *
+                       sizeof(typename BloomFilter::word_type);
+
+        timer.start();
+        filter->add(d_keys.begin(), d_keys.end());
+        cudaDeviceSynchronize();
+        double elapsed = timer.elapsed();
+
+        state.SetIterationTime(elapsed);
+        bm::DoNotOptimize(filter.get());
+    }
+
+    state.SetItemsProcessed(static_cast<int64_t>(state.iterations() * n));
+    state.counters["memory_bytes"] = benchmark::Counter(
+        static_cast<double>(filterMemory),
+        benchmark::Counter::kDefaults,
+        benchmark::Counter::kIs1024
+    );
+    state.counters["bits_per_item"] =
+        benchmark::Counter(static_cast<double>(filterMemory * 8) / static_cast<double>(n));
+    state.counters["num_items"] = benchmark::Counter(static_cast<double>(n));
+    state.counters["fingerprint_bits"] = benchmark::Counter(static_cast<double>(bitsPerElement));
+    state.counters["load_factor"] = benchmark::Counter(loadFactor * 100);
+}
+
+template <typename FingerprintType, int loadFactorPercent>
+static void TCF_Insert_Sweep(bm::State& state) {
+    using TCFType = host_bulk_tcf<uint64_t, FingerprintType>;
+    constexpr double loadFactor = loadFactorPercent / 100.0;
+    constexpr size_t fingerprintBits = sizeof(FingerprintType) * 8;
+    constexpr double TCF_CAPACITY_FACTOR = 0.85;
+
+    GPUTimer timer;
+    auto n = static_cast<size_t>(FIXED_CAPACITY * loadFactor);
+    auto requiredUsableCapacity = static_cast<size_t>(n / loadFactor);
+    auto capacity = static_cast<size_t>(requiredUsableCapacity / TCF_CAPACITY_FACTOR);
+
+    thrust::device_vector<uint64_t> d_keys(n);
+    generateKeysGPURange(d_keys, n, uint64_t(0), uint64_t(UINT32_MAX));
+
+    size_t filterMemory = capacity * sizeof(FingerprintType);
+
+    for (auto _ : state) {
+        TCFType* filter = TCFType::host_build_tcf(capacity);
+
+        uint64_t* d_misses;
+        cudaMalloc(&d_misses, sizeof(uint64_t));
+        cudaMemset(d_misses, 0, sizeof(uint64_t));
+
+        timer.start();
+        filter->bulk_insert(thrust::raw_pointer_cast(d_keys.data()), n, d_misses);
+        cudaDeviceSynchronize();
+        double elapsed = timer.elapsed();
+
+        state.SetIterationTime(elapsed);
+        bm::DoNotOptimize(filter);
+
+        cudaFree(d_misses);
+        TCFType::host_free_tcf(filter);
+    }
+
+    state.SetItemsProcessed(static_cast<int64_t>(state.iterations() * n));
+    state.counters["memory_bytes"] = benchmark::Counter(
+        static_cast<double>(filterMemory),
+        benchmark::Counter::kDefaults,
+        benchmark::Counter::kIs1024
+    );
+    state.counters["bits_per_item"] =
+        benchmark::Counter(static_cast<double>(filterMemory * 8) / static_cast<double>(n));
+    state.counters["num_items"] = benchmark::Counter(static_cast<double>(n));
+    state.counters["fingerprint_bits"] = benchmark::Counter(static_cast<double>(fingerprintBits));
+    state.counters["load_factor"] = benchmark::Counter(loadFactor * 100);
+}
+
+template <int loadFactorPercent>
+static void GQF_Insert_Sweep(bm::State& state) {
+    constexpr double loadFactor = loadFactorPercent / 100.0;
+
+    GPUTimer timer;
+    auto q = static_cast<uint32_t>(std::log2(FIXED_CAPACITY));
+    size_t capacity = 1ULL << q;
+    auto n = static_cast<size_t>(capacity * loadFactor);
+
+    thrust::device_vector<uint64_t> d_keys(n);
+    generateKeysGPURange(d_keys, n, uint64_t(0), uint64_t(UINT32_MAX));
+
+    size_t filterMemory = 0;
+
+    for (auto _ : state) {
+        QF* qf;
+        qf_malloc_device(&qf, q, true);
+        filterMemory = getQFSizeHost(qf);
+
+        timer.start();
+        bulk_insert(qf, n, thrust::raw_pointer_cast(d_keys.data()), 0);
+        cudaDeviceSynchronize();
+        double elapsed = timer.elapsed();
+
+        state.SetIterationTime(elapsed);
+        bm::DoNotOptimize(qf);
+
+        qf_destroy_device(qf);
+    }
+
+    state.SetItemsProcessed(static_cast<int64_t>(state.iterations() * n));
+    state.counters["memory_bytes"] = benchmark::Counter(
+        static_cast<double>(filterMemory),
+        benchmark::Counter::kDefaults,
+        benchmark::Counter::kIs1024
+    );
+    state.counters["bits_per_item"] =
+        benchmark::Counter(static_cast<double>(filterMemory * 8) / static_cast<double>(n));
+    state.counters["num_items"] = benchmark::Counter(static_cast<double>(n));
+    state.counters["fingerprint_bits"] = benchmark::Counter(static_cast<double>(GQF_BITS));
+    state.counters["load_factor"] = benchmark::Counter(loadFactor * 100);
+}
+
 #define FPR_SWEEP_CONFIG     \
     ->Unit(bm::kMillisecond) \
         ->UseManualTime()    \
@@ -469,10 +641,13 @@ static void PartitionedCF_FPR_Sweep(bm::State& state) {
 
 #if GQF_BITS == 8
 
-    #define REGISTER_GPUCF_FOR_LOAD_FACTOR(LF)               \
-        BENCHMARK(GPUCF_FPR_Sweep<8, LF>) FPR_SWEEP_CONFIG;  \
-        BENCHMARK(GPUCF_FPR_Sweep<16, LF>) FPR_SWEEP_CONFIG; \
-        BENCHMARK(GPUCF_FPR_Sweep<32, LF>) FPR_SWEEP_CONFIG;
+    #define REGISTER_GPUCF_FOR_LOAD_FACTOR(LF)                  \
+        BENCHMARK(GPUCF_FPR_Sweep<8, LF>) FPR_SWEEP_CONFIG;     \
+        BENCHMARK(GPUCF_FPR_Sweep<16, LF>) FPR_SWEEP_CONFIG;    \
+        BENCHMARK(GPUCF_FPR_Sweep<32, LF>) FPR_SWEEP_CONFIG;    \
+        BENCHMARK(GPUCF_Insert_Sweep<8, LF>) FPR_SWEEP_CONFIG;  \
+        BENCHMARK(GPUCF_Insert_Sweep<16, LF>) FPR_SWEEP_CONFIG; \
+        BENCHMARK(GPUCF_Insert_Sweep<32, LF>) FPR_SWEEP_CONFIG;
 
 REGISTER_GPUCF_FOR_LOAD_FACTOR(35)
 REGISTER_GPUCF_FOR_LOAD_FACTOR(40)
@@ -495,10 +670,13 @@ REGISTER_CPUCF_FOR_LOAD_FACTOR(85)
 REGISTER_CPUCF_FOR_LOAD_FACTOR(90)
 REGISTER_CPUCF_FOR_LOAD_FACTOR(95)
 
-    #define REGISTER_BLOOM_FOR_LOAD_FACTOR(LF)               \
-        BENCHMARK(Bloom_FPR_Sweep<8, LF>) FPR_SWEEP_CONFIG;  \
-        BENCHMARK(Bloom_FPR_Sweep<16, LF>) FPR_SWEEP_CONFIG; \
-        BENCHMARK(Bloom_FPR_Sweep<32, LF>) FPR_SWEEP_CONFIG;
+    #define REGISTER_BLOOM_FOR_LOAD_FACTOR(LF)                  \
+        BENCHMARK(Bloom_FPR_Sweep<8, LF>) FPR_SWEEP_CONFIG;     \
+        BENCHMARK(Bloom_FPR_Sweep<16, LF>) FPR_SWEEP_CONFIG;    \
+        BENCHMARK(Bloom_FPR_Sweep<32, LF>) FPR_SWEEP_CONFIG;    \
+        BENCHMARK(Bloom_Insert_Sweep<8, LF>) FPR_SWEEP_CONFIG;  \
+        BENCHMARK(Bloom_Insert_Sweep<16, LF>) FPR_SWEEP_CONFIG; \
+        BENCHMARK(Bloom_Insert_Sweep<32, LF>) FPR_SWEEP_CONFIG;
 
 REGISTER_BLOOM_FOR_LOAD_FACTOR(35)
 REGISTER_BLOOM_FOR_LOAD_FACTOR(40)
@@ -508,10 +686,13 @@ REGISTER_BLOOM_FOR_LOAD_FACTOR(85)
 REGISTER_BLOOM_FOR_LOAD_FACTOR(90)
 REGISTER_BLOOM_FOR_LOAD_FACTOR(95)
 
-    #define REGISTER_TCF_FOR_LOAD_FACTOR(LF)                     \
-        BENCHMARK(TCF_FPR_Sweep<uint8_t, LF>) FPR_SWEEP_CONFIG;  \
-        BENCHMARK(TCF_FPR_Sweep<uint16_t, LF>) FPR_SWEEP_CONFIG; \
-        BENCHMARK(TCF_FPR_Sweep<uint32_t, LF>) FPR_SWEEP_CONFIG;
+    #define REGISTER_TCF_FOR_LOAD_FACTOR(LF)                        \
+        BENCHMARK(TCF_FPR_Sweep<uint8_t, LF>) FPR_SWEEP_CONFIG;     \
+        BENCHMARK(TCF_FPR_Sweep<uint16_t, LF>) FPR_SWEEP_CONFIG;    \
+        BENCHMARK(TCF_FPR_Sweep<uint32_t, LF>) FPR_SWEEP_CONFIG;    \
+        BENCHMARK(TCF_Insert_Sweep<uint8_t, LF>) FPR_SWEEP_CONFIG;  \
+        BENCHMARK(TCF_Insert_Sweep<uint16_t, LF>) FPR_SWEEP_CONFIG; \
+        BENCHMARK(TCF_Insert_Sweep<uint32_t, LF>) FPR_SWEEP_CONFIG;
 
 REGISTER_TCF_FOR_LOAD_FACTOR(35)
 REGISTER_TCF_FOR_LOAD_FACTOR(40)
@@ -547,5 +728,13 @@ BENCHMARK(GQF_FPR_Sweep<75>) FPR_SWEEP_CONFIG;
 BENCHMARK(GQF_FPR_Sweep<85>) FPR_SWEEP_CONFIG;
 BENCHMARK(GQF_FPR_Sweep<90>) FPR_SWEEP_CONFIG;
 BENCHMARK(GQF_FPR_Sweep<95>) FPR_SWEEP_CONFIG;
+
+BENCHMARK(GQF_Insert_Sweep<35>) FPR_SWEEP_CONFIG;
+BENCHMARK(GQF_Insert_Sweep<40>) FPR_SWEEP_CONFIG;
+BENCHMARK(GQF_Insert_Sweep<50>) FPR_SWEEP_CONFIG;
+BENCHMARK(GQF_Insert_Sweep<75>) FPR_SWEEP_CONFIG;
+BENCHMARK(GQF_Insert_Sweep<85>) FPR_SWEEP_CONFIG;
+BENCHMARK(GQF_Insert_Sweep<90>) FPR_SWEEP_CONFIG;
+BENCHMARK(GQF_Insert_Sweep<95>) FPR_SWEEP_CONFIG;
 
 STANDARD_BENCHMARK_MAIN();

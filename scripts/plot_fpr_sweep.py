@@ -42,14 +42,17 @@ FILTER_COLORS = {
 
 
 def parse_benchmark_name(name: str) -> dict:
-    """Extract filter type, fingerprint bits, and load factor from benchmark name."""
-    # Examples:
-    # GPUCF_FPR_Sweep<8, 50>
-    # Bloom_FPR_Sweep<4, 50>
-    # TCF_FPR_Sweep<uint16_t, 50>
-    # GQF_FPR_Sweep<50>
+    """Extract filter type, fingerprint bits, load factor, and operation from benchmark name."""
+    result = {
+        "filter": None,
+        "fingerprint_bits": None,
+        "load_factor": None,
+        "operation": "query",  # default to query for FPR_Sweep benchmarks
+    }
 
-    result = {"filter": None, "fingerprint_bits": None, "load_factor": None}
+    # Check if this is an insert benchmark
+    if "_Insert_Sweep" in name:
+        result["operation"] = "insert"
 
     for prefix, filter_name in FILTER_TYPES.items():
         if name.startswith(prefix):
@@ -69,7 +72,6 @@ def parse_benchmark_name(name: str) -> dict:
         params = [p.strip() for p in params]
 
         if len(params) == 2:
-            # Could be int or type name
             first_param = params[0]
             if first_param in type_to_bits:
                 result["fingerprint_bits"] = type_to_bits[first_param]
@@ -82,153 +84,193 @@ def parse_benchmark_name(name: str) -> dict:
     return result
 
 
-def create_fastest_filter_heatmap(df: pd.DataFrame, output_path: Path):
-    """Create a heatmap showing the fastest filter for each (FPR, space) combination."""
+def create_filter_comparison_heatmaps(df: pd.DataFrame, output_dir: Path):
+    """Create 2 files: fastest filter heatmap, and insert/query throughput heatmaps."""
 
     # Define bins for FPR and bits_per_item
-    fpr_bins = np.array([2**i for i in range(-16, 0)])  # 2^-16 to 2^-1
-    space_bins = np.array(
-        [4, 6, 8, 10, 12, 16, 20, 24, 32, 40, 50, 64, 100]
-    )  # bits per item
+    fpr_bins = np.array([2**i for i in range(-16, 0)])
+    space_bins = np.array([4, 6, 8, 10, 12, 16, 20, 24, 32, 40, 50, 64, 100])
 
-    # Create grid
     n_fpr = len(fpr_bins) - 1
     n_space = len(space_bins) - 1
 
-    # Map filter names to indices
     filter_names = list(FILTER_COLORS.keys())
     filter_to_idx = {name: i for i, name in enumerate(filter_names)}
 
     # Initialize grids
-    fastest_filter = np.full((n_fpr, n_space), -1, dtype=int)
-    best_throughput = np.zeros((n_fpr, n_space))
+    fastest_filter_avg = np.full((n_fpr, n_space), -1, dtype=int)
+    best_avg_throughput = np.zeros((n_fpr, n_space))
+    best_insert_throughput = np.zeros((n_fpr, n_space))
+    best_query_throughput = np.zeros((n_fpr, n_space))
 
-    # Assign each data point to a bin and track fastest
-    for _, row in df.iterrows():
-        if row["filter"] is None:
+    # Separate insert and query data
+    query_df = df[df["operation"] == "query"].copy()
+    insert_df = df[df["operation"] == "insert"].copy()
+
+    # Create config key for matching insert/query pairs
+    def make_config_key(row):
+        return f"{row['filter']}_{row.get('fingerprint_bits', '')}_{row.get('load_factor', '')}"
+
+    query_df["config_key"] = query_df.apply(make_config_key, axis=1)
+    insert_df["config_key"] = insert_df.apply(make_config_key, axis=1)
+
+    # Merge insert and query data
+    merged = pd.merge(
+        query_df[
+            [
+                "config_key",
+                "filter",
+                "fpr_percentage",
+                "bits_per_item",
+                "throughput_mops",
+            ]
+        ],
+        insert_df[["config_key", "throughput_mops"]],
+        on="config_key",
+        suffixes=("_query", "_insert"),
+        how="outer",
+    )
+
+    # Fill NaN filter from query or insert data
+    if "filter" not in merged.columns or merged["filter"].isna().any():
+        insert_filter_map = insert_df.set_index("config_key")["filter"].to_dict()
+        merged["filter"] = merged.apply(
+            lambda r: r["filter"]
+            if pd.notna(r.get("filter"))
+            else insert_filter_map.get(r["config_key"]),
+            axis=1,
+        )
+
+    # Calculate average throughput
+    q_tp = merged["throughput_mops_query"].fillna(0)
+    i_tp = merged["throughput_mops_insert"].fillna(0)
+
+    both_exist = (merged["throughput_mops_query"].notna()) & (
+        merged["throughput_mops_insert"].notna()
+    )
+    merged["avg_throughput"] = np.where(both_exist, (q_tp + i_tp) / 2, q_tp + i_tp)
+
+    # Assign each data point to bins
+    for _, row in merged.iterrows():
+        filter_name = row.get("filter")
+        if pd.isna(filter_name) or filter_name not in filter_to_idx:
             continue
 
-        fpr = row.get("fpr_percentage", 0) / 100  # Convert to fraction
+        fpr = row.get("fpr_percentage", 0)
+        if pd.isna(fpr) or fpr <= 0:
+            continue
+        fpr = fpr / 100
+
         bits = row.get("bits_per_item", 0)
-        throughput = row.get("throughput_mops", 0)
-
-        if fpr <= 0 or bits <= 0:
+        if pd.isna(bits) or bits <= 0:
             continue
 
-        # Find bin indices
+        avg_tp = row.get("avg_throughput", 0) or 0
+        query_tp = row.get("throughput_mops_query", 0) or 0
+        insert_tp = row.get("throughput_mops_insert", 0) or 0
+
         fpr_idx = np.searchsorted(fpr_bins, fpr) - 1
         space_idx = np.searchsorted(space_bins, bits) - 1
 
         if 0 <= fpr_idx < n_fpr and 0 <= space_idx < n_space:
-            if throughput > best_throughput[fpr_idx, space_idx]:
-                best_throughput[fpr_idx, space_idx] = throughput
-                fastest_filter[fpr_idx, space_idx] = filter_to_idx[row["filter"]]
+            if avg_tp > best_avg_throughput[fpr_idx, space_idx]:
+                best_avg_throughput[fpr_idx, space_idx] = avg_tp
+                fastest_filter_avg[fpr_idx, space_idx] = filter_to_idx[filter_name]
 
-    # Create figure
-    fig, axes = plt.subplots(2, 2, figsize=(14, 12))
+            if query_tp > best_query_throughput[fpr_idx, space_idx]:
+                best_query_throughput[fpr_idx, space_idx] = query_tp
 
-    # Plot 1: Fastest filter heatmap
-    ax1 = axes[0, 0]
+            if insert_tp > best_insert_throughput[fpr_idx, space_idx]:
+                best_insert_throughput[fpr_idx, space_idx] = insert_tp
 
-    # Create colormap
     colors = ["white"] + [FILTER_COLORS[name] for name in filter_names]
     cmap = ListedColormap(colors)
 
-    # Plot with -1 for empty cells mapped to white
+    # File 1: Fastest filter heatmap
+    fig1, ax1 = plt.subplots(figsize=(10, 8))
     ax1.imshow(
-        fastest_filter + 1, cmap=cmap, aspect="auto", vmin=0, vmax=len(filter_names)
+        fastest_filter_avg + 1, cmap=cmap, aspect="auto", vmin=0, vmax=len(filter_names)
     )
-
-    # Set axis labels
     ax1.set_xticks(range(n_space))
-    ax1.set_xticklabels([f"{int(space_bins[i])}" for i in range(n_space)])
+    ax1.set_xticklabels([f"{int(space_bins[i])}" for i in range(n_space)], fontsize=9)
     ax1.set_yticks(range(n_fpr))
     ax1.set_yticklabels([f"$2^{{{int(np.log2(fpr_bins[i]))}}}$" for i in range(n_fpr)])
-
     ax1.set_xlabel("Bits per item")
     ax1.set_ylabel("FPR")
     ax1.set_title("Fastest Filter")
-
-    # Legend
     legend_elements = [
         Patch(facecolor=FILTER_COLORS[name], label=name) for name in filter_names
     ]
     ax1.legend(handles=legend_elements, loc="upper right", fontsize=8)
+    plt.tight_layout()
 
-    # Plot 2: Throughput heatmap
-    ax2 = axes[0, 1]
+    fastest_path = output_dir / "fpr_sweep_fastest.png"
+    plt.savefig(fastest_path, dpi=150, bbox_inches="tight")
+    plt.close(fig1)
+    typer.secho(f"Saved fastest filter plot to {fastest_path}", fg=typer.colors.GREEN)
 
-    throughput_masked = np.ma.masked_where(best_throughput == 0, best_throughput)
-    im2 = ax2.imshow(
-        throughput_masked,
-        cmap="viridis",
-        aspect="auto",
-        norm=plt.matplotlib.colors.LogNorm(vmin=1, vmax=throughput_masked.max()),
+    # File 2: Insert and Query throughput heatmaps
+    fig2, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+    # Insert throughput
+    ax2 = axes[0]
+    insert_masked = np.ma.masked_where(
+        best_insert_throughput == 0, best_insert_throughput
     )
-
+    if insert_masked.count() > 0 and insert_masked.max() > 0:
+        im2 = ax2.imshow(
+            insert_masked,
+            cmap="viridis",
+            aspect="auto",
+            norm=plt.matplotlib.colors.LogNorm(
+                vmin=max(1, insert_masked.min()), vmax=insert_masked.max()
+            ),
+        )
+        plt.colorbar(im2, ax=ax2, label="MOPS")
+    else:
+        ax2.text(
+            0.5,
+            0.5,
+            "No insert data",
+            ha="center",
+            va="center",
+            transform=ax2.transAxes,
+        )
     ax2.set_xticks(range(n_space))
-    ax2.set_xticklabels([f"{int(space_bins[i])}" for i in range(n_space)])
+    ax2.set_xticklabels([f"{int(space_bins[i])}" for i in range(n_space)], fontsize=8)
     ax2.set_yticks(range(n_fpr))
     ax2.set_yticklabels([f"$2^{{{int(np.log2(fpr_bins[i]))}}}$" for i in range(n_fpr)])
-
     ax2.set_xlabel("Bits per item")
-    ax2.set_ylabel("False positive rate (f)")
-    ax2.set_title("Query Throughput (MOPS)")
+    ax2.set_ylabel("FPR")
+    ax2.set_title("Insert Throughput (MOPS)")
 
-    plt.colorbar(im2, ax=ax2, label="MOPS")
-
-    # Plot 3: FPR vs bits_per_item scatter
-    ax3 = axes[1, 0]
-
-    for filter_name in filter_names:
-        filter_df = df[df["filter"] == filter_name]
-        if len(filter_df) > 0:
-            fpr = filter_df["fpr_percentage"] / 100.0
-            bits = filter_df["bits_per_item"]
-            ax3.scatter(
-                bits,
-                fpr,
-                c=FILTER_COLORS[filter_name],
-                label=filter_name,
-                alpha=0.7,
-                s=50,
-            )
-
+    # Query throughput
+    ax3 = axes[1]
+    query_masked = np.ma.masked_where(best_query_throughput == 0, best_query_throughput)
+    if query_masked.count() > 0 and query_masked.max() > 0:
+        im3 = ax3.imshow(
+            query_masked,
+            cmap="viridis",
+            aspect="auto",
+            norm=plt.matplotlib.colors.LogNorm(
+                vmin=max(1, query_masked.min()), vmax=query_masked.max()
+            ),
+        )
+        plt.colorbar(im3, ax=ax3, label="MOPS")
+    ax3.set_xticks(range(n_space))
+    ax3.set_xticklabels([f"{int(space_bins[i])}" for i in range(n_space)], fontsize=8)
+    ax3.set_yticks(range(n_fpr))
+    ax3.set_yticklabels([f"$2^{{{int(np.log2(fpr_bins[i]))}}}$" for i in range(n_fpr)])
     ax3.set_xlabel("Bits per item")
     ax3.set_ylabel("FPR")
-    ax3.set_yscale("log", base=2)
-    ax3.invert_yaxis()
-    ax3.set_title("FPR vs Space Trade-off")
-    ax3.legend(fontsize=8)
-    ax3.grid(True, alpha=0.3)
-
-    # Plot 4: Throughput vs bits_per_item scatter
-    ax4 = axes[1, 1]
-
-    for filter_name in filter_names:
-        filter_df = df[df["filter"] == filter_name]
-        if len(filter_df) > 0:
-            bits = filter_df["bits_per_item"]
-            throughput = filter_df["throughput_mops"]
-            ax4.scatter(
-                bits,
-                throughput,
-                c=FILTER_COLORS[filter_name],
-                label=filter_name,
-                alpha=0.7,
-                s=50,
-            )
-
-    ax4.set_xlabel("Bits per item")
-    ax4.set_ylabel("Throughput (MOPS)")
-    ax4.set_title("Throughput vs Space Trade-off")
-    ax4.legend(fontsize=8)
-    ax4.grid(True, alpha=0.3)
+    ax3.set_title("Query Throughput (MOPS)")
 
     plt.tight_layout()
 
-    plt.savefig(output_path, dpi=150, bbox_inches="tight")
-    typer.secho(f"Saved plot to {output_path}", fg=typer.colors.GREEN)
+    throughput_path = output_dir / "fpr_sweep_throughput.png"
+    plt.savefig(throughput_path, dpi=150, bbox_inches="tight")
+    plt.close(fig2)
+    typer.secho(f"Saved throughput plots to {throughput_path}", fg=typer.colors.GREEN)
 
 
 @app.command()
@@ -245,16 +287,9 @@ def main(
     ),
 ):
     """
-    Plot FPR sweep benchmark results to compare filters at similar FPR/space tradeoffs.
-
-    This generates a heatmap showing the fastest filter at each (FPR, space overhead)
-    combination, similar to Figure 1 from filter comparison papers.
-
-    Examples:
-        cat results.csv | plot_fpr_sweep.py
-        plot_fpr_sweep.py < results.csv
-        plot_fpr_sweep.py results.csv
-        plot_fpr_sweep.py results.csv -o custom/path.png
+    Plot FPR sweep benchmark results, generating two files:
+    1. fpr_sweep_fastest.png - Fastest filter heatmap (by avg insert+query throughput)
+    2. fpr_sweep_throughput.png - Insert and Query throughput heatmaps
     """
     try:
         if str(csv_file) == "-":
@@ -272,11 +307,11 @@ def main(
 
     df = df[df["name"].str.contains("_median", na=False)]
 
-    # Parse benchmark names
     parsed = df["name"].apply(parse_benchmark_name)
     df["filter"] = parsed.apply(lambda x: x["filter"])
     df["fingerprint_bits"] = parsed.apply(lambda x: x["fingerprint_bits"])
     df["load_factor"] = parsed.apply(lambda x: x["load_factor"])
+    df["operation"] = parsed.apply(lambda x: x["operation"])
 
     df["throughput_mops"] = df["items_per_second"] / 1e6
 
@@ -286,9 +321,7 @@ def main(
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    output = output_dir / "fpr_sweep.png"
-
-    create_fastest_filter_heatmap(df, output)
+    create_filter_comparison_heatmaps(df, output_dir)
 
 
 if __name__ == "__main__":
