@@ -198,16 +198,29 @@ def main(
         )
         plt.close()
 
-    # Create an overview plot showing all filters on one chart for insert operation
-    for operation in df["operation"].unique():
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 7))
+    # Create a single overview plot with 3x2 grid (operations x cache levels)
+    operations = sorted(df["operation"].unique())
+    n_operations = len(operations)
 
+    fig, axes = plt.subplots(
+        n_operations, 2, figsize=(16, 6 * n_operations), sharex=True
+    )
+
+    # Handle case where there's only one operation (axes would be 1D)
+    if n_operations == 1:
+        axes = axes.reshape(1, 2)
+
+    for row_idx, operation in enumerate(operations):
         operation_df = df[df["operation"] == operation]
 
-        for ax, cache_level, metric_col in [
-            (ax1, "L1", "l1_hit_rate"),
-            (ax2, "L2", "l2_hit_rate"),
-        ]:
+        for col_idx, (cache_level, metric_col) in enumerate(
+            [
+                ("L1", "l1_hit_rate"),
+                ("L2", "l2_hit_rate"),
+            ]
+        ):
+            ax = axes[row_idx, col_idx]
+
             for filter_type in sorted(operation_df["filter"].unique()):
                 filter_df = operation_df[operation_df["filter"] == filter_type]
                 filter_df = filter_df.sort_values("capacity")
@@ -227,33 +240,42 @@ def main(
                     marker=style.get("marker", "o"),
                 )
 
-            ax.set_xlabel("Capacity (elements)", fontsize=12, fontweight="bold")
-            ax.set_ylabel(f"{cache_level} Hit Rate (%)", fontsize=12, fontweight="bold")
+            # Only show x-axis label on bottom row
+            if row_idx == n_operations - 1:
+                ax.set_xlabel("Capacity (elements)", fontsize=12, fontweight="bold")
+
+            # Only show y-axis label on left column
+            if col_idx == 0:
+                ax.set_ylabel("Hit Rate (%)", fontsize=12, fontweight="bold")
+
             ax.set_title(
-                f"{cache_level} Cache Hit Rate",
+                f"{cache_level} Cache - {operation.capitalize()}",
                 fontsize=14,
                 fontweight="bold",
             )
             ax.set_xscale("log", base=2)
             ax.grid(True, which="both", ls="--", alpha=0.3)
-            ax.legend(fontsize=11, loc="best", framealpha=0)
             ax.set_ylim(0, 105)
 
-        plt.suptitle(
-            f"Cache Hit Rate Comparison - {operation.capitalize()} Operation",
-            fontsize=16,
-            fontweight="bold",
-            y=1.00,
-        )
-        plt.tight_layout()
+            # Only show legend on the top-right subplot
+            if row_idx == 0 and col_idx == 1:
+                ax.legend(fontsize=11, loc="best", framealpha=0)
 
-        output_file = output_dir / f"cache_overview_{operation}.png"
-        plt.savefig(output_file, dpi=150, bbox_inches="tight", transparent=True)
-        typer.secho(
-            f"Overview {operation} plot saved to {output_file}",
-            fg=typer.colors.GREEN,
-        )
-        plt.close()
+    plt.suptitle(
+        "Cache Hit Rate Comparison",
+        fontsize=18,
+        fontweight="bold",
+        y=1.00,
+    )
+    plt.tight_layout()
+
+    output_file = output_dir / "cache_overview.png"
+    plt.savefig(output_file, dpi=150, bbox_inches="tight", transparent=True)
+    typer.secho(
+        f"Overview plot saved to {output_file}",
+        fg=typer.colors.GREEN,
+    )
+    plt.close()
 
 
 if __name__ == "__main__":
