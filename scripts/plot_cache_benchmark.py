@@ -257,9 +257,32 @@ def main(
             ax.grid(True, which="both", ls="--", alpha=0.3)
             ax.set_ylim(0, 105)
 
-            # Only show legend on the top-right subplot
-            if row_idx == 0 and col_idx == 1:
-                ax.legend(fontsize=11, loc="best", framealpha=0)
+    # Create a unified legend with all filters (not just those in a single operation)
+    all_filter_types = sorted(df["filter"].unique())
+    legend_handles = []
+    legend_labels = []
+    for filter_type in all_filter_types:
+        style = filter_styles.get(filter_type, {})
+        handle = plt.Line2D(
+            [0],
+            [0],
+            color=style.get("color", "black"),
+            marker=style.get("marker", "o"),
+            linewidth=2.5,
+            markersize=8,
+            label=get_filter_display_name(filter_type),
+        )
+        legend_handles.append(handle)
+        legend_labels.append(get_filter_display_name(filter_type))
+
+    # Add legend to top-right subplot
+    axes[0, 1].legend(
+        handles=legend_handles,
+        labels=legend_labels,
+        fontsize=11,
+        loc="best",
+        framealpha=0,
+    )
 
     plt.suptitle(
         "Cache Hit Rate Comparison",
