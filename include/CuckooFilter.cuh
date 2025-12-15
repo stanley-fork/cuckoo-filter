@@ -38,6 +38,8 @@ enum class EvictionPolicy {
  * @tparam blockSize_ CUDA block size for kernels.
  * @tparam bucketSize_ Number of slots per bucket.
  * @tparam AltBucketPolicy_ Policy for calculating alternate bucket indices.
+ * @tparam evictionPolicy_ Policy for eviction during insertion (DFS or BFS).
+ * @tparam WordType_ The atomic word type for bucket storage (uint32_t or uint64_t).
  */
 template <
     typename T,
@@ -46,7 +48,8 @@ template <
     size_t blockSize_ = 256,
     size_t bucketSize_ = 16,
     template <typename, typename, size_t, size_t> class AltBucketPolicy_ = XorAltBucketPolicy,
-    EvictionPolicy evictionPolicy_ = EvictionPolicy::DFS>
+    EvictionPolicy evictionPolicy_ = EvictionPolicy::DFS,
+    typename WordType_ = uint64_t>
 struct CuckooConfig {
     using KeyType = T;
     static constexpr size_t bitsPerTag = bitsPerTag_;
@@ -59,6 +62,13 @@ struct CuckooConfig {
         bitsPerTag <= 8,
         uint8_t,
         typename std::conditional<bitsPerTag <= 16, uint16_t, uint32_t>::type>::type;
+
+    using WordType = WordType_;
+    static_assert(
+        std::is_same_v<WordType, uint32_t> || std::is_same_v<WordType, uint64_t>,
+        "WordType must be uint32_t or uint64_t"
+    );
+    static_assert(sizeof(TagType) <= sizeof(WordType), "TagType must fit within WordType");
 
     using AltBucketPolicy = AltBucketPolicy_<KeyType, TagType, bitsPerTag, bucketSize_>;
 };
@@ -206,8 +216,8 @@ struct CuckooFilter {
 
     /**
      * @brief Bucket structure that holds the fingerprint and tags for a given bucket.
-     * The bucket is divided into words of 64 bits each, where each word is made up of at least two
-     * fingerprints. How many depends on the fingerprint size specified by the user of the filter.
+     * The bucket is divided into words, where each word contains one or more fingerprints
+     * depending on tag size.
      *
      * This optimisation allows us to avoid having to perform atomic operations on every fingerprint
      * in the bucket, the extra computational overhead is negligible.
@@ -218,28 +228,29 @@ struct CuckooFilter {
      */
     struct Bucket {
         static_assert(powerOfTwo(bitsPerTag), "bitsPerTag must be a power of 2");
-        static constexpr size_t tagsPerWord = sizeof(uint64_t) / sizeof(TagType);
-        static_assert(
-            bucketSize % tagsPerWord == 0,
-            "bucketSize must be divisible by tagsPerAtomic"
-        );
-        static_assert(powerOfTwo(tagsPerWord), "tagsPerAtomic must be a power of 2");
+
+        using WordType = typename Config::WordType;
+
+        static constexpr size_t tagsPerWord = sizeof(WordType) / sizeof(TagType);
+        static_assert(tagsPerWord >= 1, "TagType must fit within WordType");
+        static_assert(bucketSize % tagsPerWord == 0, "bucketSize must be divisible by tagsPerWord");
+        static_assert(powerOfTwo(tagsPerWord), "tagsPerWord must be a power of 2");
 
         static constexpr size_t wordCount = bucketSize / tagsPerWord;
-        static_assert(powerOfTwo(wordCount), "atomicCount must be a power of 2");
+        static_assert(powerOfTwo(wordCount), "wordCount must be a power of 2");
 
-        cuda::std::atomic<uint64_t> packedTags[wordCount];
+        cuda::std::atomic<WordType> packedTags[wordCount];
 
         __host__ __device__ __forceinline__ TagType
-        extractTag(uint64_t packed, size_t tagIdx) const {
+        extractTag(WordType packed, size_t tagIdx) const {
             return static_cast<TagType>((packed >> (tagIdx * bitsPerTag)) & fpMask);
         }
 
-        __host__ __device__ __forceinline__ uint64_t
-        replaceTag(uint64_t packed, size_t tagIdx, TagType newTag) const {
+        __host__ __device__ __forceinline__ WordType
+        replaceTag(WordType packed, size_t tagIdx, TagType newTag) const {
             size_t shift = tagIdx * bitsPerTag;
-            uint64_t cleared = packed & ~(static_cast<uint64_t>(fpMask) << shift);
-            return cleared | (static_cast<uint64_t>(newTag) << shift);
+            WordType cleared = packed & ~(static_cast<WordType>(fpMask) << shift);
+            return cleared | (static_cast<WordType>(newTag) << shift);
         }
 
         /**
@@ -252,34 +263,84 @@ struct CuckooFilter {
          */
         __device__ bool contains(TagType tag) {
             const uint32_t startSlot = tag & (bucketSize - 1);
-            const size_t startAtomicIdx = startSlot / tagsPerWord;
+            const size_t startWordIdx = startSlot / tagsPerWord;
 
-            if constexpr (wordCount >= 2) {
-                // round down to the nearest even number
-                const size_t startPairIdx = startAtomicIdx & ~1;
-                const uint64_t replicatedTag = replicateTag(tag);
+            // 32-bit atomics
+            if constexpr (sizeof(WordType) == 4) {
+                const uint32_t replicatedTag = replicateTag32<TagType>(tag);
 
-                for (size_t i = 0; i < wordCount / 2; i++) {
-                    const size_t pairIdx = (startPairIdx + i * 2) & (wordCount - 1);
+                if constexpr (wordCount >= 4) {
+                    // Round down to nearest multiple of 4
+                    const size_t startQuadIdx = startWordIdx & ~3;
 
-                    const auto vec =
-                        __ldg(reinterpret_cast<const ulonglong2*>(&packedTags[pairIdx]));
-                    const uint64_t loaded[2] = {vec.x, vec.y};
+                    for (size_t i = 0; i < wordCount / 4; i++) {
+                        const size_t quadIdx = (startQuadIdx + i * 4) & (wordCount - 1);
 
-                    _Pragma("unroll")
-                    for (auto packed : loaded) {
-                        if (hasZero<TagType>(packed ^ replicatedTag)) {
-                            return true;
+                        const auto vec =
+                            __ldg(reinterpret_cast<const uint4*>(&packedTags[quadIdx]));
+                        const uint32_t loaded[4] = {vec.x, vec.y, vec.z, vec.w};
+
+                        _Pragma("unroll")
+                        for (auto packed : loaded) {
+                            if (hasZero32<TagType>(packed ^ replicatedTag)) {
+                                return true;
+                            }
                         }
+                    }
+                } else if constexpr (wordCount >= 2) {
+                    // Load 2 words at once
+                    const size_t startPairIdx = startWordIdx & ~1;
+
+                    for (size_t i = 0; i < wordCount / 2; i++) {
+                        const size_t pairIdx = (startPairIdx + i * 2) & (wordCount - 1);
+
+                        const auto vec =
+                            __ldg(reinterpret_cast<const uint2*>(&packedTags[pairIdx]));
+                        const uint32_t loaded[2] = {vec.x, vec.y};
+
+                        _Pragma("unroll")
+                        for (auto packed : loaded) {
+                            if (hasZero32<TagType>(packed ^ replicatedTag)) {
+                                return true;
+                            }
+                        }
+                    }
+                } else {
+                    // Single word
+                    const auto packed = reinterpret_cast<const uint32_t&>(packedTags[0]);
+                    if (hasZero32<TagType>(packed ^ replicatedTag)) {
+                        return true;
                     }
                 }
             } else {
-                // just check the single atomic
-                const auto packed = reinterpret_cast<const uint64_t&>(packedTags[0]);
+                // 64-bit atomics
                 const uint64_t replicatedTag = replicateTag(tag);
 
-                if (hasZero<TagType>(packed ^ replicatedTag)) {
-                    return true;
+                if constexpr (wordCount >= 2) {
+                    // round down to the nearest even number
+                    const size_t startPairIdx = startWordIdx & ~1;
+
+                    for (size_t i = 0; i < wordCount / 2; i++) {
+                        const size_t pairIdx = (startPairIdx + i * 2) & (wordCount - 1);
+
+                        const auto vec =
+                            __ldg(reinterpret_cast<const ulonglong2*>(&packedTags[pairIdx]));
+                        const uint64_t loaded[2] = {vec.x, vec.y};
+
+                        _Pragma("unroll")
+                        for (auto packed : loaded) {
+                            if (hasZero<TagType>(packed ^ replicatedTag)) {
+                                return true;
+                            }
+                        }
+                    }
+                } else {
+                    // just check the single atomic
+                    const auto packed = reinterpret_cast<const uint64_t&>(packedTags[0]);
+
+                    if (hasZero<TagType>(packed ^ replicatedTag)) {
+                        return true;
+                    }
                 }
             }
 
@@ -723,15 +784,20 @@ struct CuckooFilter {
         const uint32_t startSlot = tag & (bucketSize - 1);
         const size_t startWord = startSlot / Bucket::tagsPerWord;
 
-        const uint64_t replicatedTag = replicateTag(tag);
-
         for (size_t i = 0; i < Bucket::wordCount; ++i) {
             const size_t currIdx = (startWord + i) & (Bucket::wordCount - 1);
 
             while (true) {
-                uint64_t expected = bucket.packedTags[currIdx].load(cuda::memory_order_relaxed);
+                auto expected = bucket.packedTags[currIdx].load(cuda::memory_order_relaxed);
 
-                uint64_t matchMask = getZeroMask<TagType>(expected ^ replicatedTag);
+                typename Bucket::WordType matchMask;
+                if constexpr (sizeof(typename Bucket::WordType) == 4) {
+                    const uint32_t replicatedTag = replicateTag32<TagType>(tag);
+                    matchMask = getZeroMask32<TagType>(expected ^ replicatedTag);
+                } else {
+                    const uint64_t replicatedTag = replicateTag(tag);
+                    matchMask = getZeroMask<TagType>(expected ^ replicatedTag);
+                }
 
                 if (matchMask == 0) {
                     // No matching tags in this word
@@ -739,10 +805,15 @@ struct CuckooFilter {
                 }
 
                 // Find position of first matching tag
-                int bitPos = __ffsll(static_cast<long long>(matchMask)) - 1;
+                int bitPos;
+                if constexpr (sizeof(typename Bucket::WordType) == 4) {
+                    bitPos = __ffs(static_cast<int>(matchMask)) - 1;
+                } else {
+                    bitPos = __ffsll(static_cast<long long>(matchMask)) - 1;
+                }
                 size_t tagIdx = bitPos / bitsPerTag;
 
-                uint64_t desired = bucket.replaceTag(expected, tagIdx, EMPTY);
+                auto desired = bucket.replaceTag(expected, tagIdx, EMPTY);
 
                 if (bucket.packedTags[currIdx].compare_exchange_weak(
                         expected, desired, cuda::memory_order_relaxed, cuda::memory_order_relaxed
@@ -779,7 +850,12 @@ struct CuckooFilter {
                 retryWord = false;
 
                 // check for any empty slot in this word
-                uint64_t zeroMask = getZeroMask<TagType>(expected);
+                typename Bucket::WordType zeroMask;
+                if constexpr (sizeof(typename Bucket::WordType) == 4) {
+                    zeroMask = getZeroMask32<TagType>(expected);
+                } else {
+                    zeroMask = getZeroMask<TagType>(expected);
+                }
 
                 if (zeroMask == 0) {
                     // No empty slots in this word, move to next
@@ -787,7 +863,12 @@ struct CuckooFilter {
                 }
 
                 // Find position of first empty slot (returns 1-indexed bit position)
-                int bitPos = __ffsll(static_cast<long long>(zeroMask)) - 1;
+                int bitPos;
+                if constexpr (sizeof(typename Bucket::WordType) == 4) {
+                    bitPos = __ffs(static_cast<int>(zeroMask)) - 1;
+                } else {
+                    bitPos = __ffsll(static_cast<long long>(zeroMask)) - 1;
+                }
                 size_t j = bitPos / bitsPerTag;
 
                 auto desired = bucket.replaceTag(expected, j, tag);
@@ -828,7 +909,7 @@ struct CuckooFilter {
 
             Bucket& bucket = d_buckets[currentBucket];
             auto expected = bucket.packedTags[evictWord].load(cuda::memory_order_relaxed);
-            uint64_t desired;
+            typename Bucket::WordType desired;
             TagType evictedFp;
 
             do {

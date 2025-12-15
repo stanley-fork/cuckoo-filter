@@ -119,6 +119,62 @@ __host__ __device__ __forceinline__ constexpr uint64_t replicateTag(T tag) {
     }
 }
 
+
+/**
+ * @brief Returns a bitmask indicating which slots in a 32-bit packed word are zero.
+ *
+ * Uses SWAR (SIMD Within A Register) to check multiple items in parallel.
+ * The high bit of each slot that is zero will be set in the result.
+ *
+ * @tparam T The type of the individual items (uint8_t, uint16_t, or uint32_t)
+ * @param v The packed 32-bit integer
+ * @return A bitmask with the high bit of each zero slot set
+ */
+template <typename T>
+__host__ __device__ __forceinline__ constexpr uint32_t getZeroMask32(uint32_t v) {
+    if constexpr (sizeof(T) == 1) {
+        return (v - 0x01010101U) & ~v & 0x80808080U;
+    } else if constexpr (sizeof(T) == 2) {
+        return (v - 0x00010001U) & ~v & 0x80008000U;
+    } else if constexpr (sizeof(T) == 4) {
+        return (v - 0x00000001U) & ~v & 0x80000000U;
+    } else {
+        return 0;
+    }
+}
+
+/**
+ * @brief Checks if a 32-bit packed word contains a zero byte/word.
+ *
+ * @tparam T The type of the individual items (uint8_t, uint16_t, or uint32_t)
+ * @param v The packed 32-bit integer
+ * @return true if any of the items in v are zero
+ */
+template <typename T>
+__host__ __device__ __forceinline__ constexpr bool hasZero32(uint32_t v) {
+    return getZeroMask32<T>(v) != 0;
+}
+
+/**
+ * @brief Replicates a tag value across all slots in a 32-bit word.
+ *
+ * @tparam T The type of the tag (uint8_t, uint16_t, or uint32_t)
+ * @param tag The tag value to replicate
+ * @return A 32-bit word with the tag replicated in every slot
+ */
+template <typename T>
+__host__ __device__ __forceinline__ constexpr uint32_t replicateTag32(T tag) {
+    if constexpr (sizeof(T) == 1) {
+        return static_cast<uint32_t>(tag) * 0x01010101U;
+    } else if constexpr (sizeof(T) == 2) {
+        return static_cast<uint32_t>(tag) * 0x00010001U;
+    } else if constexpr (sizeof(T) == 4) {
+        return static_cast<uint32_t>(tag);
+    } else {
+        return tag;
+    }
+}
+
 /**
  * @brief Integer division with rounding up (ceiling).
  */

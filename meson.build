@@ -249,6 +249,15 @@ if get_option('BUILD_BENCHMARKS') == true
         install: false,
     )
 
+    executable(
+        'benchmark-cuckoo-atomics',
+        './benchmark/cuckoo_atomics_comparison.cu',
+        dependencies: bench_deps,
+        include_directories: includes,
+        cuda_args: cuda_args,
+        install: false,
+    )
+
 
     if nccl_dep.found()
         executable(
