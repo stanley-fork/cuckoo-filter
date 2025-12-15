@@ -19,7 +19,8 @@ app = typer.Typer()
 def main(
     output: Path = typer.Option(
         Path("build/fpr_sweep.csv"),
-        "--output", "-o",
+        "--output",
+        "-o",
         help="Output CSV file path",
     ),
 ):
@@ -49,7 +50,12 @@ def main(
             csv_path = f.name
 
         result = subprocess.run(
-            [str(bench_path), f"--benchmark_out={csv_path}", "--benchmark_out_format=csv", "--benchmark_format=csv"],
+            [
+                str(bench_path),
+                f"--benchmark_out={csv_path}",
+                "--benchmark_out_format=csv",
+                "--benchmark_format=csv",
+            ],
         )
 
         if result.returncode != 0:

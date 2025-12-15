@@ -268,6 +268,15 @@ if get_option('BUILD_BENCHMARKS') == true
             cuda_args: cuda_args,
             install: false,
         )
+
+        executable(
+            'benchmark-multi-gpu-scaling',
+            './benchmark/multi_gpu_scaling_benchmark.cu',
+            dependencies: bench_deps + [nccl_dep],
+            include_directories: includes,
+            cuda_args: cuda_args,
+            install: false,
+        )
     endif
 endif
 
