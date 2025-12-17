@@ -15,44 +15,7 @@ using PackedTagType = typename Filter::PackedTagType;
 
 static constexpr double LOAD_FACTOR = 0.95;
 
-class CF : public benchmark::Fixture {
-    using benchmark::Fixture::SetUp;
-    using benchmark::Fixture::TearDown;
-
-   public:
-    void SetUp(const benchmark::State& state) override {
-        auto [cap, num] = calculateCapacityAndSize(state.range(0), LOAD_FACTOR);
-        capacity = cap;
-        n = num;
-
-        d_keys.resize(n);
-        d_output.resize(n);
-        generateKeysGPU(d_keys);
-
-        filter = std::make_unique<Filter>(capacity);
-        filterMemory = filter->sizeInBytes();
-    }
-
-    void TearDown(const benchmark::State&) override {
-        filter.reset();
-        d_keys.clear();
-        d_keys.shrink_to_fit();
-        d_output.clear();
-        d_output.shrink_to_fit();
-    }
-
-    void setCounters(benchmark::State& state) const {
-        setCommonCounters(state, filterMemory, n);
-    }
-
-    size_t capacity;
-    size_t n;
-    size_t filterMemory;
-    thrust::device_vector<uint64_t> d_keys;
-    thrust::device_vector<uint8_t> d_output;
-    std::unique_ptr<Filter> filter;
-    GPUTimer timer;
-};
+using CF = CuckooFilterFixture<Config>;
 
 BENCHMARK_DEFINE_F(CF, InsertUnsorted)(bm::State& state) {
     for (auto _ : state) {
