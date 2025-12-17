@@ -17,8 +17,8 @@
  * @brief Eviction policy for the Cuckoo Filter.
  */
 enum class EvictionPolicy {
-    DFS,  ///< Pure depth-first search (default)
-    BFS   ///< Breadth-first search with DFS fallback
+    BFS,  ///< Breadth-first search with DFS fallback (default)
+    DFS   ///< Pure depth-first search
 };
 
 #if __has_include(<thrust/device_vector.h>)

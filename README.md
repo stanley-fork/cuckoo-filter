@@ -74,7 +74,7 @@ The `CuckooConfig` template accepts the following parameters:
 | `blockSize`       | CUDA block size                          | 256                  |
 | `bucketSize`      | Slots per bucket (must be power of 2)    | 16                   |
 | `AltBucketPolicy` | Alternate bucket calculation policy      | `XorAltBucketPolicy` |
-| `evictionPolicy`  | Eviction strategy (DFS or BFS)           | `DFS`                |
+| `evictionPolicy`  | Eviction strategy (DFS or BFS)           | `BFS`                |
 | `WordType`        | Atomic type (uint32_t or uint64_t)       | `uint64_t`           |
 
 ## Multi-GPU Support
