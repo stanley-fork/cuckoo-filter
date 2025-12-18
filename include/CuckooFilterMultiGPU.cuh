@@ -17,7 +17,6 @@
 #include <vector>
 #include "CuckooFilter.cuh"
 #include "helpers.cuh"
-#include "subprojects/gossip/include/gossip/config.h"
 
 #include <gossip.cuh>
 #include <plan_parser.hpp>
@@ -153,9 +152,9 @@ class CuckooFilterMultiGPU {
             return returnOccupied ? totalOccupiedSlots() : 0;
         }
 
-        // Calculate per-GPU allocation with safety margin for gossip transfers
-        const float memoryFactor = 1.5f;  // gossip recommends this for random distributions
-        const size_t perGPUCapacity =
+        // gossip recommends this for random distributions
+        const float memoryFactor = 1.5f;
+        const auto perGPUCapacity =
             static_cast<size_t>(std::ceil(static_cast<double>(n) / numGPUs * memoryFactor));
 
         ensureBufferCapacity(perGPUCapacity);
@@ -220,34 +219,21 @@ class CuckooFilterMultiGPU {
         );
         all2all.sync();
 
-        // Phase 4: Execute filter operations locally on each GPU
-        // Each GPU now has all keys that hash to it
-        std::vector<thrust::device_vector<bool>> d_results(numGPUs);
-
-        parallelForGPUs([&](size_t gpuId) {
-            size_t localCount = recvCounts[gpuId];
-            if (localCount == 0)
-                return;
-
-            // Wrap raw pointer in thrust device vector for filter operation
-            thrust::device_vector<T> d_localKeys(dstBuffers[gpuId], dstBuffers[gpuId] + localCount);
-
-            if constexpr (hasOutput) {
-                d_results[gpuId].resize(localCount);
-            }
-
-            auto stream = gossipContext.get_streams(gpuId)[0];
-            filterOp(filters[gpuId], d_localKeys, d_results[gpuId], stream);
-        });
-        gossipContext.sync_all_streams();
-
-        // If no output is required, we're done
+        // If no output is required, execute filter ops and we're done
         if constexpr (!hasOutput) {
+            parallelForGPUs([&](size_t gpuId) {
+                size_t localCount = recvCounts[gpuId];
+                if (localCount == 0) {
+                    return;
+                }
+                auto stream = gossipContext.get_streams(gpuId)[0];
+                filterOp(filters[gpuId], dstBuffers[gpuId], nullptr, localCount, stream);
+            });
+            gossipContext.sync_all_streams();
             return returnOccupied ? totalOccupiedSlots() : 0;
         }
 
-        // Phase 5: Reverse all-to-all to send results back
-        // We need to transpose the partition table for the reverse direction
+        // Phase 4: Prepare result buffers and transpose table for reverse all-to-all
         std::vector<std::vector<size_t>> reverseTable(numGPUs, std::vector<size_t>(numGPUs));
         for (size_t src = 0; src < numGPUs; ++src) {
             for (size_t dst = 0; dst < numGPUs; ++dst) {
@@ -255,7 +241,6 @@ class CuckooFilterMultiGPU {
             }
         }
 
-        // Allocate bool buffers for result transfer
         std::vector<bool*> resultSrcPtrs(numGPUs);
         std::vector<bool*> resultDstPtrs(numGPUs);
 
@@ -265,17 +250,19 @@ class CuckooFilterMultiGPU {
                 cudaMalloc(&resultSrcPtrs[gpuId], std::max(localCount, size_t(1)) * sizeof(bool))
             );
             CUDA_CALL(cudaMalloc(&resultDstPtrs[gpuId], perGPUCapacity * sizeof(bool)));
-
-            if (localCount > 0) {
-                CUDA_CALL(cudaMemcpy(
-                    resultSrcPtrs[gpuId],
-                    thrust::raw_pointer_cast(d_results[gpuId].data()),
-                    localCount * sizeof(bool),
-                    cudaMemcpyDeviceToDevice
-                ));
-            }
         });
         gossipContext.sync_hard();
+
+        // Phase 5: Execute filter operations, writing results directly to resultSrcPtrs
+        parallelForGPUs([&](size_t gpuId) {
+            size_t localCount = recvCounts[gpuId];
+            if (localCount == 0) {
+                return;
+            }
+            auto stream = gossipContext.get_streams(gpuId)[0];
+            filterOp(filters[gpuId], dstBuffers[gpuId], resultSrcPtrs[gpuId], localCount, stream);
+        });
+        gossipContext.sync_all_streams();
 
         // Use a second all2all instance for bool results (reuse context)
         gossip::all2all_t all2all_results(gossipContext, gossip::all2all::default_plan(numGPUs));
@@ -295,8 +282,9 @@ class CuckooFilterMultiGPU {
 
         parallelForGPUs([&](size_t gpuId) {
             size_t localCount = returnCounts[gpuId];
-            if (localCount == 0)
+            if (localCount == 0) {
                 return;
+            }
 
             std::vector<uint8_t> h_localResults(localCount);
             CUDA_CALL(cudaMemcpy(
@@ -413,9 +401,10 @@ class CuckooFilterMultiGPU {
             h_keys,
             nullptr,
             [](CuckooFilter<Config>* filter,
-               const thrust::device_vector<T>& keys,
-               thrust::device_vector<bool>& /*unused_results*/,
-               cudaStream_t stream) { filter->insertMany(keys, stream); }
+               const T* keys,
+               bool* /*unused_results*/,
+               size_t count,
+               cudaStream_t stream) { filter->insertMany(keys, count, stream); }
         );
     }
 
@@ -429,9 +418,10 @@ class CuckooFilterMultiGPU {
             h_keys,
             &h_output,
             [](CuckooFilter<Config>* filter,
-               const thrust::device_vector<T>& keys,
-               thrust::device_vector<bool>& results,
-               cudaStream_t stream) { filter->containsMany(keys, results, stream); }
+               const T* keys,
+               bool* results,
+               size_t count,
+               cudaStream_t stream) { filter->containsMany(keys, count, results, stream); }
         );
     }
 
@@ -446,9 +436,27 @@ class CuckooFilterMultiGPU {
             h_keys,
             &h_output,
             [](CuckooFilter<Config>* filter,
-               const thrust::device_vector<T>& keys,
-               thrust::device_vector<bool>& results,
-               cudaStream_t stream) { filter->deleteMany(keys, results, stream); }
+               const T* keys,
+               bool* results,
+               size_t count,
+               cudaStream_t stream) { filter->deleteMany(keys, count, results, stream); }
+        );
+    }
+
+    /**
+     * @brief Deletes multiple keys from the filter without returning per-key results.
+     * @param h_keys The keys to delete.
+     * @return The total number of occupied slots across all GPUs after deletion.
+     */
+    size_t deleteMany(const thrust::host_vector<T>& h_keys) {
+        return executeOperation<true, false>(
+            h_keys,
+            nullptr,
+            [](CuckooFilter<Config>* filter,
+               const T* keys,
+               bool* /*unused_results*/,
+               size_t count,
+               cudaStream_t stream) { filter->deleteMany(keys, count, nullptr, stream); }
         );
     }
 
