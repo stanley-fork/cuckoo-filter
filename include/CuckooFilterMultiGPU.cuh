@@ -333,10 +333,10 @@ class CuckooFilterMultiGPU {
 
         filters.resize(numGPUs);
 
-        parallelForGPUs([&](size_t i) {
-            CUDA_CALL(cudaSetDevice(i));
+        for (size_t i = 0; i < numGPUs; ++i) {
+            CUDA_CALL(cudaSetDevice(gossipContext.get_device_id(i)));
             filters[i] = new CuckooFilter<Config>(capacityPerGPU);
-        });
+        }
         gossipContext.sync_hard();
     }
 
@@ -367,10 +367,10 @@ class CuckooFilterMultiGPU {
 
         filters.resize(numGPUs);
 
-        parallelForGPUs([&](size_t i) {
-            CUDA_CALL(cudaSetDevice(i));
+        for (size_t i = 0; i < numGPUs; ++i) {
+            CUDA_CALL(cudaSetDevice(gossipContext.get_device_id(i)));
             filters[i] = new CuckooFilter<Config>(capacityPerGPU);
-        });
+        }
         gossipContext.sync_hard();
     }
 
@@ -381,10 +381,10 @@ class CuckooFilterMultiGPU {
      */
     ~CuckooFilterMultiGPU() {
         freeBuffers();
-        parallelForGPUs([&](size_t i) {
-            CUDA_CALL(cudaSetDevice(i));
+        for (size_t i = 0; i < numGPUs; ++i) {
+            CUDA_CALL(cudaSetDevice(gossipContext.get_device_id(i)));
             delete filters[i];
-        });
+        }
     }
 
     CuckooFilterMultiGPU(const CuckooFilterMultiGPU&) = delete;
@@ -480,8 +480,8 @@ class CuckooFilterMultiGPU {
     void parallelForGPUs(Func func) const {
         std::vector<std::thread> threads;
         for (size_t i = 0; i < numGPUs; ++i) {
-            threads.emplace_back([=]() {
-                CUDA_CALL(cudaSetDevice(i));
+            threads.emplace_back([=, this]() {
+                CUDA_CALL(cudaSetDevice(gossipContext.get_device_id(i)));
                 func(i);
             });
         }
