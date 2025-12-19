@@ -323,7 +323,7 @@ struct CuckooFilter {
                 for (size_t i = 0; i < wordCount / 4; i++) {
                     const size_t idx = (startQuadIdx + i * 4) & (wordCount - 1);
                     WordType loaded[4];
-                    load128Bit<4>(idx, loaded);
+                    load128Bit(idx, loaded);
                     if (checkWords(loaded, replicatedTag)) {
                         return true;
                     }
@@ -334,7 +334,7 @@ struct CuckooFilter {
                 for (size_t i = 0; i < wordCount / 2; i++) {
                     const size_t idx = (startPairIdx + i * 2) & (wordCount - 1);
                     WordType loaded[2];
-                    load128Bit<2>(idx, loaded);
+                    load128Bit(idx, loaded);
                     if (checkWords(loaded, replicatedTag)) {
                         return true;
                     }
