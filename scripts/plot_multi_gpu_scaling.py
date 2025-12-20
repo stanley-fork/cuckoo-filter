@@ -59,8 +59,36 @@ def load_and_parse_csv(csv_path: Path) -> pd.DataFrame:
     parsed = df["name"].apply(parse_benchmark_name)
     df["operation"] = parsed.apply(lambda x: x["operation"])
     df["fixture"] = parsed.apply(lambda x: x["fixture"])
-    df["throughput_mops"] = df["items_per_second"] / 1e6
     df["gpus"] = df["gpus"].astype(int)
+    df["throughput_mops"] = df["items_per_second"] / 1e6
+
+    return df
+
+
+def normalize_by_baseline(df: pd.DataFrame, baseline_gpus: int = 2) -> pd.DataFrame:
+    """Normalize time and throughput values so that baseline_gpus has value 1.0."""
+    df = df.copy()
+
+    for fixture in df["fixture"].unique():
+        for operation in df["operation"].unique():
+            mask = (df["fixture"] == fixture) & (df["operation"] == operation)
+            baseline_mask = mask & (df["gpus"] == baseline_gpus)
+
+            if baseline_mask.sum() > 0:
+                # Normalize time
+                baseline_time = df.loc[baseline_mask, "real_time"].values[0]
+                df.loc[mask, "normalized_time"] = (
+                    df.loc[mask, "real_time"] / baseline_time
+                )
+                # Normalize throughput
+                baseline_throughput = df.loc[baseline_mask, "throughput_mops"].values[0]
+                df.loc[mask, "normalized_throughput"] = (
+                    df.loc[mask, "throughput_mops"] / baseline_throughput
+                )
+            else:
+                # No baseline found, use raw values
+                df.loc[mask, "normalized_time"] = df.loc[mask, "real_time"]
+                df.loc[mask, "normalized_throughput"] = df.loc[mask, "throughput_mops"]
 
     return df
 
@@ -70,6 +98,7 @@ def plot_scaling_on_axis(
     df: pd.DataFrame,
     scaling_mode: str,
     show_xlabel: bool = True,
+    baseline_gpus: int = 2,
 ) -> list:
     """Plot scaling results on a single axis. Returns legend elements."""
     # Filter to this scaling mode
@@ -94,13 +123,24 @@ def plot_scaling_on_axis(
     bar_width = 0.25
     group_width = bar_width * n_operations + 0.15
 
+    # Choose metric based on scaling mode
+    # Weak scaling: normalized throughput (higher = better, ideal = n GPUs / baseline GPUs)
+    # Strong scaling: normalized time (lower = better, ideal = baseline GPUs / n GPUs)
+    use_throughput = scaling_mode == "weak"
+
     for gpu_idx, gpu_count in enumerate(gpu_counts):
         gpu_data = mode_df[mode_df["gpus"] == gpu_count]
         group_center = gpu_idx * group_width
 
         for op_idx, operation in enumerate(operations):
             op_data = gpu_data[gpu_data["operation"] == operation]
-            throughput = op_data["throughput_mops"].max() if len(op_data) > 0 else 0
+
+            if use_throughput:
+                value = (
+                    op_data["normalized_throughput"].max() if len(op_data) > 0 else 0
+                )
+            else:
+                value = op_data["normalized_time"].max() if len(op_data) > 0 else 0
 
             x_pos = group_center + (op_idx - 1) * bar_width
 
@@ -116,7 +156,7 @@ def plot_scaling_on_axis(
 
             ax.bar(
                 x_pos,
-                throughput,
+                value,
                 bar_width,
                 color=pu.OPERATION_COLORS.get(operation, "#999999"),
                 edgecolor="white",
@@ -132,7 +172,11 @@ def plot_scaling_on_axis(
 
     if show_xlabel:
         ax.set_xlabel("Number of GPUs", fontsize=14, fontweight="bold")
-    ax.set_ylabel("Throughput [M ops/s]", fontsize=14, fontweight="bold")
+
+    if use_throughput:
+        ax.set_ylabel("Normalized Throughput", fontsize=14, fontweight="bold")
+    else:
+        ax.set_ylabel("Normalized Time", fontsize=14, fontweight="bold")
 
     # Build title with capacity info
     if (
@@ -202,6 +246,7 @@ def main(
         raise typer.Exit(1)
 
     df = load_and_parse_csv(csv_file)
+    df = normalize_by_baseline(df, baseline_gpus=2)
 
     output_dir = pu.resolve_output_dir(output_dir, Path(__file__))
 
