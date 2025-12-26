@@ -50,9 +50,13 @@ class CuckooFilterMultiGPU {
         }
     };
 
+    /// Default fraction of free GPU memory to use for buffers (after filter allocation)
+    static constexpr float defaultMemoryFactor = 0.8f;
+
    private:
     size_t numGPUs;
     size_t capacityPerGPU;
+    float memoryFactor;
     std::vector<CuckooFilter<Config>*> filters;
 
     gossip::context_t gossipContext;
@@ -65,9 +69,10 @@ class CuckooFilterMultiGPU {
     std::vector<T*> dstBuffers;
     std::vector<size_t> bufferCapacities;
 
-    std::vector<size_t> resultBufferCapacities;
     std::vector<bool*> resultSrcBuffers;
     std::vector<bool*> resultDstBuffers;
+
+    size_t totalBufferCapacity;
 
     /**
      * @brief Gets the available free memory for each GPU.
@@ -84,68 +89,62 @@ class CuckooFilterMultiGPU {
     }
 
     /**
-     * @brief Ensures per-GPU buffers have sufficient capacity.
-     * @param requiredPerGPU Required capacity for each GPU's buffer.
+     * @brief Pre-allocates buffers on each GPU based on available VRAM.
+     *
+     * Called after filter allocation. Each GPU gets buffers sized proportionally
+     * to its available free memory. This allows processing large datasets in chunks
+     * without requiring buffer reallocation.
      */
-    void ensureBufferCapacity(size_t requiredPerGPU) {
-        for (size_t gpu = 0; gpu < numGPUs; ++gpu) {
-            cudaSetDevice(gossipContext.get_device_id(gpu));
+    void allocateBuffers() {
+        // Bytes per element: 2 key buffers (src + dst) + 2 result buffers (src + dst)
+        const size_t bytesPerKey = 2 * sizeof(T) + 2 * sizeof(bool);
 
-            // Key buffers
-            if (bufferCapacities[gpu] < requiredPerGPU) {
-                if (srcBuffers[gpu]) {
-                    cudaFree(srcBuffers[gpu]);
-                }
-                if (dstBuffers[gpu]) {
-                    cudaFree(dstBuffers[gpu]);
-                }
+        totalBufferCapacity = 0;
 
-                CUDA_CALL(cudaMalloc(&srcBuffers[gpu], requiredPerGPU * sizeof(T)));
-                CUDA_CALL(cudaMalloc(&dstBuffers[gpu], requiredPerGPU * sizeof(T)));
-                bufferCapacities[gpu] = requiredPerGPU;
-            }
+        parallelForGPUs([&](size_t gpuId) {
+            size_t freeMem, totalMem;
+            CUDA_CALL(cudaMemGetInfo(&freeMem, &totalMem));
 
-            // Result buffers
-            if (resultBufferCapacities[gpu] < requiredPerGPU) {
-                if (resultSrcBuffers[gpu]) {
-                    cudaFree(resultSrcBuffers[gpu]);
-                }
-                if (resultDstBuffers[gpu]) {
-                    cudaFree(resultDstBuffers[gpu]);
-                }
+            // Calculate max keys this GPU can buffer
+            auto availableBytes = static_cast<size_t>(freeMem * memoryFactor);
+            size_t maxKeys = availableBytes / bytesPerKey;
 
-                CUDA_CALL(cudaMalloc(&resultSrcBuffers[gpu], requiredPerGPU * sizeof(bool)));
-                CUDA_CALL(cudaMalloc(&resultDstBuffers[gpu], requiredPerGPU * sizeof(bool)));
-                resultBufferCapacities[gpu] = requiredPerGPU;
-            }
-        }
+            // Allocate key buffers
+            CUDA_CALL(cudaMalloc(&srcBuffers[gpuId], maxKeys * sizeof(T)));
+            CUDA_CALL(cudaMalloc(&dstBuffers[gpuId], maxKeys * sizeof(T)));
+
+            // Allocate result buffers
+            CUDA_CALL(cudaMalloc(&resultSrcBuffers[gpuId], maxKeys * sizeof(bool)));
+            CUDA_CALL(cudaMalloc(&resultDstBuffers[gpuId], maxKeys * sizeof(bool)));
+
+            bufferCapacities[gpuId] = maxKeys;
+            totalBufferCapacity += maxKeys;
+        });
     }
 
     /**
      * @brief Free all pre-allocated buffers.
      */
     void freeBuffers() {
-        for (size_t gpu = 0; gpu < numGPUs; ++gpu) {
-            cudaSetDevice(gossipContext.get_device_id(gpu));
-            if (srcBuffers[gpu]) {
-                cudaFree(srcBuffers[gpu]);
-                srcBuffers[gpu] = nullptr;
+        parallelForGPUs([&](size_t gpuId) {
+            if (srcBuffers[gpuId]) {
+                cudaFree(srcBuffers[gpuId]);
+                srcBuffers[gpuId] = nullptr;
             }
-            if (dstBuffers[gpu]) {
-                cudaFree(dstBuffers[gpu]);
-                dstBuffers[gpu] = nullptr;
+            if (dstBuffers[gpuId]) {
+                cudaFree(dstBuffers[gpuId]);
+                dstBuffers[gpuId] = nullptr;
             }
-            if (resultSrcBuffers[gpu]) {
-                cudaFree(resultSrcBuffers[gpu]);
-                resultSrcBuffers[gpu] = nullptr;
+            if (resultSrcBuffers[gpuId]) {
+                cudaFree(resultSrcBuffers[gpuId]);
+                resultSrcBuffers[gpuId] = nullptr;
             }
-            if (resultDstBuffers[gpu]) {
-                cudaFree(resultDstBuffers[gpu]);
-                resultDstBuffers[gpu] = nullptr;
+            if (resultDstBuffers[gpuId]) {
+                cudaFree(resultDstBuffers[gpuId]);
+                resultDstBuffers[gpuId] = nullptr;
             }
-            bufferCapacities[gpu] = 0;
-            resultBufferCapacities[gpu] = 0;
-        }
+            bufferCapacities[gpuId] = 0;
+        });
     }
 
     /**
@@ -182,140 +181,155 @@ class CuckooFilterMultiGPU {
             return returnOccupied ? totalOccupiedSlots() : 0;
         }
 
-        // gossip recommends this for random distributions
-        const float memoryFactor = 1.5f;
-        const auto perGPUCapacity =
-            static_cast<size_t>(std::ceil(static_cast<double>(n) / numGPUs * memoryFactor));
+        size_t processed = 0;
 
-        ensureBufferCapacity(perGPUCapacity);
+        while (processed < n) {
+            size_t chunkSize = std::min(n - processed, totalBufferCapacity);
 
-        // Distribute input keys evenly across GPUs initially
-        std::vector<size_t> inputLens(numGPUs);
-        std::vector<size_t> inputOffsets(numGPUs + 1, 0);
-        size_t keysPerGPU = n / numGPUs;
-        size_t remainder = n % numGPUs;
+            // Distribute chunk proportionally based on each GPU's buffer capacity
+            std::vector<size_t> inputLens(numGPUs);
+            std::vector<size_t> inputOffsets(numGPUs + 1, 0);
 
-        for (size_t gpu = 0; gpu < numGPUs; ++gpu) {
-            inputLens[gpu] = keysPerGPU + (gpu < remainder ? 1 : 0);
-            inputOffsets[gpu + 1] = inputOffsets[gpu] + inputLens[gpu];
-        }
-
-        // Copy input data to source buffers on each GPU
-        parallelForGPUs([&](size_t gpuId) {
-            if (inputLens[gpuId] > 0) {
-                CUDA_CALL(cudaMemcpy(
-                    srcBuffers[gpuId],
-                    h_keys.data() + inputOffsets[gpuId],
-                    inputLens[gpuId] * sizeof(T),
-                    cudaMemcpyHostToDevice
-                ));
-            }
-        });
-        gossipContext.sync_hard();
-
-        // Partition keys by target GPU
-        std::vector<std::vector<size_t>> partitionTable(numGPUs, std::vector<size_t>(numGPUs));
-        std::vector<size_t> dstLens(numGPUs, perGPUCapacity);
-
-        Partitioner partitioner{numGPUs};
-        multisplit.execAsync(
-            srcBuffers,      // source pointers (per GPU)
-            inputLens,       // source lengths (per GPU)
-            dstBuffers,      // destination pointers (per GPU)
-            dstLens,         // destination capacities (per GPU)
-            partitionTable,  // output: partition counts [src][dst]
-            partitioner
-        );
-        multisplit.sync();
-
-        std::swap(srcBuffers, dstBuffers);
-
-        // Calculate how many keys each GPU will receive after all2all
-        std::vector<size_t> recvCounts(numGPUs, 0);
-        for (size_t dst = 0; dst < numGPUs; ++dst) {
-            for (size_t src = 0; src < numGPUs; ++src) {
-                recvCounts[dst] += partitionTable[src][dst];
-            }
-        }
-
-        // Shuffle partitioned keys to correct GPUs
-        all2all.execAsync(
-            srcBuffers,     // partitioned source data
-            dstLens,        // source buffer capacities
-            dstBuffers,     // destination for received data
-            dstLens,        // destination buffer capacities
-            partitionTable  // partition counts from multisplit
-        );
-        all2all.sync();
-
-        // If no output is required, execute filter ops and we're done
-        if constexpr (!hasOutput) {
-            parallelForGPUs([&](size_t gpuId) {
-                size_t localCount = recvCounts[gpuId];
-                if (localCount == 0) {
-                    return;
+            size_t remaining = chunkSize;
+            for (size_t gpu = 0; gpu < numGPUs; ++gpu) {
+                if (gpu == numGPUs - 1) {
+                    inputLens[gpu] = std::min(remaining, bufferCapacities[gpu]);
+                } else {
+                    double proportion =
+                        static_cast<double>(bufferCapacities[gpu]) / totalBufferCapacity;
+                    inputLens[gpu] = std::min(
+                        static_cast<size_t>(chunkSize * proportion), bufferCapacities[gpu]
+                    );
+                    inputLens[gpu] = std::min(inputLens[gpu], remaining);
                 }
-                auto stream = gossipContext.get_streams(gpuId)[0];
-                filterOp(filters[gpuId], dstBuffers[gpuId], nullptr, localCount, stream);
+                remaining -= inputLens[gpu];
+                inputOffsets[gpu + 1] = inputOffsets[gpu] + inputLens[gpu];
+            }
+
+            // Copy input data to source buffers on each GPU
+            parallelForGPUs([&](size_t gpuId) {
+                if (inputLens[gpuId] > 0) {
+                    CUDA_CALL(cudaMemcpy(
+                        srcBuffers[gpuId],
+                        h_keys.data() + processed + inputOffsets[gpuId],
+                        inputLens[gpuId] * sizeof(T),
+                        cudaMemcpyHostToDevice
+                    ));
+                }
             });
-            gossipContext.sync_all_streams();
-            return returnOccupied ? totalOccupiedSlots() : 0;
-        }
+            gossipContext.sync_hard();
 
-        // Prepare table for reverse all-to-all
-        std::vector<std::vector<size_t>> reverseTable(numGPUs, std::vector<size_t>(numGPUs));
-        for (size_t src = 0; src < numGPUs; ++src) {
-            for (size_t dst = 0; dst < numGPUs; ++dst) {
-                reverseTable[dst][src] = partitionTable[src][dst];
-            }
-        }
+            // Partition keys by target GPU
+            std::vector<std::vector<size_t>> partitionTable(numGPUs, std::vector<size_t>(numGPUs));
 
-        // Execute filter operations
-        parallelForGPUs([&](size_t gpuId) {
-            size_t localCount = recvCounts[gpuId];
-            if (localCount == 0) {
-                return;
-            }
-            auto stream = gossipContext.get_streams(gpuId)[0];
-            filterOp(
-                filters[gpuId], dstBuffers[gpuId], resultSrcBuffers[gpuId], localCount, stream
+            Partitioner partitioner{numGPUs};
+            multisplit.execAsync(
+                srcBuffers,        // source pointers (per GPU)
+                inputLens,         // source lengths (per GPU)
+                dstBuffers,        // destination pointers (per GPU)
+                bufferCapacities,  // destination capacities (per GPU)
+                partitionTable,    // output: partition counts [src][dst]
+                partitioner
             );
-        });
-        gossipContext.sync_all_streams();
+            multisplit.sync();
 
-        all2allResults.execAsync(
-            resultSrcBuffers, recvCounts, resultDstBuffers, dstLens, reverseTable
-        );
-        all2allResults.sync();
+            std::swap(srcBuffers, dstBuffers);
 
-        // Copy results back to host and reorder
-        std::vector<size_t> returnCounts(numGPUs);
-        for (size_t gpu = 0; gpu < numGPUs; ++gpu) {
-            returnCounts[gpu] = 0;
-            for (size_t src = 0; src < numGPUs; ++src) {
-                returnCounts[gpu] += reverseTable[src][gpu];
+            // Calculate how many keys each GPU will receive after all2all
+            std::vector<size_t> recvCounts(numGPUs, 0);
+            for (size_t dst = 0; dst < numGPUs; ++dst) {
+                for (size_t src = 0; src < numGPUs; ++src) {
+                    recvCounts[dst] += partitionTable[src][dst];
+                }
             }
+
+            // Shuffle partitioned keys to correct GPUs
+            all2all.execAsync(
+                srcBuffers,        // partitioned source data
+                bufferCapacities,  // source buffer capacities
+                dstBuffers,        // destination for received data
+                bufferCapacities,  // destination buffer capacities
+                partitionTable     // partition counts from multisplit
+            );
+            all2all.sync();
+
+            // If no output is required, execute filter ops and continue
+            if constexpr (!hasOutput) {
+                parallelForGPUs([&](size_t gpuId) {
+                    size_t localCount = recvCounts[gpuId];
+                    if (localCount == 0) {
+                        return;
+                    }
+                    auto stream = gossipContext.get_streams(gpuId)[0];
+                    filterOp(filters[gpuId], dstBuffers[gpuId], nullptr, localCount, stream);
+                });
+                gossipContext.sync_all_streams();
+            } else {
+                // Prepare table for reverse all-to-all
+                std::vector<std::vector<size_t>> reverseTable(
+                    numGPUs, std::vector<size_t>(numGPUs)
+                );
+                for (size_t src = 0; src < numGPUs; ++src) {
+                    for (size_t dst = 0; dst < numGPUs; ++dst) {
+                        reverseTable[dst][src] = partitionTable[src][dst];
+                    }
+                }
+
+                // Execute filter operations
+                parallelForGPUs([&](size_t gpuId) {
+                    size_t localCount = recvCounts[gpuId];
+                    if (localCount == 0) {
+                        return;
+                    }
+                    auto stream = gossipContext.get_streams(gpuId)[0];
+                    filterOp(
+                        filters[gpuId],
+                        dstBuffers[gpuId],
+                        resultSrcBuffers[gpuId],
+                        localCount,
+                        stream
+                    );
+                });
+                gossipContext.sync_all_streams();
+
+                all2allResults.execAsync(
+                    resultSrcBuffers, recvCounts, resultDstBuffers, bufferCapacities, reverseTable
+                );
+                all2allResults.sync();
+
+                // Copy results back to host
+                std::vector<size_t> returnCounts(numGPUs);
+                for (size_t gpu = 0; gpu < numGPUs; ++gpu) {
+                    returnCounts[gpu] = 0;
+                    for (size_t src = 0; src < numGPUs; ++src) {
+                        returnCounts[gpu] += reverseTable[src][gpu];
+                    }
+                }
+
+                parallelForGPUs([&](size_t gpuId) {
+                    size_t localCount = returnCounts[gpuId];
+                    if (localCount == 0) {
+                        return;
+                    }
+
+                    std::vector<uint8_t> h_localResults(localCount);
+                    CUDA_CALL(cudaMemcpy(
+                        h_localResults.data(),
+                        resultDstBuffers[gpuId],
+                        localCount * sizeof(bool),
+                        cudaMemcpyDeviceToHost
+                    ));
+
+                    for (size_t i = 0; i < localCount; ++i) {
+                        (*h_output)[processed + inputOffsets[gpuId] + i] =
+                            static_cast<bool>(h_localResults[i]);
+                    }
+                });
+                gossipContext.sync_hard();
+            }
+
+            processed += chunkSize;
         }
-
-        parallelForGPUs([&](size_t gpuId) {
-            size_t localCount = returnCounts[gpuId];
-            if (localCount == 0) {
-                return;
-            }
-
-            std::vector<uint8_t> h_localResults(localCount);
-            CUDA_CALL(cudaMemcpy(
-                h_localResults.data(),
-                resultDstBuffers[gpuId],
-                localCount * sizeof(bool),
-                cudaMemcpyDeviceToHost
-            ));
-
-            for (size_t i = 0; i < localCount; ++i) {
-                (*h_output)[inputOffsets[gpuId] + i] = static_cast<bool>(h_localResults[i]);
-            }
-        });
-        gossipContext.sync_hard();
 
         return returnOccupied ? totalOccupiedSlots() : 0;
     }
@@ -330,9 +344,10 @@ class CuckooFilterMultiGPU {
      * @param numGPUs Number of GPUs to use.
      * @param capacity Total capacity of the distributed filter.
      */
-    CuckooFilterMultiGPU(size_t numGPUs, size_t capacity)
+    CuckooFilterMultiGPU(size_t numGPUs, size_t capacity, float memFactor = defaultMemoryFactor)
         : numGPUs(numGPUs),
           capacityPerGPU(static_cast<size_t>(SDIV(capacity, numGPUs) * 1.02)),
+          memoryFactor(memFactor),
           gossipContext(numGPUs),
           multisplit(gossipContext),
           all2all(gossipContext, gossip::all2all::default_plan(numGPUs)),
@@ -342,7 +357,7 @@ class CuckooFilterMultiGPU {
           bufferCapacities(numGPUs, 0),
           resultSrcBuffers(numGPUs, nullptr),
           resultDstBuffers(numGPUs, nullptr),
-          resultBufferCapacities(numGPUs, 0) {
+          totalBufferCapacity(0) {
         assert(numGPUs > 0 && "Number of GPUs must be at least 1");
 
         filters.resize(numGPUs);
@@ -355,6 +370,8 @@ class CuckooFilterMultiGPU {
             filters[i] = filter;
         }
         gossipContext.sync_hard();
+
+        allocateBuffers();
     }
 
     /**
@@ -368,9 +385,15 @@ class CuckooFilterMultiGPU {
      * @param transferPlanPath Path to gossip transfer plan file for optimized topology-aware
      * transfers.
      */
-    CuckooFilterMultiGPU(size_t numGPUs, size_t capacity, const char* transferPlanPath)
+    CuckooFilterMultiGPU(
+        size_t numGPUs,
+        size_t capacity,
+        const char* transferPlanPath,
+        float memFactor = defaultMemoryFactor
+    )
         : numGPUs(numGPUs),
           capacityPerGPU(static_cast<size_t>(SDIV(capacity, numGPUs) * 1.02)),
+          memoryFactor(memFactor),
           gossipContext(numGPUs),
           multisplit(gossipContext),
           all2all(
@@ -398,7 +421,7 @@ class CuckooFilterMultiGPU {
           bufferCapacities(numGPUs, 0),
           resultSrcBuffers(numGPUs, nullptr),
           resultDstBuffers(numGPUs, nullptr),
-          resultBufferCapacities(numGPUs, 0) {
+          totalBufferCapacity(0) {
         assert(numGPUs > 0 && "Number of GPUs must be at least 1");
 
         filters.resize(numGPUs);
@@ -411,6 +434,8 @@ class CuckooFilterMultiGPU {
             filters[i] = filter;
         }
         gossipContext.sync_hard();
+
+        allocateBuffers();
     }
 
     /**
