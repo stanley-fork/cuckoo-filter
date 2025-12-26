@@ -265,13 +265,10 @@ class CuckooFilterMultiGPU {
                 });
                 gossipContext.sync_all_streams();
             } else {
-                // Prepare table for reverse all-to-all
-                std::vector<std::vector<size_t>> reverseTable(
-                    numGPUs, std::vector<size_t>(numGPUs)
-                );
-                for (size_t src = 0; src < numGPUs; ++src) {
-                    for (size_t dst = 0; dst < numGPUs; ++dst) {
-                        reverseTable[dst][src] = partitionTable[src][dst];
+                // Transpose partitionTable in-place for reverse all-to-all
+                for (size_t i = 0; i < numGPUs; ++i) {
+                    for (size_t j = i + 1; j < numGPUs; ++j) {
+                        std::swap(partitionTable[i][j], partitionTable[j][i]);
                     }
                 }
 
@@ -293,21 +290,12 @@ class CuckooFilterMultiGPU {
                 gossipContext.sync_all_streams();
 
                 all2allResults.execAsync(
-                    resultSrcBuffers, recvCounts, resultDstBuffers, bufferCapacities, reverseTable
+                    resultSrcBuffers, recvCounts, resultDstBuffers, bufferCapacities, partitionTable
                 );
                 all2allResults.sync();
 
-                // Copy results back to host
-                std::vector<size_t> returnCounts(numGPUs);
-                for (size_t gpu = 0; gpu < numGPUs; ++gpu) {
-                    returnCounts[gpu] = 0;
-                    for (size_t src = 0; src < numGPUs; ++src) {
-                        returnCounts[gpu] += reverseTable[src][gpu];
-                    }
-                }
-
                 parallelForGPUs([&](size_t gpuId) {
-                    size_t localCount = returnCounts[gpuId];
+                    size_t localCount = inputLens[gpuId];
                     if (localCount == 0) {
                         return;
                     }
