@@ -10,6 +10,16 @@ project(
     ],
 )
 
+kmc_api_dep = subproject('kmc').get_variable('kmc_api_dep')
+cli11_dep = subproject('cli11').get_variable('CLI11_dep')
+
+executable(
+    'kmc_to_binary',
+    'src/kmc_to_binary.cpp',
+    dependencies: [kmc_api_dep, cli11_dep],
+    install: true,
+)
+
 cuda_args = [
     '-std=c++20',
     '--expt-extended-lambda',

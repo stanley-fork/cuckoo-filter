@@ -3,11 +3,14 @@ build
 .direnv
 .cache
 .clangd
+
 /subprojects/*
 !/subprojects/packagefiles
 !/subprojects/*.wrap
 /subprojects/moderngpu.wrap
 /subprojects/openssl.wrap
+/subprojects/zlib.wrap
+
 *.*-rep
 *.sqlite
 *.html
