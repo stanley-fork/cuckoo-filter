@@ -148,7 +148,7 @@ if get_option('BUILD_BENCHMARKS') == true
         './benchmark/cuckoo_bucket_size.cu',
         dependencies: bench_deps,
         include_directories: includes,
-        cuda_args: cuda_args,
+        cuda_args: cuda_args + ['-DCUCKOO_FILTER_DISABLE_256BIT_LOADS'],
         install: false,
     )
 
