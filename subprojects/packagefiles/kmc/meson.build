@@ -45,7 +45,7 @@ kmc_core_sources = files(
     'kmc_core/kff_writer.cpp',
 )
 
-raduls_objects = []
+raduls_libs = []
 
 if is_x86
     raduls_sse2 = static_library('raduls_sse2',
@@ -53,46 +53,45 @@ if is_x86
         include_directories: include_directories('.'),
         cpp_args: ['-msse2'],
     )
-    raduls_objects += raduls_sse2.extract_all_objects(recursive: false)
+    raduls_libs += raduls_sse2
 
     raduls_sse41 = static_library('raduls_sse41',
         'kmc_core/raduls_sse41.cpp',
         include_directories: include_directories('.'),
         cpp_args: ['-msse4.1'],
     )
-    raduls_objects += raduls_sse41.extract_all_objects(recursive: false)
+    raduls_libs += raduls_sse41
 
     raduls_avx = static_library('raduls_avx',
         'kmc_core/raduls_avx.cpp',
         include_directories: include_directories('.'),
         cpp_args: ['-mavx'],
     )
-    raduls_objects += raduls_avx.extract_all_objects(recursive: false)
+    raduls_libs += raduls_avx
 
     raduls_avx2 = static_library('raduls_avx2',
         'kmc_core/raduls_avx2.cpp',
         include_directories: include_directories('.'),
         cpp_args: ['-mavx2'],
     )
-    raduls_objects += raduls_avx2.extract_all_objects(recursive: false)
+    raduls_libs += raduls_avx2
 elif is_arm
     raduls_neon = static_library('raduls_neon',
         'kmc_core/raduls_neon.cpp',
         include_directories: include_directories('.'),
     )
-    raduls_objects += raduls_neon.extract_all_objects(recursive: false)
+    raduls_libs += raduls_neon
 endif
 
 kmc_core_lib = static_library('kmc_core',
     kmc_core_sources,
-    objects: raduls_objects,
     include_directories: include_directories('.'),
     dependencies: [zlib_dep],
 )
 
 kmc_exe = executable('kmc',
     'kmc_CLI/kmc.cpp',
-    link_with: [kmc_core_lib, kmc_api_lib],
+    link_with: [kmc_core_lib, kmc_api_lib] + raduls_libs,
     include_directories: include_directories('.'),
     dependencies: [zlib_dep],
     install: true,
