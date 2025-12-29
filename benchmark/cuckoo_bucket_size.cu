@@ -60,12 +60,12 @@ class BucketSizeFixture : public benchmark::Fixture {
 
 #define REGISTER_ALL_FOR_BUCKET_SIZE(BSize)   \
     REGISTER_BUCKET_BENCHMARK(BSize, Insert); \
-    REGISTER_BUCKET_BENCHMARK(BSize, Query);  \
-    REGISTER_BUCKET_BENCHMARK(BSize, Delete);
+    REGISTER_BUCKET_BENCHMARK(BSize, Query);
 
 #define DEFINE_BUCKET_SIZE_BENCHMARKS(BSize)           \
     using BSFixture##BSize = BucketSizeFixture<BSize>; \
-    DEFINE_CORE_BENCHMARKS(BSFixture##BSize)
+    DEFINE_FILTER_INSERT_BENCHMARK(BSFixture##BSize)   \
+    DEFINE_FILTER_QUERY_BENCHMARK(BSFixture##BSize)
 
 #define DEFINE_AND_REGISTER_BUCKET_SIZE_BENCHMARKS(BSize) \
     DEFINE_BUCKET_SIZE_BENCHMARKS(BSize)                  \
