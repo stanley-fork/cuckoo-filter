@@ -48,24 +48,27 @@ kmc_core_sources = files(
 raduls_libs = []
 
 if is_x86
+    # Each raduls file must compile with ONLY its target SIMD level's macro defined.
     raduls_sse2 = static_library('raduls_sse2',
         'kmc_core/raduls_sse2.cpp',
         include_directories: include_directories('.'),
-        cpp_args: ['-msse2'],
+        cpp_args: ['-msse2', '-mno-sse4.1', '-mno-avx', '-mno-avx2',
+                   '-U__SSE4_1__', '-U__AVX__', '-U__AVX2__'],
     )
     raduls_libs += raduls_sse2
 
     raduls_sse41 = static_library('raduls_sse41',
         'kmc_core/raduls_sse41.cpp',
         include_directories: include_directories('.'),
-        cpp_args: ['-msse4.1'],
+        cpp_args: ['-msse4.1', '-mno-avx', '-mno-avx2',
+                   '-U__AVX__', '-U__AVX2__'],
     )
     raduls_libs += raduls_sse41
 
     raduls_avx = static_library('raduls_avx',
         'kmc_core/raduls_avx.cpp',
         include_directories: include_directories('.'),
-        cpp_args: ['-mavx'],
+        cpp_args: ['-mavx', '-mno-avx2', '-U__AVX2__'],
     )
     raduls_libs += raduls_avx
 
