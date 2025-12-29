@@ -71,7 +71,7 @@ static void GPUCF_Insert(bm::State& state) {
     ensureDeviceKeys();
 
     size_t n = g_kmerData.size();
-    size_t capacity = static_cast<size_t>(n / LOAD_FACTOR);
+    auto capacity = static_cast<size_t>(n / LOAD_FACTOR);
 
     auto filter = std::make_unique<CuckooFilter<Config>>(capacity);
     size_t filterMemory = filter->sizeInBytes();

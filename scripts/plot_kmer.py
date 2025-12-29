@@ -7,7 +7,6 @@
 #   "typer",
 # ]
 # ///
-"""Plot k-mer benchmark results comparing GPU filter Insert and Query performance."""
 
 import re
 from pathlib import Path
