@@ -84,8 +84,8 @@ For workloads that exceed single GPU capacity:
 #include <CuckooFilterMultiGPU.cuh>
 
 CuckooFilterMultiGPU<Config> filter(numGPUs, capacityPerGPU);
-filter.insertMany(d_keys, numKeys);
-filter.containsMany(d_keys, d_results, numKeys);
+filter.insertMany(h_keys, numKeys);
+filter.containsMany(h_keys, h_results, numKeys);
 ```
 
 ## Project Structure
