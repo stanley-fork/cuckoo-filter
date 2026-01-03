@@ -368,9 +368,35 @@ struct CuckooFilter {
         return AltBucketPolicy::getCandidateBuckets(key, numBuckets);
     }
 
+    /**
+     * @brief Computes the alternate bucket for a fingerprint.
+     *
+     * For policies without choice bit: simply returns alternate bucket.
+     * For policies with choice bit: returns alternate bucket (fp unchanged here,
+     *   caller must use getAlternateBucketWithNewFp for eviction).
+     */
     static __host__ __device__ size_t
     getAlternateBucket(size_t bucket, TagType fp, size_t numBuckets) {
-        return AltBucketPolicy::getAlternateBucket(bucket, fp, numBuckets);
+        if constexpr (AltBucketPolicy::usesChoiceBit) {
+            auto [alt, newFp] =
+                AltBucketPolicy::getAlternateBucketWithNewFp(bucket, fp, numBuckets);
+            return alt;
+        } else {
+            return AltBucketPolicy::getAlternateBucket(bucket, fp, numBuckets);
+        }
+    }
+
+    /**
+     * @brief Computes alternate bucket AND updated fingerprint for choice bit policies.
+     * For non-choice-bit policies, returns the original fingerprint unchanged.
+     */
+    static __host__ __device__ cuda::std::tuple<size_t, TagType>
+    getAlternateBucketWithNewFp(size_t bucket, TagType fp, size_t numBuckets) {
+        if constexpr (AltBucketPolicy::usesChoiceBit) {
+            return AltBucketPolicy::getAlternateBucketWithNewFp(bucket, fp, numBuckets);
+        } else {
+            return {AltBucketPolicy::getAlternateBucket(bucket, fp, numBuckets), fp};
+        }
     }
 
     /**
@@ -915,7 +941,10 @@ struct CuckooFilter {
 #endif
 
             currentFp = evictedFp;
-            currentBucket = getAlternateBucket(currentBucket, evictedFp, numBuckets);
+            auto [altBucket, newFp] =
+                getAlternateBucketWithNewFp(currentBucket, evictedFp, numBuckets);
+            currentBucket = altBucket;
+            currentFp = newFp;
 
             if (tryInsertAtBucket(currentBucket, currentFp)) {
                 return true;
@@ -955,8 +984,9 @@ struct CuckooFilter {
                 continue;
             }
 
-            size_t altBucket = getAlternateBucket(startBucket, candidateFp, numBuckets);
-            if (tryInsertAtBucket(altBucket, candidateFp)) {
+            auto [altBucket, altFp] =
+                getAlternateBucketWithNewFp(startBucket, candidateFp, numBuckets);
+            if (tryInsertAtBucket(altBucket, altFp)) {
                 // Successfully inserted the evicted tag at its alternate location
                 // Now atomically swap in our tag at the original location
                 auto expected = bucket.packedTags[atomicIdx].load(cuda::memory_order_relaxed);
@@ -999,22 +1029,53 @@ struct CuckooFilter {
     __device__ bool insert(const T& key) {
         auto [i1, i2, fp] = getCandidateBuckets(key, numBuckets);
 
-        if (tryInsertAtBucket(i1, fp) || tryInsertAtBucket(i2, fp)) {
-            return true;
-        }
+        // For choice bit policies: fp has choice=0, need fpForSecondary with choice=1
+        if constexpr (AltBucketPolicy::usesChoiceBit) {
+            // Try primary bucket with choice=0
+            if (tryInsertAtBucket(i1, fp)) {
+                return true;
+            }
 
-        auto startBucket = (fp & 1) == 0 ? i1 : i2;
+            // Get fingerprint with flipped choice bit for secondary
+            auto [_, fpForSecondary] = getAlternateBucketWithNewFp(i1, fp, numBuckets);
+            if (tryInsertAtBucket(i2, fpForSecondary)) {
+                return true;
+            }
 
-        if constexpr (Config::evictionPolicy == EvictionPolicy::BFS) {
-            return insertWithEvictionBFS(fp, startBucket);
-        } else if constexpr (Config::evictionPolicy == EvictionPolicy::DFS) {
-            return insertWithEvictionDFS(fp, startBucket);
+            // For eviction, use correct fingerprint for the starting bucket
+            TagType evictFp = (fp & 1) == 0 ? fp : fpForSecondary;
+            auto startBucket = (fp & 1) == 0 ? i1 : i2;
+
+            if constexpr (Config::evictionPolicy == EvictionPolicy::BFS) {
+                return insertWithEvictionBFS(evictFp, startBucket);
+            } else if constexpr (Config::evictionPolicy == EvictionPolicy::DFS) {
+                return insertWithEvictionDFS(evictFp, startBucket);
+            } else {
+                static_assert(
+                    Config::evictionPolicy == EvictionPolicy::DFS ||
+                        Config::evictionPolicy == EvictionPolicy::BFS,
+                    "Unhandled eviction policy"
+                );
+            }
         } else {
-            static_assert(
-                Config::evictionPolicy == EvictionPolicy::DFS ||
-                    Config::evictionPolicy == EvictionPolicy::BFS,
-                "Unhandled eviction policy"
-            );
+            // Standard policy: no choice bit
+            if (tryInsertAtBucket(i1, fp) || tryInsertAtBucket(i2, fp)) {
+                return true;
+            }
+
+            auto startBucket = (fp & 1) == 0 ? i1 : i2;
+
+            if constexpr (Config::evictionPolicy == EvictionPolicy::BFS) {
+                return insertWithEvictionBFS(fp, startBucket);
+            } else if constexpr (Config::evictionPolicy == EvictionPolicy::DFS) {
+                return insertWithEvictionDFS(fp, startBucket);
+            } else {
+                static_assert(
+                    Config::evictionPolicy == EvictionPolicy::DFS ||
+                        Config::evictionPolicy == EvictionPolicy::BFS,
+                    "Unhandled eviction policy"
+                );
+            }
         }
     }
 
@@ -1026,7 +1087,14 @@ struct CuckooFilter {
      */
     __device__ bool contains(const T& key) const {
         auto [i1, i2, fp] = getCandidateBuckets(key, numBuckets);
-        return d_buckets[i1].contains(fp) || d_buckets[i2].contains(fp);
+
+        if constexpr (AltBucketPolicy::usesChoiceBit) {
+            // For choice bit: i1 has fp with choice=0, i2 has fp with choice=1
+            auto [_, fpForSecondary] = getAlternateBucketWithNewFp(i1, fp, numBuckets);
+            return d_buckets[i1].contains(fp) || d_buckets[i2].contains(fpForSecondary);
+        } else {
+            return d_buckets[i1].contains(fp) || d_buckets[i2].contains(fp);
+        }
     }
 
     /**
@@ -1038,7 +1106,13 @@ struct CuckooFilter {
     __device__ bool remove(const T& key) {
         auto [i1, i2, fp] = getCandidateBuckets(key, numBuckets);
 
-        return tryRemoveAtBucket(i1, fp) || tryRemoveAtBucket(i2, fp);
+        if constexpr (AltBucketPolicy::usesChoiceBit) {
+            // For choice bit: i1 has fp with choice=0, i2 has fp with choice=1
+            auto [_, fpForSecondary] = getAlternateBucketWithNewFp(i1, fp, numBuckets);
+            return tryRemoveAtBucket(i1, fp) || tryRemoveAtBucket(i2, fpForSecondary);
+        } else {
+            return tryRemoveAtBucket(i1, fp) || tryRemoveAtBucket(i2, fp);
+        }
     }
 };
 
@@ -1160,18 +1234,19 @@ __global__ void insertKernelSorted(
         if (filter->tryInsertAtBucket(primaryBucket, fp)) {
             success = 1;
         } else {
-            size_t secondaryBucket =
-                Filter::getAlternateBucket(primaryBucket, fp, filter->numBuckets);
+            auto [secondaryBucket, fpForSecondary] =
+                Filter::getAlternateBucketWithNewFp(primaryBucket, fp, filter->numBuckets);
 
-            if (filter->tryInsertAtBucket(secondaryBucket, fp)) {
+            if (filter->tryInsertAtBucket(secondaryBucket, fpForSecondary)) {
                 success = 1;
             } else {
+                TagType evictFp = (fp & 1) == 0 ? fp : fpForSecondary;
                 auto startBucket = (fp & 1) == 0 ? primaryBucket : secondaryBucket;
 
                 if constexpr (Config::evictionPolicy == EvictionPolicy::BFS) {
-                    success = filter->insertWithEvictionBFS(fp, startBucket);
+                    success = filter->insertWithEvictionBFS(evictFp, startBucket);
                 } else if constexpr (Config::evictionPolicy == EvictionPolicy::DFS) {
-                    success = filter->insertWithEvictionDFS(fp, startBucket);
+                    success = filter->insertWithEvictionDFS(evictFp, startBucket);
                 } else {
                     static_assert(
                         Config::evictionPolicy == EvictionPolicy::DFS ||
