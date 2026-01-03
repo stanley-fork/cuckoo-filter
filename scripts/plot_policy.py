@@ -21,26 +21,29 @@ import typer
 app = typer.Typer(help="Plot bucket policy benchmark results")
 
 
-def load_policy_data(csv_path: Path) -> dict[str, dict[str, float]]:
+def load_policy_data(csv_path: Path) -> tuple[dict[str, dict[str, float]], int | None]:
     """Load and parse policy benchmark data from CSV.
 
     Returns:
-        Nested dict {policy: {operation: throughput_mops}}
+        Tuple of (nested dict {policy: {operation: throughput_mops}}, capacity)
     """
     df = pu.load_csv(csv_path)
     df = df[df["name"].str.endswith("_median")]
 
     data: dict[str, dict[str, float]] = {}
+    capacity: int | None = None
 
     for _, row in df.iterrows():
         name = row["name"]
-        # Parse: "XorFixture/Insert/..." -> policy="Xor", operation="Insert"
-        match = re.match(r"(\w+)Fixture/(\w+)/", name)
+        # Parse: "XorFixture/Insert/.../<capacity>" -> policy="Xor", operation="Insert"
+        match = re.match(r"(\w+)Fixture/(\w+)/(\d+)", name)
         if not match:
             continue
 
         policy = match.group(1)
         operation = match.group(2)
+        if capacity is None:
+            capacity = int(match.group(3))
 
         items_per_second = row.get("items_per_second")
         if pd.notna(items_per_second):
@@ -49,7 +52,7 @@ def load_policy_data(csv_path: Path) -> dict[str, dict[str, float]]:
                 data[policy] = {}
             data[policy][operation] = throughput_mops
 
-    return data
+    return data, capacity
 
 
 @app.command()
@@ -60,7 +63,7 @@ def main(
     ),
 ):
     """Plot bucket policy benchmark results."""
-    data = load_policy_data(csv_file)
+    data, capacity = load_policy_data(csv_file)
 
     if not data:
         typer.secho("No valid data found in CSV", fg=typer.colors.RED, err=True)
@@ -82,11 +85,13 @@ def main(
         colors=pu.POLICY_COLORS,
     )
 
+    title = pu.format_capacity_title("Bucket Policy Comparison", capacity)
+
     pu.format_axis(
         ax,  # ty:ignore[invalid-argument-type]
         "Operation",
         "Throughput [M ops/s]",
-        title="Bucket Policy Comparison",
+        title=title,
         xscale=None,
     )
     pu.create_legend(ax, loc="upper right")  # ty:ignore[invalid-argument-type]
