@@ -104,21 +104,12 @@ if get_option('BUILD_BENCHMARKS') == true
     partitioned_sub = cmake.subproject('partitioned-filters', options: partitioned_opts)
     partitioned_dep = partitioned_sub.dependency('filters')
 
-    gqf_subproj = subproject('gqf')
-    gqf_dep = gqf_subproj.get_variable('gqf_dep')
-    gqf_dep_8 = gqf_subproj.get_variable('gqf_deps')['8']
-    gqf_dep_16 = gqf_subproj.get_variable('gqf_deps')['16']
-    gqf_dep_32 = gqf_subproj.get_variable('gqf_deps')['32']
-
-    tcf_opts = cmake.subproject_options()
-    tcf_opts.add_cmake_defines(
-        {
-            'CMAKE_BUILD_TYPE': 'Release',
-            'BUILD_TESTING': 'OFF',
-        },
-    )
-    tcf_sub = cmake.subproject('tcf', options: tcf_opts)
-    tcf_dep = tcf_sub.dependency('bulk_tcf')
+    gpu_filters_subproj = subproject('gpu-filters')
+    gqf_dep = gpu_filters_subproj.get_variable('gqf_dep')
+    gqf_dep_8 = gpu_filters_subproj.get_variable('gqf_deps')['8']
+    gqf_dep_16 = gpu_filters_subproj.get_variable('gqf_deps')['16']
+    gqf_dep_32 = gpu_filters_subproj.get_variable('gqf_deps')['32']
+    tcf_dep = gpu_filters_subproj.get_variable('tcf_dep')
 
     bench_deps = [
         benchmark_dep,

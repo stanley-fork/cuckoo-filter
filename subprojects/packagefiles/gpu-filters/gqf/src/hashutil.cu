@@ -7,8 +7,6 @@
  * ============================================================================
  */
 
-#pragma once
-
 #include "hashutil.cuh"
 
 
@@ -120,11 +118,11 @@ __host__ __device__ uint64_t aMurmurHash64B ( const void * key, int len, unsigne
 }
 
 /*
- *   For any 1<k<=64, let mask=(1<<k)-1. ahash_64() is a bijection on [0,1<<k),
+ *   For any 1<k<=64, let mask=(1<<k)-1. hash_64() is a bijection on [0,1<<k),
  *   which means
- *     ahash_64(x, mask)==ahash_64(y, mask) if and only if x==y. ahash_64i() is
+ *     hash_64(x, mask)==hash_64(y, mask) if and only if x==y. hash_64i() is
  *     the inversion of
- *       ahash_64(): ahash_64i(ahash_64(x, mask), mask) == ahash_64(ahash_64i(x,
+ *       hash_64(): hash_64i(hash_64(x, mask), mask) == hash_64(hash_64i(x,
  *       mask), mask) == x.
  */
 
@@ -143,7 +141,7 @@ __host__ __device__ uint64_t ahash_64(uint64_t key, uint64_t mask)
 	return key;
 }
 
-// The inversion of ahash_64(). Modified from
+// The inversion of hash_64(). Modified from
 // <https://naml.us/blog/tag/invertible>
 __host__ __device__ uint64_t ahash_64i(uint64_t key, uint64_t mask)
 {

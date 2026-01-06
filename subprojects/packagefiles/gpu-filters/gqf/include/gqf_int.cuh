@@ -27,12 +27,13 @@ extern "C" {
    8, 16, 32, or 64 (for optimized versions),
    or other integer <= 56 (for compile-time-optimized bit-shifting-based versions)
 */
+
 #ifndef QF_BITS_PER_SLOT
-#   define QF_BITS_PER_SLOT 32
+    #define QF_BITS_PER_SLOT 32
 #endif
 
 #ifndef R_BITS
-#   define R_BITS 16
+    #define R_BITS 16
 #endif
 
 /* Must be >= 6.  6 seems fastest. */
@@ -116,6 +117,7 @@ extern "C" {
 		uint64_t nelts;
 		uint64_t ndistinct_elts;
 		uint64_t noccupied_slots;
+		bool qf_full;
 	} quotient_filter_metadata;
 
 	typedef quotient_filter_metadata qfmetadata;

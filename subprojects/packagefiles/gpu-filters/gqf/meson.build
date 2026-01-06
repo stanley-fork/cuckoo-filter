@@ -1,5 +1,3 @@
-project('gqf', 'cpp', 'cuda', default_options: ['optimization=3'])
-
 gqf_inc = include_directories('include')
 
 base_cuda_args = [
@@ -11,7 +9,7 @@ base_cuda_args = [
     '-rdc=true',
 ]
 
-gqf_sources = ['src/gqf.cu', 'src/hashutil.cu', './src/partitioned_counter.cu']
+gqf_sources = ['src/gqf.cu', 'src/hashutil.cu', 'src/partitioned_counter.cu']
 
 # Build multiple GQF variants with different bit configurations
 # Format: [bits_per_slot, r_bits, suffix]
