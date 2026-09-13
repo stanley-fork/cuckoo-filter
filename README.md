@@ -1,7 +1,7 @@
 # Cuckoo-GPU
 
 [![Documentation](https://img.shields.io/badge/docs-latest-blue.svg)](https://tdortman.github.io/Cuckoo-GPU/)
-[![arXiv](https://img.shields.io/badge/arXiv-2603.15486-b31b1b.svg)](https://arxiv.org/abs/2603.15486)
+[![DOI](https://img.shields.io/badge/DOI-10.1145%2F3832810.3832822-blue.svg)](https://doi.org/10.1145/3832810.3832822)
 
 A high-performance, lock-free CUDA implementation of the Cuckoo Filter. This library is the companion code for the paper **"Cuckoo-GPU: Accelerating Cuckoo Filters on Modern GPUs"**.
 
