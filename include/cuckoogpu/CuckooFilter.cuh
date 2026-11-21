@@ -1706,11 +1706,12 @@ struct Filter {
     /**
      * @brief Inserts a fingerprint using repeated shallow breadth-first attempts.
      *
-     * Each round scans a handful of candidate eviction slots in the current bucket and tries to
-     * place one candidate in its alternate bucket. If no shallow move succeeds, it evicts the
-     * last scanned candidate slot from the current bucket and restarts the same BFS round from
-     * that evicted tag's alternate bucket. This repeats until insertion succeeds or maxEvictions
-     * is reached.
+     * Each round scans a handful of candidate eviction slots in the current bucket for one whose
+     * alternate bucket has a free slot. The thread swaps itself into that slot and then places the
+     * evicted tag, which it now holds, in the alternate bucket. If no candidate qualifies, it
+     * evicts the last scanned slot. Either way, an evicted tag that cannot be placed continues the
+     * chain from its alternate bucket. Tags only ever move by swap, so concurrent chains cannot
+     * leave duplicate copies. This repeats until insertion succeeds or maxEvictions is reached.
      *
      * @param fp Fingerprint to insert
      * @param evictionAttempts Optional pointer to a counter for eviction attempts
@@ -1727,16 +1728,15 @@ struct Filter {
         size_t evictions = 0;
         while (evictions < maxEvictions) {
             Bucket& bucket = d_buckets[currentBucket];
-            size_t restartWord = 0;
-            size_t restartTagIdx = 0;
+            size_t evictWord = 0;
+            size_t evictTagIdx = 0;
+            bool lookahead = false;
 
-            for (size_t i = 0; i < numCandidates; ++i) {
+            for (size_t i = 0; i < numCandidates && !lookahead; ++i) {
                 size_t evictSlot = (currentFp + i * 0x9E3779B1UL + (evictions + 1) * 0x85EBCA77) &
                                    (bucketSize - 1);
-                size_t evictWord = evictSlot / Bucket::tagsPerWord;
-                size_t evictTagIdx = evictSlot & (Bucket::tagsPerWord - 1);
-                restartWord = evictWord;
-                restartTagIdx = evictTagIdx;
+                evictWord = evictSlot / Bucket::tagsPerWord;
+                evictTagIdx = evictSlot & (Bucket::tagsPerWord - 1);
 
                 auto packed = bucket.word(evictWord).load(cuda::memory_order_relaxed);
                 TagType candidateFp = bucket.extractTag(packed, evictTagIdx);
@@ -1750,49 +1750,24 @@ struct Filter {
 
                 auto [altBucket, altFp] =
                     getAlternateBucketWithNewFp(currentBucket, candidateFp, numBuckets);
-                if (tryInsertAtBucket(altBucket, altFp)) {
-                    // Successfully inserted the evicted tag at its alternate location
-                    // Now atomically swap in our tag at the original location
-                    auto expected = bucket.word(evictWord).load(cuda::memory_order_relaxed);
-
-                    // Verify the tag is still there and try to replace it
-                    if (bucket.extractTag(expected, evictTagIdx) == candidateFp) {
-                        auto desired = bucket.replaceTag(expected, evictTagIdx, currentFp);
-
-                        if (bucket.word(evictWord).compare_exchange_strong(
-                                expected,
-                                desired,
-                                cuda::memory_order_relaxed,
-                                cuda::memory_order_relaxed
-                            )) {
-#ifdef CUCKOO_FILTER_COUNT_EVICTIONS
-                            d_numEvictions->fetch_add(1, cuda::memory_order_relaxed);
-                            if (evictionAttempts != nullptr) {
-                                (*evictionAttempts)++;
-                            }
-#endif
-                            return true;
-                        }
-                    }
-
-                    // Failed to swap, clean up the tag we inserted to avoid duplicates
-                    tryRemoveAtBucket(altBucket, candidateFp);
-                }
+                using WordType = typename Bucket::WordType;
+                lookahead =
+                    scanBucket(d_buckets[altBucket], 0, WordType{0}, [](size_t, WordType word) {
+                        return detail::hasZero<TagType, WordType>(word);
+                    });
             }
 
-            // Evict the last scanned candidate and continue from its alternate location.
-            auto expected = bucket.word(restartWord).load(cuda::memory_order_relaxed);
+            // Swap our tag into the chosen slot; the displaced tag is now held by this thread.
+            auto expected = bucket.word(evictWord).load(cuda::memory_order_relaxed);
             typename Bucket::WordType desired;
             TagType evictedFp;
 
             do {
-                evictedFp = bucket.extractTag(expected, restartTagIdx);
-                desired = bucket.replaceTag(expected, restartTagIdx, currentFp);
-            } while (
-                !bucket.word(restartWord)
-                     .compare_exchange_strong(
-                         expected, desired, cuda::memory_order_relaxed, cuda::memory_order_relaxed
-                     ));
+                evictedFp = bucket.extractTag(expected, evictTagIdx);
+                desired = bucket.replaceTag(expected, evictTagIdx, currentFp);
+            } while (!bucket.word(evictWord).compare_exchange_strong(
+                expected, desired, cuda::memory_order_relaxed, cuda::memory_order_relaxed
+            ));
 
             if (evictedFp == EMPTY) {
                 return true;
@@ -1808,6 +1783,9 @@ struct Filter {
             evictions++;
             auto [altBucket, altFp] =
                 getAlternateBucketWithNewFp(currentBucket, evictedFp, numBuckets);
+            if (tryInsertAtBucket(altBucket, altFp)) {
+                return true;
+            }
             currentBucket = altBucket;
             currentFp = altFp;
         }

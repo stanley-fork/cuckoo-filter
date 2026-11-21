@@ -399,6 +399,31 @@ TEST_F(CuckooFilterTest, InsertFullFilterReportsFailures) {
     EXPECT_EQ(successCount + failureCount, numKeys) << "All keys should have a result";
 }
 
+// Concurrent eviction chains in a nearly full filter must move fingerprints, never leave an
+// uncounted copy behind: the occupancy counter has to match the table after every batch.
+template <template <typename, typename, size_t, size_t> class Policy>
+void expectEvictionsKeepOneCopyPerKey() {
+    using Config = cuckoogpu::Config<uint32_t, 16, 500, 256, 16, Policy>;
+    const char* policy = Config::AltBucketPolicy::name;
+    cuckoogpu::Filter<Config> filter(1 << 12);
+    const size_t prefill = filter.capacity() * 96 / 100;
+    const size_t n = filter.capacity() * 35 / 1000;
+    thrust::device_vector<uint32_t> keys(prefill + n);
+    for (uint32_t batch = 0; batch < 500; ++batch) {
+        thrust::sequence(keys.begin(), keys.end(), batch * static_cast<uint32_t>(keys.size()) + 1);
+        filter.clear();
+        filter.insertMany(thrust::raw_pointer_cast(keys.data()), prefill);
+        const size_t counted =
+            filter.insertMany(thrust::raw_pointer_cast(keys.data()) + prefill, n);
+        ASSERT_EQ(filter.countOccupiedSlots(), counted) << policy << " batch " << batch;
+    }
+}
+
+TEST_F(CuckooFilterTest, ConcurrentEvictionsKeepOneCopyPerKey) {
+    expectEvictionsKeepOneCopyPerKey<cuckoogpu::XorAltBucketPolicy>();
+    expectEvictionsKeepOneCopyPerKey<cuckoogpu::OffsetAltBucketPolicy>();
+}
+
 TEST_F(CuckooFilterTest, InsertSortedAndVerifyOutput) {
     const size_t capacity = 10000;
     cuckoogpu::Filter<Config> filter(capacity);
