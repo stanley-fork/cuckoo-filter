@@ -1,12 +1,16 @@
 #pragma once
 
 #include <thrust/device_vector.h>
+#include <algorithm>
+#include <bit>
 #include <cstdint>
 #include <cub/cub.cuh>
 #include <cuda/atomic>
 #include <cuda/std/atomic>
 #include <cuda/std/cstddef>
 #include <cuda/std/cstdint>
+#include <mutex>
+#include <optional>
 #include <vector>
 #include "bucket_policies.cuh"
 #include "hashutil.cuh"
@@ -99,6 +103,24 @@ __global__ void insertKernelSorted(
 );
 
 /**
+ * @brief Maps thread `idx` so that consecutive warps walk `stripes` equally spaced chunks of
+ * [0, total) in round-robin instead of one contiguous range. Covers
+ * [0, stripedThreads(total, stripes)) bijectively; indices >= total must be skipped.
+ */
+__host__ __device__ inline size_t stripedChunk(size_t total, uint32_t stripes) {
+    return SDIV(SDIV(total, stripes), 32) * 32;
+}
+
+__host__ __device__ inline size_t stripedThreads(size_t total, uint32_t stripes) {
+    return stripedChunk(total, stripes) * stripes;
+}
+
+__device__ inline size_t stripedIndex(size_t idx, size_t total, uint32_t stripes) {
+    const size_t warp = idx / 32;
+    return (warp % stripes) * stripedChunk(total, stripes) + (warp / stripes) * 32 + idx % 32;
+}
+
+/**
  * @brief Kernel for computing packed tags for sorting.
  */
 template <typename Config>
@@ -126,6 +148,75 @@ __global__ void containsKernel(
 template <typename Config>
 __global__ void
 deleteKernel(const typename Config::KeyType* keys, bool* output, size_t n, Filter<Config>* filter);
+
+/// Keys handled per thread by the region scatter kernel.
+inline constexpr size_t partitionItemsPerThread = 8;
+
+/// Upper bound on the number of regions a batch is split into (sizes shared memory).
+inline constexpr uint32_t maxRegions = 1024;
+
+/**
+ * @brief Layout of a region-grouped batch: region r owns slots [r * capacity, (r + 1) * capacity)
+ * and covers the buckets whose index has r as its top bits.
+ */
+struct RegionLayout {
+    uint32_t localBits;   ///< Bucket-index bits below the region index
+    uint32_t numRegions;  ///< Number of regions (power of two)
+    uint32_t capacity;    ///< Slots per region
+};
+
+/**
+ * @brief Hashes keys and scatters region-local tags into their region's slots. Sets *overflow if
+ * any region runs out of capacity.
+ */
+template <typename Config>
+__global__ void regionScatterKernel(
+    const typename Config::KeyType* keys,
+    size_t n,
+    size_t numBuckets,
+    RegionLayout layout,
+    uint32_t* regionCounts,
+    typename Filter<Config>::RegionTagType* tags,
+    uint32_t* positions,
+    uint32_t* overflow
+);
+
+/**
+ * @brief Looks up every occupied slot of a region-grouped batch.
+ */
+template <typename Config>
+__global__ void regionContainsKernel(
+    const typename Filter<Config>::RegionTagType* tags,
+    const uint32_t* regionCounts,
+    RegionLayout layout,
+    uint32_t* results,
+    Filter<Config>* filter
+);
+
+/**
+ * @brief Mutates every occupied slot of a region-grouped batch, visiting `stripes` regions
+ * concurrently.
+ */
+template <typename Config, bool Delete = false>
+__global__ void regionMutationKernel(
+    const typename Filter<Config>::RegionTagType* tags,
+    const uint32_t* regionCounts,
+    RegionLayout layout,
+    bool* results,
+    Filter<Config>* filter,
+    uint32_t stripes
+);
+
+/**
+ * @brief output[i] = results[positions[i]].
+ */
+template <typename Config>
+__global__ void
+gatherKernel(const bool* results, const uint32_t* positions, bool* output, size_t n);
+
+template <typename Config>
+__global__ void
+gatherBitmapKernel(const uint32_t* results, const uint32_t* positions, bool* output, size_t n);
 
 }  // namespace detail
 
@@ -159,6 +250,9 @@ struct Filter {
     static_assert(detail::powerOfTwo(bucketSize), "Bucket size must be a power of 2");
 
     using PackedTagType = typename std::conditional<bitsPerTag <= 8, uint32_t, uint64_t>::type;
+
+    /// Region-local tag: the primary bucket's index bits below its region, then the fingerprint.
+    using RegionTagType = std::conditional_t<bitsPerTag <= 16, uint32_t, uint64_t>;
 
     /**
      * @brief This is used by the sorted insert kernel to store the fingerprint and primary bucket
@@ -414,7 +508,12 @@ struct Filter {
     cuda::std::atomic<size_t>* d_numEvictions{};  ///< Pointer to device memory for eviction counter
 #endif
 
-    size_t h_numOccupied = 0;  ///< Number of occupied buckets in the filter
+    size_t h_numOccupied = 0;   ///< Number of occupied buckets in the filter
+    uint32_t h_overflow = 0;    ///< Host copy of the region-overflow flag
+    size_t l2CacheBytes = 0;    ///< L2 size of the device the filter lives on
+    void* d_scratch{};          ///< Reusable device scratch for batch preprocessing
+    size_t d_scratchBytes = 0;  ///< Size of d_scratch in bytes
+    std::mutex scratchMutex;    ///< Serialises host calls that use d_scratch
 
     template <typename H>
     static __host__ __device__ uint64_t hash64(const H& key) {
@@ -477,6 +576,12 @@ struct Filter {
 #endif
 
         clear();
+
+        int device = 0;
+        int l2Bytes = 0;
+        CUCKOO_CUDA_CALL(cudaGetDevice(&device));
+        CUCKOO_CUDA_CALL(cudaDeviceGetAttribute(&l2Bytes, cudaDevAttrL2CacheSize, device));
+        l2CacheBytes = static_cast<size_t>(l2Bytes);
     }
 
     /**
@@ -487,6 +592,9 @@ struct Filter {
     ~Filter() {
         if (d_buckets) {
             CUCKOO_CUDA_CALL(cudaFree(d_buckets));
+        }
+        if (d_scratch) {
+            CUCKOO_CUDA_CALL(cudaFree(d_scratch));
         }
         if (d_numOccupied) {
             CUCKOO_CUDA_CALL(cudaFree(d_numOccupied));
@@ -522,11 +630,179 @@ struct Filter {
         bool* d_output = nullptr,
         cudaStream_t stream = {}
     ) {
+        if (usePartitioning(n)) {
+            std::lock_guard<std::mutex> lock(scratchMutex);
+            if (auto part = partitionByRegion(d_keys, n, d_output != nullptr, stream)) {
+                const auto stripes = regionMutationStripes(part->layout);
+                const size_t slots = part->slots();
+                detail::regionMutationKernel<Config>
+                    <<<SDIV(detail::stripedThreads(slots, stripes), blockSize),
+                       blockSize,
+                       0,
+                       stream>>>(
+                        part->tags, part->counts, part->layout, part->results, this, stripes
+                    );
+                if (d_output != nullptr) {
+                    detail::gatherKernel<Config><<<SDIV(n, blockSize), blockSize, 0, stream>>>(
+                        part->results, part->positions, d_output, n
+                    );
+                }
+                return syncOccupiedSlots(stream);
+            }
+        }
+
         size_t numBlocks = SDIV(n, blockSize);
         detail::insertKernel<Config>
             <<<numBlocks, blockSize, 0, stream>>>(d_keys, d_output, n, this, nullptr);
 
         return syncOccupiedSlots(stream);
+    }
+
+    /// Batch grouped by primary-bucket region, plus what is needed to restore input order.
+    struct RegionPartition {
+        RegionTagType* tags;  ///< Region-local tags, grouped by region
+        uint32_t* counts;     ///< Occupied slots per region
+        uint32_t* positions;  ///< positions[i] = slot of input key i (optional)
+        bool* results;        ///< Per-slot results (optional)
+        detail::RegionLayout layout;
+
+        [[nodiscard]] size_t slots() const {
+            return static_cast<size_t>(layout.numRegions) * layout.capacity;
+        }
+    };
+
+    /**
+     * @brief log2 of the number of regions batches are grouped into: at least 256 regions, and
+     * enough that a bucket's index below its region fits next to its fingerprint in a
+     * RegionTagType.
+     */
+    [[nodiscard]] size_t regionBits() const {
+        constexpr size_t maxLocalBits = sizeof(RegionTagType) * 8 - bitsPerTag;
+        const size_t bucketBits = bucketIndexBits();
+        return std::max<size_t>(
+            std::min<size_t>(8, bucketBits),
+            bucketBits > maxLocalBits ? bucketBits - maxLocalBits : 0
+        );
+    }
+
+    [[nodiscard]] detail::RegionLayout regionLayout(size_t n) const {
+        const size_t bits = regionBits();
+        const size_t numRegions = size_t{1} << bits;
+        // Hashing spreads keys evenly over regions, so 25% headroom plus one scatter tile absorbs
+        // normal variance; heavily skewed batches overflow and take the unpartitioned path.
+        constexpr size_t tile = blockSize * detail::partitionItemsPerThread;
+        const size_t capacity = SDIV(SDIV(n, numRegions) * 5 / 4 + tile, 32) * 32;
+        return {
+            static_cast<uint32_t>(bucketIndexBits() - bits),
+            static_cast<uint32_t>(numRegions),
+            static_cast<uint32_t>(capacity),
+        };
+    }
+
+    /**
+     * @brief Whether a batch should be grouped by primary-bucket region before processing.
+     *
+     * For filters larger than L2, random keys turn almost every bucket access into a DRAM access
+     * and every update into a write-back. Grouping keys by the top bits of their primary bucket
+     * makes consecutive work hit a small region of the table that stays in L2 (the alternate
+     * bucket is in the same 2^16-bucket block), so table traffic drops to roughly one pass. The
+     * grouping costs a few streaming passes over the batch, far less than the traffic it removes.
+     */
+    [[nodiscard]] bool usePartitioning(size_t n) const {
+        // Region decoding splits the bucket index into fixed-width bit fields.
+        if (!std::has_single_bit(numBuckets) || sizeInBytes() <= l2CacheBytes ||
+            n > UINT32_MAX / 2 || (size_t{1} << regionBits()) > detail::maxRegions) {
+            return false;
+        }
+        const auto layout = regionLayout(n);
+        return static_cast<size_t>(layout.numRegions) * layout.capacity <= UINT32_MAX;
+    }
+
+    [[nodiscard]] uint32_t regionMutationStripes(detail::RegionLayout layout) const {
+        // Spread CAS traffic across regions while keeping their working set within L2.
+        const size_t regionBytes = sizeInBytes() / layout.numRegions;
+        return static_cast<uint32_t>(
+            std::bit_floor(std::clamp<size_t>(l2CacheBytes / (4 * regionBytes), 1, 16))
+        );
+    }
+
+    /**
+     * @brief Hashes `d_keys` and scatters them into fixed-capacity regions by primary bucket.
+     *
+     * Returns std::nullopt if a region overflowed. Results live in the filter's scratch buffer,
+     * so the caller must hold scratchMutex until the stream has consumed them.
+     */
+    std::optional<RegionPartition> partitionByRegion(
+        const T* d_keys,
+        size_t n,
+        bool withPositions,
+        cudaStream_t stream,
+        bool bitmap = false
+    ) {
+        const auto layout = regionLayout(n);
+        const size_t slots = static_cast<size_t>(layout.numRegions) * layout.capacity;
+
+        auto aligned = [](size_t bytes) { return SDIV(bytes, 256) * 256; };
+        const size_t tagBytes = aligned(slots * sizeof(RegionTagType));
+        const size_t countBytes = aligned((layout.numRegions + 1) * sizeof(uint32_t));
+        const size_t posBytes = withPositions ? aligned(n * sizeof(uint32_t)) : 0;
+        const size_t resultBytes =
+            withPositions
+                ? aligned(bitmap ? SDIV(slots, 32) * sizeof(uint32_t) : slots * sizeof(bool))
+                : 0;
+
+        char* base =
+            static_cast<char*>(scratch(tagBytes + countBytes + posBytes + resultBytes, stream));
+        RegionPartition part{
+            reinterpret_cast<RegionTagType*>(base),
+            reinterpret_cast<uint32_t*>(base + tagBytes),
+            withPositions ? reinterpret_cast<uint32_t*>(base + tagBytes + countBytes) : nullptr,
+            withPositions ? reinterpret_cast<bool*>(base + tagBytes + countBytes + posBytes)
+                          : nullptr,
+            layout,
+        };
+        uint32_t* d_overflow = part.counts + layout.numRegions;
+
+        CUCKOO_CUDA_CALL(
+            cudaMemsetAsync(part.counts, 0, (layout.numRegions + 1) * sizeof(uint32_t), stream)
+        );
+        constexpr size_t tile = blockSize * detail::partitionItemsPerThread;
+        detail::regionScatterKernel<Config><<<SDIV(n, tile), blockSize, 0, stream>>>(
+            d_keys, n, numBuckets, layout, part.counts, part.tags, part.positions, d_overflow
+        );
+        CUCKOO_CUDA_CALL(cudaMemcpyAsync(
+            &h_overflow, d_overflow, sizeof(uint32_t), cudaMemcpyDeviceToHost, stream
+        ));
+        CUCKOO_CUDA_CALL(cudaStreamSynchronize(stream));
+        if (h_overflow != 0) {
+            return std::nullopt;
+        }
+        return part;
+    }
+
+    /**
+     * @brief Returns a device scratch buffer of at least `bytes`, reused across calls.
+     *
+     * Kept for the filter's lifetime because allocating gigabytes per batch costs more than the
+     * batch itself. Growing waits for `stream` so in-flight users of the old buffer finish first.
+     */
+    void* scratch(size_t bytes, cudaStream_t stream) {
+        if (bytes > d_scratchBytes) {
+            CUCKOO_CUDA_CALL(cudaStreamSynchronize(stream));
+            if (d_scratch) {
+                CUCKOO_CUDA_CALL(cudaFree(d_scratch));
+                d_scratch = nullptr;
+                d_scratchBytes = 0;
+            }
+            CUCKOO_CUDA_CALL(cudaMalloc(&d_scratch, bytes));
+            d_scratchBytes = bytes;
+        }
+        return d_scratch;
+    }
+
+    /// log2(numBuckets); numBuckets is always a power of two.
+    [[nodiscard]] size_t bucketIndexBits() const {
+        return static_cast<size_t>(std::countr_zero(numBuckets));
     }
 
 #ifdef CUCKOO_FILTER_COUNT_EVICTIONS
@@ -694,6 +970,24 @@ struct Filter {
      */
     void containsMany(const T* d_keys, const size_t n, bool* d_output, cudaStream_t stream = {}) {
         size_t numBlocks = SDIV(n, blockSize);
+        if (usePartitioning(n)) {
+            std::lock_guard<std::mutex> lock(scratchMutex);
+            if (auto part = partitionByRegion(d_keys, n, true, stream, true)) {
+                constexpr size_t queryBlockSize = SDIV(blockSize, 32) * 32;
+                auto* bitmap = reinterpret_cast<uint32_t*>(part->results);
+                detail::regionContainsKernel<Config>
+                    <<<SDIV(part->slots(), queryBlockSize), queryBlockSize, 0, stream>>>(
+                        part->tags, part->counts, part->layout, bitmap, this
+                    );
+                detail::gatherBitmapKernel<Config>
+                    <<<SDIV(n, 4 * blockSize), blockSize, 0, stream>>>(
+                        bitmap, part->positions, d_output, n
+                    );
+                CUCKOO_CUDA_CALL(cudaStreamSynchronize(stream));
+                return;
+            }
+        }
+
         detail::containsKernel<Config>
             <<<numBlocks, blockSize, 0, stream>>>(d_keys, d_output, n, this);
 
@@ -717,7 +1011,41 @@ struct Filter {
         bool* d_output = nullptr,
         cudaStream_t stream = {}
     ) {
+        if (n == 0) {
+            return syncOccupiedSlots(stream);
+        }
         size_t numBlocks = SDIV(n, blockSize);
+        if (n >= numBuckets && usePartitioning(n)) {
+            std::lock_guard<std::mutex> lock(scratchMutex);
+            constexpr bool bitmap = blockSize % 32 == 0;
+            if (auto part = partitionByRegion(d_keys, n, d_output != nullptr, stream, bitmap)) {
+                const auto stripes = regionMutationStripes(part->layout);
+                const size_t slots = part->slots();
+                detail::regionMutationKernel<Config, true>
+                    <<<SDIV(detail::stripedThreads(slots, stripes), blockSize),
+                       blockSize,
+                       0,
+                       stream>>>(
+                        part->tags, part->counts, part->layout, part->results, this, stripes
+                    );
+                if (d_output != nullptr) {
+                    if constexpr (bitmap) {
+                        detail::gatherBitmapKernel<Config>
+                            <<<SDIV(n, 4 * blockSize), blockSize, 0, stream>>>(
+                                reinterpret_cast<const uint32_t*>(part->results),
+                                part->positions,
+                                d_output,
+                                n
+                            );
+                    } else {
+                        detail::gatherKernel<Config><<<numBlocks, blockSize, 0, stream>>>(
+                            part->results, part->positions, d_output, n
+                        );
+                    }
+                }
+                return syncOccupiedSlots(stream);
+            }
+        }
         detail::deleteKernel<Config>
             <<<numBlocks, blockSize, 0, stream>>>(d_keys, d_output, n, this);
 
@@ -1187,24 +1515,59 @@ struct Filter {
         return occupiedCount;
     }
 
-    /**
-     * @brief Attempt to remove a single instance of a fingerprint from a bucket
-     *
-     * Scans the atomic words that make up the bucket and attempts a CAS on each matching
-     * tag position until one removal succeeds. This allows multiple concurrent
-     * deleters to remove distinct copies when a bucket contains several identical
-     * fingerprints instead of all trying to clear the same slot
-     *
-     * The function is lock-free and uses per-word compare-and-swap operations.
-     * It does NOT update any global occupancy counter, the caller is responsible
-     * for decrementing d_numOccupied if appropriate
-     *
-     * @param bucketIdx Index of the bucket to search.
-     * @param tag       Fingerprint value to remove (must not be EMPTY).
-     * @return true if a single instance of `tag` was removed from the bucket;
-     *         false if no matching tag remained (or another thread removed the
-     *         last matching instance before this call could succeed).
-     */
+    template <typename TryWord>
+    __device__ __forceinline__ static bool scanBucket(
+        Bucket& bucket,
+        size_t startWord,
+        typename Bucket::WordType replicated,
+        TryWord tryWord
+    ) {
+        using WordType = typename Bucket::WordType;
+#if __CUDA_ARCH__ >= 1000 && !defined(CUCKOO_FILTER_DISABLE_256BIT_LOADS)
+        constexpr bool wide = sizeof(Bucket) == 32 && sizeof(WordType) == 8;
+#else
+        constexpr bool wide = false;
+#endif
+        if constexpr (wide) {
+            // Snapshot one sector. Every write still validates its word by CAS.
+            WordType words[Bucket::wordCount];
+            asm volatile("ld.relaxed.gpu.global.v4.b64 {%0, %1, %2, %3}, [%4];"
+                         : "=l"(words[0]), "=l"(words[1]), "=l"(words[2]), "=l"(words[3])
+                         : "l"(&bucket.packedTags[0]));
+            uint32_t matches = 0;
+            _Pragma("unroll")
+            for (uint32_t k = 0; k < Bucket::wordCount; ++k) {
+                matches |= uint32_t(detail::hasZero<TagType, WordType>(words[k] ^ replicated)) << k;
+            }
+            constexpr uint32_t wordMask = Bucket::wordCount - 1;
+            // Rotate the mask to keep the tag-dependent probe order.
+            matches = ((matches | (matches << Bucket::wordCount)) >> startWord) &
+                      ((1u << Bucket::wordCount) - 1);
+            while (matches != 0) {
+                const auto step = static_cast<uint32_t>(__ffs(matches) - 1);
+                const auto idx = (startWord + step) & wordMask;
+                WordType expected = words[0];  // Constant indices keep the snapshot in registers.
+                _Pragma("unroll")
+                for (uint32_t k = 1; k < Bucket::wordCount; ++k) {
+                    expected = idx == k ? words[k] : expected;
+                }
+                if (tryWord(idx, expected)) {
+                    return true;
+                }
+                matches &= matches - 1;
+            }
+        } else {
+            for (size_t i = 0; i < Bucket::wordCount; ++i) {
+                const size_t idx = (startWord + i) & (Bucket::wordCount - 1);
+                if (tryWord(idx, bucket.word(idx).load(cuda::memory_order_relaxed))) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /** Removes one matching fingerprint without updating the occupancy counter. */
     __device__ bool tryRemoveAtBucket(size_t bucketIdx, TagType tag) {
         Bucket& bucket = d_buckets[bucketIdx];
 
@@ -1213,21 +1576,10 @@ struct Filter {
 
         using WordType = typename Bucket::WordType;
 
-        for (size_t i = 0; i < Bucket::wordCount; ++i) {
-            const size_t currIdx = (startWord + i) & (Bucket::wordCount - 1);
-
-            while (true) {
-                auto expected = bucket.word(currIdx).load(cuda::memory_order_relaxed);
-
-                WordType matchMask = detail::getZeroMask<TagType, WordType>(
-                    expected ^ detail::replicateTag<TagType, WordType>(tag)
-                );
-
-                if (matchMask == 0) {
-                    // No matching tags in this word
-                    break;
-                }
-
+        const auto replicated = detail::replicateTag<TagType, WordType>(tag);
+        auto tryWord = [&](size_t currIdx, WordType expected) {
+            while (const auto matchMask =
+                       detail::getZeroMask<TagType, WordType>(expected ^ replicated)) {
                 // Find position of first matching tag
                 int bitPos;
                 if constexpr (sizeof(WordType) == 4) {
@@ -1255,9 +1607,9 @@ struct Filter {
                 }
                 // CAS failed, retry with updated expected value
             }
-        }
-
-        return false;
+            return false;
+        };
+        return scanBucket(bucket, startWord, replicated, tryWord);
     }
 
     /**
@@ -1275,64 +1627,25 @@ struct Filter {
         const size_t startWord = startIdx / Bucket::tagsPerWord;
 
         using WordType = typename Bucket::WordType;
-
-#if __CUDA_ARCH__ >= 1000 && !defined(CUCKOO_FILTER_DISABLE_256BIT_LOADS)
-        // The whole bucket is one 32-byte sector: snapshot it with a single L2 request instead of
-        // one request per scanned word. Words may tear relative to each other, which is harmless
-        // because each update is validated by its own CAS.
-        constexpr bool snapshot = sizeof(Bucket) == 32 && sizeof(WordType) == 8;
-        WordType words[Bucket::wordCount];
-        if constexpr (snapshot) {
-            asm volatile("ld.relaxed.gpu.global.v4.b64 {%0, %1, %2, %3}, [%4];"
-                         : "=l"(words[0]), "=l"(words[1]), "=l"(words[2]), "=l"(words[3])
-                         : "l"(&bucket.packedTags[0]));
-        }
-#else
-        constexpr bool snapshot = false;
-        WordType words[Bucket::wordCount];
-#endif
-
-        for (size_t i = 0; i < Bucket::wordCount; ++i) {
-            const size_t currWord = (startWord + i) & (Bucket::wordCount - 1);
-            WordType expected;
-            if constexpr (snapshot) {
-                // Select chain instead of words[currWord] keeps the array in registers.
-                expected = words[0];
-                _Pragma("unroll")
-                for (size_t k = 1; k < Bucket::wordCount; ++k) {
-                    expected = currWord == k ? words[k] : expected;
-                }
-            } else {
-                expected = bucket.word(currWord).load(cuda::memory_order_relaxed);
-            }
-
-            while (true) {
-                WordType zeroMask = detail::getZeroMask<TagType, WordType>(expected);
-
-                if (zeroMask == 0) {
-                    // No empty slots in this word, move to next
-                    break;
-                }
-
-                // Find position of first empty slot (returns 1-indexed bit position)
+        auto tryWord = [&](size_t idx, WordType expected) {
+            while (const WordType zeros = detail::getZeroMask<TagType, WordType>(expected)) {
                 int bitPos;
                 if constexpr (sizeof(WordType) == 4) {
-                    bitPos = __ffs(static_cast<int>(zeroMask)) - 1;
+                    bitPos = __ffs(static_cast<int>(zeros)) - 1;
                 } else {
-                    bitPos = __ffsll(static_cast<long long>(zeroMask)) - 1;
+                    bitPos = __ffsll(static_cast<long long>(zeros)) - 1;
                 }
-                size_t j = bitPos / bitsPerTag;
-
-                auto desired = bucket.replaceTag(expected, j, tag);
-
-                if (bucket.word(currWord).compare_exchange_strong(
+                const auto desired = bucket.replaceTag(expected, bitPos / bitsPerTag, tag);
+                if (bucket.word(idx).compare_exchange_strong(
                         expected, desired, cuda::memory_order_relaxed, cuda::memory_order_relaxed
                     )) {
                     return true;
                 }
             }
-        }
-        return false;
+            return false;
+        };
+
+        return scanBucket(bucket, startWord, WordType{0}, tryWord);
     }
 
     /**
@@ -1514,9 +1827,22 @@ struct Filter {
      */
     __device__ bool insert(const T& key, uint32_t* evictionAttempts = nullptr) {
         auto [i1, i2, fp1, fp2] = getCandidateBucketsAndFPs(key, numBuckets);
+        return insertCandidates(i1, i2, fp1, fp2, evictionAttempts);
+    }
 
-        // For all policies: fp1 is for bucket i1, fp2 is for bucket i2
-        // For non-choice-bit policies, fp1 == fp2
+    /**
+     * @brief Inserts a fingerprint given both candidate buckets, evicting if necessary.
+     *
+     * fp1 is the fingerprint for bucket i1 and fp2 for bucket i2 (equal for non-choice-bit
+     * policies).
+     */
+    __device__ bool insertCandidates(
+        size_t i1,
+        size_t i2,
+        TagType fp1,
+        TagType fp2,
+        uint32_t* evictionAttempts = nullptr
+    ) {
         if (tryInsertAtBucket(i1, fp1) || tryInsertAtBucket(i2, fp2)) {
             return true;
         }
@@ -1556,6 +1882,29 @@ struct Filter {
         // fp1 is for bucket i1, fp2 is for bucket i2
         // For non-choice-bit policies, fp1 == fp2
         return d_buckets[i1].contains(fp1) || d_buckets[i2].contains(fp2);
+    }
+
+    /**
+     * @brief Decodes slot `slot` of a region-grouped batch into its primary bucket and
+     * fingerprint. Returns false for unused slots.
+     */
+    __device__ static bool decodeRegionSlot(
+        const RegionTagType* tags,
+        const uint32_t* regionCounts,
+        detail::RegionLayout layout,
+        size_t slot,
+        size_t& bucket,
+        TagType& fp
+    ) {
+        const size_t region = slot / layout.capacity;
+        const size_t offset = slot - region * layout.capacity;
+        if (region >= layout.numRegions || offset >= regionCounts[region]) {
+            return false;
+        }
+        const RegionTagType tag = tags[slot];
+        bucket = (region << layout.localBits) | static_cast<size_t>(tag >> bitsPerTag);
+        fp = static_cast<TagType>(tag & fpMask);
+        return true;
     }
 
     /**
@@ -1747,6 +2096,216 @@ __global__ void insertKernelSorted(
 
     if (threadIdx.x == 0 && blockSum > 0) {
         filter->d_numOccupied->fetch_add(blockSum, cuda::memory_order_relaxed);
+    }
+}
+
+template <typename Config>
+__global__ void regionScatterKernel(
+    const typename Config::KeyType* keys,
+    size_t n,
+    size_t numBuckets,
+    RegionLayout layout,
+    uint32_t* regionCounts,
+    typename Filter<Config>::RegionTagType* tags,
+    uint32_t* positions,
+    uint32_t* overflow
+) {
+    using RegionTagType = typename Filter<Config>::RegionTagType;
+    constexpr uint32_t blockSize = Config::blockSize;
+    constexpr uint32_t tileSize = blockSize * partitionItemsPerThread;
+    constexpr uint32_t binsPerThread = (maxRegions + blockSize - 1) / blockSize;
+    constexpr uint32_t noSlot = UINT32_MAX;
+    using BlockScan = cub::BlockScan<uint32_t, blockSize>;
+
+    __shared__ uint32_t binCount[maxRegions];
+    __shared__ uint32_t binStart[maxRegions];
+    __shared__ uint32_t regionBase[maxRegions];
+    __shared__ RegionTagType staged[tileSize];
+    __shared__ uint16_t stagedBin[tileSize];
+    __shared__ typename BlockScan::TempStorage scanStorage;
+
+    const uint32_t numRegions = layout.numRegions;
+    for (uint32_t b = threadIdx.x; b < numRegions; b += blockSize) {
+        binCount[b] = 0;
+    }
+    __syncthreads();
+
+    // Rank every key within its region for this tile.
+    const size_t base = static_cast<size_t>(blockIdx.x) * tileSize;
+    const size_t localMask = (size_t{1} << layout.localBits) - 1;
+    RegionTagType tag[partitionItemsPerThread];
+    uint32_t bin[partitionItemsPerThread];
+    uint32_t rank[partitionItemsPerThread];
+    _Pragma("unroll")
+    for (uint32_t k = 0; k < partitionItemsPerThread; ++k) {
+        const size_t i = base + k * blockSize + threadIdx.x;
+        if (i < n) {
+            auto [i1, i2, fp1, fp2] =
+                Filter<Config>::getCandidateBucketsAndFPs(keys[i], numBuckets);
+            tag[k] = (static_cast<RegionTagType>(i1 & localMask) << Config::bitsPerTag) |
+                     static_cast<RegionTagType>(fp1);
+            bin[k] = static_cast<uint32_t>(i1 >> layout.localBits);
+            rank[k] = atomicAdd(&binCount[bin[k]], 1u);
+        }
+    }
+    __syncthreads();
+
+    uint32_t counts[binsPerThread];
+    _Pragma("unroll")
+    for (uint32_t j = 0; j < binsPerThread; ++j) {
+        const uint32_t b = threadIdx.x * binsPerThread + j;
+        counts[j] = b < numRegions ? binCount[b] : 0;
+    }
+    BlockScan(scanStorage).ExclusiveSum(counts, counts);
+    _Pragma("unroll")
+    for (uint32_t j = 0; j < binsPerThread; ++j) {
+        const uint32_t b = threadIdx.x * binsPerThread + j;
+        if (b < numRegions) {
+            binStart[b] = counts[j];
+        }
+    }
+
+    // Claim this tile's share of each region.
+    for (uint32_t b = threadIdx.x; b < numRegions; b += blockSize) {
+        const uint32_t count = binCount[b];
+        uint32_t slot = noSlot;
+        if (count > 0) {
+            const uint32_t offset = atomicAdd(&regionCounts[b], count);
+            if (offset + count <= layout.capacity) {
+                slot = b * layout.capacity + offset;
+            } else {
+                atomicOr(overflow, 1u);
+            }
+        }
+        regionBase[b] = slot;
+    }
+    __syncthreads();
+
+    // Stage the tile grouped by region, then write each region's run contiguously.
+    _Pragma("unroll")
+    for (uint32_t k = 0; k < partitionItemsPerThread; ++k) {
+        const size_t i = base + k * blockSize + threadIdx.x;
+        if (i < n) {
+            const uint32_t s = binStart[bin[k]] + rank[k];
+            staged[s] = tag[k];
+            stagedBin[s] = static_cast<uint16_t>(bin[k]);
+            if (positions != nullptr && regionBase[bin[k]] != noSlot) {
+                positions[i] = regionBase[bin[k]] + rank[k];
+            }
+        }
+    }
+    __syncthreads();
+
+    const auto tileCount = static_cast<uint32_t>(min(static_cast<size_t>(tileSize), n - base));
+    for (uint32_t j = threadIdx.x; j < tileCount; j += blockSize) {
+        const uint32_t b = stagedBin[j];
+        if (regionBase[b] != noSlot) {
+            tags[regionBase[b] + (j - binStart[b])] = staged[j];
+        }
+    }
+}
+
+template <typename Config>
+__global__ void regionContainsKernel(
+    const typename Filter<Config>::RegionTagType* tags,
+    const uint32_t* regionCounts,
+    RegionLayout layout,
+    uint32_t* results,
+    Filter<Config>* filter
+) {
+    using FilterType = Filter<Config>;
+
+    const size_t slot = globalThreadId();
+    size_t i1;
+    typename FilterType::TagType fp1;
+    bool found = false;
+    if (FilterType::decodeRegionSlot(tags, regionCounts, layout, slot, i1, fp1)) {
+        auto [i2, fp2] = FilterType::getAlternateBucketWithNewFp(i1, fp1, filter->numBuckets);
+        found = filter->d_buckets[i1].contains(fp1) || filter->d_buckets[i2].contains(fp2);
+    }
+    const uint32_t bits = __ballot_sync(0xffffffffu, found);
+    if (slot % 32 == 0 &&
+        slot / 32 < static_cast<size_t>(layout.numRegions) * layout.capacity / 32) {
+        results[slot / 32] = bits;
+    }
+}
+
+template <typename Config>
+__global__ void
+gatherBitmapKernel(const uint32_t* results, const uint32_t* positions, bool* output, size_t n) {
+    // Four keys per thread: independent bitmap reads and one 32-bit output store.
+    const size_t first = globalThreadId() * 4;
+    auto bit = [&](uint32_t slot) { return (results[slot / 32] >> (slot % 32)) & 1; };
+    if (first + 4 <= n && reinterpret_cast<uintptr_t>(output) % 4 == 0) {
+        const uint4 slots = *reinterpret_cast<const uint4*>(positions + first);
+        const uint32_t packed =
+            bit(slots.x) | bit(slots.y) << 8 | bit(slots.z) << 16 | bit(slots.w) << 24;
+        *reinterpret_cast<uint32_t*>(output + first) = packed;
+    } else {
+        for (size_t idx = first; idx < min(first + 4, n); ++idx) {
+            output[idx] = bit(positions[idx]);
+        }
+    }
+}
+
+template <typename Config, bool Delete>
+__global__ void regionMutationKernel(
+    const typename Filter<Config>::RegionTagType* tags,
+    const uint32_t* regionCounts,
+    RegionLayout layout,
+    bool* results,
+    Filter<Config>* filter,
+    uint32_t stripes
+) {
+    using FilterType = Filter<Config>;
+    using BlockReduce = cub::BlockReduce<int32_t, Config::blockSize>;
+    __shared__ typename BlockReduce::TempStorage tempStorage;
+
+    const size_t slots = static_cast<size_t>(layout.numRegions) * layout.capacity;
+    const size_t slot = stripedIndex(globalThreadId(), slots, stripes);
+
+    int32_t success = 0;
+    size_t i1;
+    typename FilterType::TagType fp1;
+    if (slot < slots && FilterType::decodeRegionSlot(tags, regionCounts, layout, slot, i1, fp1)) {
+        auto [i2, fp2] = FilterType::getAlternateBucketWithNewFp(i1, fp1, filter->numBuckets);
+        if constexpr (Delete) {
+            success = filter->tryRemoveAtBucket(i1, fp1) || filter->tryRemoveAtBucket(i2, fp2);
+        } else {
+            success = filter->insertCandidates(i1, i2, fp1, fp2);
+        }
+        if constexpr (!Delete || Config::blockSize % 32 != 0) {
+            if (results != nullptr) {
+                results[slot] = success;
+            }
+        }
+    }
+
+    if constexpr (Delete && Config::blockSize % 32 == 0) {
+        if (results != nullptr) {
+            const uint32_t bits = __ballot_sync(0xffffffffu, success);
+            if (slot % 32 == 0 && slot < slots) {
+                reinterpret_cast<uint32_t*>(results)[slot / 32] = bits;
+            }
+        }
+    }
+
+    int32_t blockSum = BlockReduce(tempStorage).Sum(success);
+    if (threadIdx.x == 0 && blockSum > 0) {
+        if constexpr (Delete) {
+            filter->d_numOccupied->fetch_sub(blockSum, cuda::memory_order_relaxed);
+        } else {
+            filter->d_numOccupied->fetch_add(blockSum, cuda::memory_order_relaxed);
+        }
+    }
+}
+
+template <typename Config>
+__global__ void
+gatherKernel(const bool* results, const uint32_t* positions, bool* output, size_t n) {
+    const size_t idx = globalThreadId();
+    if (idx < n) {
+        output[idx] = results[positions[idx]];
     }
 }
 

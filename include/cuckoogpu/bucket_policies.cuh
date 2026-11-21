@@ -62,6 +62,13 @@ struct XorAltBucketPolicy {
         return {i1, i2, fp, fp};
     }
 
+    /// The XOR offset only touches the low bits of the bucket index, so both candidate buckets lie
+    /// in the same aligned block of 2^16 buckets. That keeps every access of a key (and of each
+    /// eviction step) inside one small region of the table, which region-partitioned batches
+    /// can serve from L2. A block still holds 2^16 * bucketSize slots, so per-block load stays
+    /// tightly concentrated around the global load factor.
+    static constexpr size_t altBucketBits = 16;
+
     /**
      * @brief Computes the alternate bucket index using XOR.
      *
@@ -72,7 +79,8 @@ struct XorAltBucketPolicy {
      */
     static __host__ __device__ size_t
     getAlternateBucket(size_t bucket, TagType fp, size_t numBuckets) {
-        return bucket ^ (hash64(fp) & (numBuckets - 1));
+        constexpr size_t altMask = (size_t{1} << altBucketBits) - 1;
+        return bucket ^ (hash64(fp) & (numBuckets - 1) & altMask);
     }
 
     /**

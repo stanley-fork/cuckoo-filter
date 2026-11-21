@@ -1,6 +1,8 @@
 #include <cuda_runtime.h>
 #include <gtest/gtest.h>
+#include <thrust/count.h>
 #include <thrust/device_vector.h>
+#include <thrust/sequence.h>
 #include <cuckoogpu/CuckooFilter.cuh>
 #include <cuckoogpu/helpers.cuh>
 #include <random>
@@ -425,4 +427,130 @@ TEST_F(CuckooFilterTest, InsertSortedAndVerifyOutput) {
     for (size_t i = 0; i < keys.size(); ++i) {
         EXPECT_TRUE(containsOutput[i]) << "Key " << keys[i] << " should be found after insertion";
     }
+}
+
+// Filters larger than L2 group each batch by bucket region before processing; per-key outputs
+// must still come back in input order.
+TEST_F(CuckooFilterTest, LargerThanL2KeepsOutputOrder) {
+    int device = 0;
+    int l2Bytes = 0;
+    ASSERT_EQ(cudaGetDevice(&device), cudaSuccess);
+    ASSERT_EQ(cudaDeviceGetAttribute(&l2Bytes, cudaDevAttrL2CacheSize, device), cudaSuccess);
+
+    // 16-bit tags: 2 bytes per slot, so this is about 4x the L2 size.
+    const size_t capacity = 2 * static_cast<size_t>(l2Bytes);
+    cuckoogpu::Filter<Config> filter(capacity);
+    ASSERT_GT(filter.sizeInBytes(), static_cast<size_t>(l2Bytes));
+
+    // Insert every odd key 1, 3, 5, ... up to ~90% load, then query 1, 2, 3, ... interleaved.
+    const size_t numInserted = filter.capacity() * 9 / 10;
+    thrust::device_vector<uint32_t> d_inserted(numInserted);
+    thrust::sequence(d_inserted.begin(), d_inserted.end(), 1u, 2u);
+    thrust::device_vector<uint8_t> d_insertOutput(numInserted);
+
+    size_t occupied = filter.insertMany(d_inserted, d_insertOutput);
+    ASSERT_EQ(occupied, numInserted);
+    EXPECT_EQ(thrust::count(d_insertOutput.begin(), d_insertOutput.end(), uint8_t{1}), numInserted);
+
+    const size_t numQueried = 2 * numInserted;
+    thrust::device_vector<uint32_t> d_queried(numQueried);
+    thrust::sequence(d_queried.begin(), d_queried.end(), 1u);
+    thrust::device_vector<uint8_t> d_containsOutput(numQueried);
+    filter.containsMany(d_queried, d_containsOutput);
+
+    std::vector<uint8_t> found(numQueried);
+    thrust::copy(d_containsOutput.begin(), d_containsOutput.end(), found.begin());
+
+    size_t falseNegatives = 0;
+    size_t falsePositives = 0;
+    for (size_t i = 0; i < numQueried; ++i) {
+        const bool wasInserted = i % 2 == 0;
+        falseNegatives += wasInserted && !found[i];
+        falsePositives += !wasInserted && found[i];
+    }
+    EXPECT_EQ(falseNegatives, 0u);
+    // Expected FPR is about 2 * 16 * 0.9 / 2^16 = 0.04%; misordered output would give ~50%.
+    EXPECT_LT(falsePositives, numInserted / 100);
+}
+
+// A batch whose keys all land in one bucket region cannot be region-grouped; it must still be
+// answered correctly.
+TEST_F(CuckooFilterTest, LargerThanL2SkewedBatch) {
+    int device = 0;
+    int l2Bytes = 0;
+    ASSERT_EQ(cudaGetDevice(&device), cudaSuccess);
+    ASSERT_EQ(cudaDeviceGetAttribute(&l2Bytes, cudaDevAttrL2CacheSize, device), cudaSuccess);
+
+    cuckoogpu::Filter<Config> filter(2 * static_cast<size_t>(l2Bytes));
+    ASSERT_GT(filter.sizeInBytes(), static_cast<size_t>(l2Bytes));
+
+    thrust::device_vector<uint32_t> d_key(1, 42u);
+    ASSERT_EQ(filter.insertMany(d_key), 1u);
+
+    const size_t n = 1 << 20;
+    thrust::device_vector<uint32_t> d_queried(n, 42u);
+    thrust::device_vector<uint8_t> d_found(n);
+    filter.containsMany(d_queried, d_found);
+    EXPECT_EQ(thrust::count(d_found.begin(), d_found.end(), uint8_t{1}), n);
+}
+
+TEST_F(CuckooFilterTest, LargerThanL2WithOddBucketCount) {
+    using OffsetConfig =
+        cuckoogpu::Config<uint32_t, 16, 500, 256, 16, cuckoogpu::OffsetAltBucketPolicy>;
+    using Filter = cuckoogpu::Filter<OffsetConfig>;
+    int device = 0;
+    int l2Bytes = 0;
+    ASSERT_EQ(cudaGetDevice(&device), cudaSuccess);
+    ASSERT_EQ(cudaDeviceGetAttribute(&l2Bytes, cudaDevAttrL2CacheSize, device), cudaSuccess);
+
+    const size_t buckets = (static_cast<size_t>(l2Bytes) / sizeof(Filter::Bucket) + 1) | 1;
+    Filter filter(buckets * OffsetConfig::bucketSize);
+    constexpr size_t n = 16387;
+    thrust::device_vector<uint32_t> keys(n);
+    thrust::sequence(keys.begin(), keys.end());
+    thrust::device_vector<uint8_t> found(n);
+
+    ASSERT_EQ(filter.insertMany(keys), n);
+    filter.containsMany(keys, found);
+    EXPECT_EQ(thrust::count(found.begin(), found.end(), uint8_t{1}), n);
+}
+
+TEST_F(CuckooFilterTest, LargerThanL2DeletePreservesOutputOrder) {
+    int device = 0;
+    int l2Bytes = 0;
+    ASSERT_EQ(cudaGetDevice(&device), cudaSuccess);
+    ASSERT_EQ(cudaDeviceGetAttribute(&l2Bytes, cudaDevAttrL2CacheSize, device), cudaSuccess);
+
+    using Filter = cuckoogpu::Filter<Config>;
+    Filter filter((static_cast<size_t>(l2Bytes) / sizeof(Filter::Bucket) + 1) * Config::bucketSize);
+    const size_t n = filter.getNumBuckets() + 3;
+    thrust::device_vector<uint32_t> keys(n);
+    thrust::sequence(keys.begin(), keys.end(), 1u);
+    const size_t first = n / 3;
+    const size_t second = 2 * first;
+    const uint32_t key = keys[first];
+    keys[second] = key;
+    thrust::device_vector<uint32_t> duplicates(2, key);
+    ASSERT_EQ(filter.insertMany(duplicates), 2u);
+
+    thrust::device_vector<uint8_t> output(n);
+    filter.containsMany(keys, output);
+    // Exclude keys that already collide before testing delete output order.
+    std::vector<uint8_t> found(n);
+    thrust::copy(output.begin(), output.end(), found.begin());
+    const auto miss = std::find(found.begin(), found.end(), uint8_t{0});
+    ASSERT_NE(miss, found.end());
+    const uint32_t missKey = std::distance(found.begin(), miss) + 1;
+    for (size_t i = 0; i < n; ++i) {
+        if (i != first && i != second && found[i]) {
+            keys[i] = missKey;
+        }
+    }
+    ASSERT_EQ(filter.deleteMany(keys, output), 0u);
+    EXPECT_EQ(thrust::count(output.begin(), output.end(), uint8_t{1}), 2);
+    EXPECT_EQ(static_cast<uint8_t>(output[first]), 1u);
+    EXPECT_EQ(static_cast<uint8_t>(output[second]), 1u);
+    thrust::device_vector<uint8_t> remaining(2);
+    filter.containsMany(duplicates, remaining);
+    EXPECT_EQ(thrust::count(remaining.begin(), remaining.end(), uint8_t{1}), 0);
 }

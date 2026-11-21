@@ -19,6 +19,17 @@ This library provides a GPU-accelerated Cuckoo Filter implementation optimized f
 - Experimental IPC support for cross-process filter sharing
 - Header-only library design
 
+For filters with a power-of-two bucket count that exceed GPU L2 cache,
+`insertMany`, `containsMany`, and `deleteMany` can group keys by primary
+bucket region. `deleteMany` uses this path only for batches with at least as
+many keys as buckets. Per-key results stay in input order. The filter
+retains the device scratch buffer for reuse until destruction.
+
+The XOR policy keeps both candidate buckets in the same aligned group of up
+to 65,536 buckets. This changes bucket placement for larger filters compared
+with versions that use a full-width XOR offset. Rebuild those filters from
+their keys rather than reuse their bucket contents.
+
 ## Performance
 
 ![image](./docs/load_factor_bar_95.png)
