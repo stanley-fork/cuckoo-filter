@@ -70,7 +70,8 @@ struct Config {
     );
     static_assert(sizeof(TagType) <= sizeof(WordType), "TagType must fit within WordType");
 
-    using AltBucketPolicy = AltBucketPolicy_<KeyType, TagType, bitsPerTag, bucketSize_>;
+    /// The top bit of every slot holds the bucket's overflow mask, so fingerprints use the rest.
+    using AltBucketPolicy = AltBucketPolicy_<KeyType, TagType, bitsPerTag - 1, bucketSize_>;
 };
 
 template <typename Config>
@@ -303,7 +304,9 @@ struct Filter {
     };
 
     static constexpr TagType EMPTY = 0;
-    static constexpr size_t fpMask = (1ULL << bitsPerTag) - 1;
+    /// Fingerprint bits of a slot. The top bit of every slot instead belongs to its bucket's
+    /// overflow mask (see `Bucket::overflowBit`).
+    static constexpr size_t fpMask = (1ULL << (bitsPerTag - 1)) - 1;
 
     /**
      * @brief Bucket structure that holds the fingerprint and tags for a given bucket.
@@ -382,6 +385,20 @@ struct Filter {
             ) const {
                 return compare_exchange_strong(expected, desired, success, failure);
             }
+
+            __device__ __forceinline__ void fetchOr(WordType bits) const {
+                if constexpr (sizeof(WordType) == 8) {
+                    asm volatile("red.relaxed.gpu.global.or.b64 [%0], %1;"
+                                 :
+                                 : "l"(ptr), "l"(bits)
+                                 : "memory");
+                } else {
+                    asm volatile("red.relaxed.gpu.global.or.b32 [%0], %1;"
+                                 :
+                                 : "l"(ptr), "r"(bits)
+                                 : "memory");
+                }
+            }
         };
 
         __device__ __forceinline__ WordRef word(size_t idx) {
@@ -400,6 +417,28 @@ struct Filter {
             return cleared | (static_cast<WordType>(newTag) << shift);
         }
 
+        /// Fingerprint bits of every slot in a word.
+        static constexpr WordType fpLanes =
+            detail::replicateTag<TagType, WordType>(static_cast<TagType>(fpMask));
+
+        /// Marks slots whose fingerprint is zero (empty), ignoring overflow bits.
+        __host__ __device__ __forceinline__ static constexpr WordType fpZeroMask(WordType v) {
+            return detail::getZeroMask<TagType, WordType>(v & fpLanes);
+        }
+
+        /**
+         * Overflow mask: a tag with fingerprint `fp` that leaves this bucket for its other
+         * candidate (or skips it) sets this bit first. Lookups that miss here only need the
+         * other bucket if it is set. Bits are only cleared by `clear()`.
+         */
+        __host__ __device__ static constexpr size_t overflowWord(TagType fp) {
+            return (fp & (bucketSize - 1)) / tagsPerWord;
+        }
+
+        __host__ __device__ static constexpr WordType overflowBit(TagType fp) {
+            return WordType(1) << ((fp & (tagsPerWord - 1)) * bitsPerTag + bitsPerTag - 1);
+        }
+
         /**
          * @brief Checks an array of loaded words for a matching tag using SWAR.
          */
@@ -408,11 +447,27 @@ struct Filter {
         checkWords(const WordType (&loaded)[N], WordType replicatedTag) {
             _Pragma("unroll")
             for (size_t j = 0; j < N; ++j) {
-                if (detail::hasZero<TagType, WordType>(loaded[j] ^ replicatedTag)) {
+                if (fpZeroMask(loaded[j] ^ replicatedTag)) {
                     return true;
                 }
             }
             return false;
+        }
+
+        /// Ors this tag's overflow bit from the words loaded at [startIdx, startIdx + N).
+        template <size_t N>
+        __device__ __forceinline__ static void
+        noteOverflow(const WordType (&loaded)[N], size_t startIdx, TagType tag, bool* overflow) {
+            if (overflow == nullptr) {
+                return;
+            }
+            const size_t word = overflowWord(tag);
+            _Pragma("unroll")
+            for (size_t j = 0; j < N; ++j) {
+                if (startIdx + j == word && (loaded[j] & overflowBit(tag))) {
+                    *overflow = true;
+                }
+            }
         }
 
         /**
@@ -438,14 +493,18 @@ struct Filter {
          * @brief Checks if a tag is present in the bucket using vectorized loads.
          *        Automatically selects the best load width based on bucket size and
          * architecture.
+         *
+         * @param overflow If non-null and the tag is absent, set to true when the tag's overflow
+         * bit is set, i.e. when the other candidate bucket must be checked too.
          */
-        __device__ bool contains(TagType tag) const {
+        __device__ bool contains(TagType tag, bool* overflow = nullptr) const {
             const WordType replicatedTag = detail::replicateTag<TagType, WordType>(tag);
 
             // Scalar path
             if constexpr (wordCount == 1) {
-                const auto packed = reinterpret_cast<const WordType&>(packedTags[0]);
-                return detail::hasZero<TagType, WordType>(packed ^ replicatedTag);
+                const WordType loaded[1] = {reinterpret_cast<const WordType&>(packedTags[0])};
+                noteOverflow(loaded, 0, tag, overflow);
+                return checkWords(loaded, replicatedTag);
             }
 
             const uint32_t startSlot = tag & (bucketSize - 1);
@@ -467,6 +526,7 @@ struct Filter {
                     if (checkWords(loaded, replicatedTag)) {
                         return true;
                     }
+                    noteOverflow(loaded, idx, tag, overflow);
                 }
                 return false;
             }
@@ -484,6 +544,7 @@ struct Filter {
                     if (checkWords(loaded, replicatedTag)) {
                         return true;
                     }
+                    noteOverflow(loaded, idx, tag, overflow);
                 }
                 return false;
             }
@@ -1537,7 +1598,7 @@ struct Filter {
             uint32_t matches = 0;
             _Pragma("unroll")
             for (uint32_t k = 0; k < Bucket::wordCount; ++k) {
-                matches |= uint32_t(detail::hasZero<TagType, WordType>(words[k] ^ replicated)) << k;
+                matches |= uint32_t(Bucket::fpZeroMask(words[k] ^ replicated) != 0) << k;
             }
             constexpr uint32_t wordMask = Bucket::wordCount - 1;
             // Rotate the mask to keep the tag-dependent probe order.
@@ -1578,8 +1639,7 @@ struct Filter {
 
         const auto replicated = detail::replicateTag<TagType, WordType>(tag);
         auto tryWord = [&](size_t currIdx, WordType expected) {
-            while (const auto matchMask =
-                       detail::getZeroMask<TagType, WordType>(expected ^ replicated)) {
+            while (const auto matchMask = Bucket::fpZeroMask(expected ^ replicated)) {
                 // Find position of first matching tag
                 int bitPos;
                 if constexpr (sizeof(WordType) == 4) {
@@ -1628,7 +1688,7 @@ struct Filter {
 
         using WordType = typename Bucket::WordType;
         auto tryWord = [&](size_t idx, WordType expected) {
-            while (const WordType zeros = detail::getZeroMask<TagType, WordType>(expected)) {
+            while (const WordType zeros = Bucket::fpZeroMask(expected)) {
                 int bitPos;
                 if constexpr (sizeof(WordType) == 4) {
                     bitPos = __ffs(static_cast<int>(zeros)) - 1;
@@ -1646,6 +1706,11 @@ struct Filter {
         };
 
         return scanBucket(bucket, startWord, WordType{0}, tryWord);
+    }
+
+    /// Records in `bucketIdx` that a tag with fingerprint `fp` lives in its other bucket.
+    __device__ void markOverflow(size_t bucketIdx, TagType fp) {
+        d_buckets[bucketIdx].word(Bucket::overflowWord(fp)).fetchOr(Bucket::overflowBit(fp));
     }
 
     /**
@@ -1690,7 +1755,9 @@ struct Filter {
             }
 #endif
 
-            currentFp = evictedFp;
+            if (evictedFp != EMPTY) {
+                markOverflow(currentBucket, evictedFp);
+            }
             auto [altBucket, newFp] =
                 getAlternateBucketWithNewFp(currentBucket, evictedFp, numBuckets);
             currentBucket = altBucket;
@@ -1753,7 +1820,7 @@ struct Filter {
                 using WordType = typename Bucket::WordType;
                 lookahead =
                     scanBucket(d_buckets[altBucket], 0, WordType{0}, [](size_t, WordType word) {
-                        return detail::hasZero<TagType, WordType>(word);
+                        return Bucket::fpZeroMask(word) != 0;
                     });
             }
 
@@ -1781,6 +1848,7 @@ struct Filter {
 #endif
 
             evictions++;
+            markOverflow(currentBucket, evictedFp);
             auto [altBucket, altFp] =
                 getAlternateBucketWithNewFp(currentBucket, evictedFp, numBuckets);
             if (tryInsertAtBucket(altBucket, altFp)) {
@@ -1821,7 +1889,12 @@ struct Filter {
         TagType fp2,
         uint32_t* evictionAttempts = nullptr
     ) {
-        if (tryInsertAtBucket(i1, fp1) || tryInsertAtBucket(i2, fp2)) {
+        if (tryInsertAtBucket(i1, fp1)) {
+            return true;
+        }
+        // Whichever way the key ends up outside i1, lookups must learn to check i2.
+        markOverflow(i1, fp1);
+        if (tryInsertAtBucket(i2, fp2)) {
             return true;
         }
 
@@ -1859,7 +1932,8 @@ struct Filter {
 
         // fp1 is for bucket i1, fp2 is for bucket i2
         // For non-choice-bit policies, fp1 == fp2
-        return d_buckets[i1].contains(fp1) || d_buckets[i2].contains(fp2);
+        bool overflow = false;
+        return d_buckets[i1].contains(fp1, &overflow) || (overflow && d_buckets[i2].contains(fp2));
     }
 
     /**
@@ -2029,37 +2103,9 @@ __global__ void insertKernelSorted(
         size_t primaryBucket = packedTag >> bitsPerTag;
         auto fp = static_cast<TagType>(packedTag & fpMask);
 
-        if (filter->tryInsertAtBucket(primaryBucket, fp)) {
-            success = 1;
-        } else {
-            auto [i2, fp2] =
-                FilterType::getAlternateBucketWithNewFp(primaryBucket, fp, filter->numBuckets);
-
-            if (filter->tryInsertAtBucket(i2, fp2)) {
-                success = 1;
-            } else {
-                TagType evictFp;
-                auto startBucket = (fp & 1) == 0 ? primaryBucket : i2;
-
-                if constexpr (Config::AltBucketPolicy::usesChoiceBit) {
-                    evictFp = (fp & 1) == 0 ? fp : fp2;
-                } else {
-                    evictFp = fp;
-                }
-
-                if constexpr (Config::evictionPolicy == EvictionPolicy::BFS) {
-                    success = filter->insertWithEvictionBFS(evictFp, startBucket, &threadEvictions);
-                } else if constexpr (Config::evictionPolicy == EvictionPolicy::DFS) {
-                    success = filter->insertWithEvictionDFS(evictFp, startBucket, &threadEvictions);
-                } else {
-                    static_assert(
-                        Config::evictionPolicy == EvictionPolicy::DFS ||
-                            Config::evictionPolicy == EvictionPolicy::BFS,
-                        "Unhandled eviction policy"
-                    );
-                }
-            }
-        }
+        auto [i2, fp2] =
+            FilterType::getAlternateBucketWithNewFp(primaryBucket, fp, filter->numBuckets);
+        success = filter->insertCandidates(primaryBucket, i2, fp, fp2, &threadEvictions);
 
         if (output != nullptr) {
             output[idx] = success;
@@ -2199,7 +2245,9 @@ __global__ void regionContainsKernel(
     bool found = false;
     if (FilterType::decodeRegionSlot(tags, regionCounts, layout, slot, i1, fp1)) {
         auto [i2, fp2] = FilterType::getAlternateBucketWithNewFp(i1, fp1, filter->numBuckets);
-        found = filter->d_buckets[i1].contains(fp1) || filter->d_buckets[i2].contains(fp2);
+        bool overflow = false;
+        found = filter->d_buckets[i1].contains(fp1, &overflow) ||
+                (overflow && filter->d_buckets[i2].contains(fp2));
     }
     const uint32_t bits = __ballot_sync(0xffffffffu, found);
     if (slot % 32 == 0 &&

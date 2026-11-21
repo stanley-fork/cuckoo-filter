@@ -424,6 +424,39 @@ TEST_F(CuckooFilterTest, ConcurrentEvictionsKeepOneCopyPerKey) {
     expectEvictionsKeepOneCopyPerKey<cuckoogpu::OffsetAltBucketPolicy>();
 }
 
+// Keys moved to their alternate bucket by evictions must stay visible to lookups, which skip
+// the alternate bucket unless the primary bucket says something overflowed.
+template <template <typename, typename, size_t, size_t> class Policy>
+void expectEvictedKeysFound() {
+    using Config = cuckoogpu::Config<uint32_t, 16, 500, 256, 16, Policy>;
+    const char* policy = Config::AltBucketPolicy::name;
+    cuckoogpu::Filter<Config> filter(1 << 16);
+    const size_t n = filter.capacity() * 99 / 100;
+    thrust::device_vector<uint32_t> keys(n);
+    thrust::sequence(keys.begin(), keys.end(), 1u);
+    const uint32_t* d_keys = thrust::raw_pointer_cast(keys.data());
+    // Several batches so later ones evict tags placed by earlier ones.
+    for (size_t first = 0; first < n; first += n / 4) {
+        filter.insertMany(d_keys + first, std::min(n / 4, n - first));
+    }
+    ASSERT_EQ(filter.occupiedSlots(), n) << policy;
+
+    thrust::device_vector<uint8_t> found(n);
+    auto* d_found = reinterpret_cast<bool*>(thrust::raw_pointer_cast(found.data()));
+    filter.containsMany(d_keys, n, d_found);
+    EXPECT_EQ(thrust::count(found.begin(), found.end(), 0), 0) << policy;
+
+    const size_t half = n / 2;
+    filter.deleteMany(d_keys, half);
+    filter.containsMany(d_keys + half, n - half, d_found);
+    EXPECT_EQ(thrust::count(found.begin(), found.begin() + (n - half), 0), 0) << policy;
+}
+
+TEST_F(CuckooFilterTest, EvictedKeysRemainVisible) {
+    expectEvictedKeysFound<cuckoogpu::XorAltBucketPolicy>();
+    expectEvictedKeysFound<cuckoogpu::OffsetAltBucketPolicy>();
+}
+
 TEST_F(CuckooFilterTest, InsertSortedAndVerifyOutput) {
     const size_t capacity = 10000;
     cuckoogpu::Filter<Config> filter(capacity);
