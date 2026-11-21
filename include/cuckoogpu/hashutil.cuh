@@ -1,6 +1,9 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
+#include <cuda/std/bit>
+#include <type_traits>
 
 /**
  * XXHash_64 implementation from
@@ -67,8 +70,50 @@ __host__ __device__ __forceinline__ uint64_t finalize(uint64_t h) {
     return h;
 }
 
+template <size_t N>
+using UIntOfSize = std::conditional_t<
+    N == 1,
+    uint8_t,
+    std::conditional_t<N == 2, uint16_t, std::conditional_t<N == 4, uint32_t, uint64_t>>>;
+
+/**
+ * @brief xxhash64 for keys of 1, 2, 4 or 8 bytes computed purely in registers.
+ *
+ * Bit-identical to the generic path below, which on device lowers memcpy to byte-wise local
+ * memory traffic.
+ */
+template <typename T>
+__host__ __device__ __forceinline__ uint64_t xxhash64Small(const T& key, uint64_t seed) {
+    const uint64_t v = cuda::std::bit_cast<UIntOfSize<sizeof(T)>>(key);
+    uint64_t h64 = seed + PRIME64_5 + sizeof(T);
+
+    if constexpr (sizeof(T) == 8) {
+        uint64_t k1 = v * PRIME64_2;
+        k1 = rotl64(k1, 31) * PRIME64_1;
+        h64 ^= k1;
+        h64 = rotl64(h64, 27) * PRIME64_1 + PRIME64_4;
+    } else if constexpr (sizeof(T) == 4) {
+        h64 ^= v * PRIME64_1;
+        h64 = rotl64(h64, 23) * PRIME64_2 + PRIME64_3;
+    } else {
+        for (size_t i = 0; i < sizeof(T); ++i) {
+            h64 ^= ((v >> (8 * i)) & 0xff) * PRIME64_5;
+            h64 = rotl64(h64, 11) * PRIME64_1;
+        }
+    }
+
+    return finalize(h64);
+}
+
 template <typename T>
 __host__ __device__ inline uint64_t xxhash64(const T& key, uint64_t seed = 0) {
+    if constexpr (
+        std::is_trivially_copyable_v<T> &&
+        (sizeof(T) == 1 || sizeof(T) == 2 || sizeof(T) == 4 || sizeof(T) == 8)
+    ) {
+        return xxhash64Small(key, seed);
+    }
+
     const auto* bytes = reinterpret_cast<const uint8_t*>(&key);
     size_t size = sizeof(T);
     size_t offset = 0;

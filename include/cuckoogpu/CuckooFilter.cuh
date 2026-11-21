@@ -3,6 +3,7 @@
 #include <thrust/device_vector.h>
 #include <cstdint>
 #include <cub/cub.cuh>
+#include <cuda/atomic>
 #include <cuda/std/atomic>
 #include <cuda/std/cstddef>
 #include <cuda/std/cstdint>
@@ -236,6 +237,62 @@ struct Filter {
         static_assert(detail::powerOfTwo(wordCount), "wordCount must be a power of 2");
 
         cuda::std::atomic<WordType> packedTags[wordCount];
+
+        /**
+         * @brief Relaxed, device-scope atomic view of one bucket word.
+         *
+         * The filter is only mutated by kernels on its own device, so system scope is not needed.
+         * Raw intrinsics keep `expected` in registers; libcu++ atomics spill it to local memory.
+         */
+        struct WordRef {
+            WordType* ptr;
+
+            __device__ __forceinline__ WordType load(cuda::memory_order) const {
+                WordType v;
+                if constexpr (sizeof(WordType) == 8) {
+                    asm volatile("ld.relaxed.gpu.global.b64 %0, [%1];" : "=l"(v) : "l"(ptr));
+                } else {
+                    asm volatile("ld.relaxed.gpu.global.b32 %0, [%1];" : "=r"(v) : "l"(ptr));
+                }
+                return v;
+            }
+
+            __device__ __forceinline__ bool compare_exchange_strong(
+                WordType& expected,
+                WordType desired,
+                cuda::memory_order,
+                cuda::memory_order
+            ) const {
+                WordType old;
+                if constexpr (sizeof(WordType) == 8) {
+                    asm volatile("atom.relaxed.gpu.global.cas.b64 %0, [%1], %2, %3;"
+                                 : "=l"(old)
+                                 : "l"(ptr), "l"(expected), "l"(desired)
+                                 : "memory");
+                } else {
+                    asm volatile("atom.relaxed.gpu.global.cas.b32 %0, [%1], %2, %3;"
+                                 : "=r"(old)
+                                 : "l"(ptr), "r"(expected), "r"(desired)
+                                 : "memory");
+                }
+                const bool success = old == expected;
+                expected = old;
+                return success;
+            }
+
+            __device__ __forceinline__ bool compare_exchange_weak(
+                WordType& expected,
+                WordType desired,
+                cuda::memory_order success,
+                cuda::memory_order failure
+            ) const {
+                return compare_exchange_strong(expected, desired, success, failure);
+            }
+        };
+
+        __device__ __forceinline__ WordRef word(size_t idx) {
+            return {reinterpret_cast<WordType*>(&packedTags[idx])};
+        }
 
         __host__ __device__ __forceinline__ TagType
         extractTag(WordType packed, size_t tagIdx) const {
@@ -1158,7 +1215,7 @@ struct Filter {
             const size_t currIdx = (startWord + i) & (Bucket::wordCount - 1);
 
             while (true) {
-                auto expected = bucket.packedTags[currIdx].load(cuda::memory_order_relaxed);
+                auto expected = bucket.word(currIdx).load(cuda::memory_order_relaxed);
 
                 WordType matchMask = detail::getZeroMask<TagType, WordType>(
                     expected ^ detail::replicateTag<TagType, WordType>(tag)
@@ -1183,7 +1240,7 @@ struct Filter {
 #ifdef CUCKOO_FILTER_COUNT_DELETE_CAS
                 d_deleteCasAttempts->fetch_add(1, cuda::memory_order_relaxed);
 #endif
-                bool casSuccess = bucket.packedTags[currIdx].compare_exchange_weak(
+                bool casSuccess = bucket.word(currIdx).compare_exchange_weak(
                     expected, desired, cuda::memory_order_relaxed, cuda::memory_order_relaxed
                 );
 #ifdef CUCKOO_FILTER_COUNT_DELETE_CAS
@@ -1217,9 +1274,35 @@ struct Filter {
 
         using WordType = typename Bucket::WordType;
 
+#if __CUDA_ARCH__ >= 1000 && !defined(CUCKOO_FILTER_DISABLE_256BIT_LOADS)
+        // The whole bucket is one 32-byte sector: snapshot it with a single L2 request instead of
+        // one request per scanned word. Words may tear relative to each other, which is harmless
+        // because each update is validated by its own CAS.
+        constexpr bool snapshot = sizeof(Bucket) == 32 && sizeof(WordType) == 8;
+        WordType words[Bucket::wordCount];
+        if constexpr (snapshot) {
+            asm volatile("ld.relaxed.gpu.global.v4.b64 {%0, %1, %2, %3}, [%4];"
+                         : "=l"(words[0]), "=l"(words[1]), "=l"(words[2]), "=l"(words[3])
+                         : "l"(&bucket.packedTags[0]));
+        }
+#else
+        constexpr bool snapshot = false;
+        WordType words[Bucket::wordCount];
+#endif
+
         for (size_t i = 0; i < Bucket::wordCount; ++i) {
             const size_t currWord = (startWord + i) & (Bucket::wordCount - 1);
-            auto expected = bucket.packedTags[currWord].load(cuda::memory_order_relaxed);
+            WordType expected;
+            if constexpr (snapshot) {
+                // Select chain instead of words[currWord] keeps the array in registers.
+                expected = words[0];
+                _Pragma("unroll")
+                for (size_t k = 1; k < Bucket::wordCount; ++k) {
+                    expected = currWord == k ? words[k] : expected;
+                }
+            } else {
+                expected = bucket.word(currWord).load(cuda::memory_order_relaxed);
+            }
 
             while (true) {
                 WordType zeroMask = detail::getZeroMask<TagType, WordType>(expected);
@@ -1240,7 +1323,7 @@ struct Filter {
 
                 auto desired = bucket.replaceTag(expected, j, tag);
 
-                if (bucket.packedTags[currWord].compare_exchange_strong(
+                if (bucket.word(currWord).compare_exchange_strong(
                         expected, desired, cuda::memory_order_relaxed, cuda::memory_order_relaxed
                     )) {
                     return true;
@@ -1274,14 +1357,14 @@ struct Filter {
             size_t evictTagIdx = evictSlot & (Bucket::tagsPerWord - 1);
 
             Bucket& bucket = d_buckets[currentBucket];
-            auto expected = bucket.packedTags[evictWord].load(cuda::memory_order_relaxed);
+            auto expected = bucket.word(evictWord).load(cuda::memory_order_relaxed);
             typename Bucket::WordType desired;
             TagType evictedFp;
 
             do {
                 evictedFp = bucket.extractTag(expected, evictTagIdx);
                 desired = bucket.replaceTag(expected, evictTagIdx, currentFp);
-            } while (!bucket.packedTags[evictWord].compare_exchange_strong(
+            } while (!bucket.word(evictWord).compare_exchange_strong(
                 expected, desired, cuda::memory_order_relaxed, cuda::memory_order_relaxed
             ));
 
@@ -1340,7 +1423,7 @@ struct Filter {
                 restartWord = evictWord;
                 restartTagIdx = evictTagIdx;
 
-                auto packed = bucket.packedTags[evictWord].load(cuda::memory_order_relaxed);
+                auto packed = bucket.word(evictWord).load(cuda::memory_order_relaxed);
                 TagType candidateFp = bucket.extractTag(packed, evictTagIdx);
 
                 if (candidateFp == EMPTY) {
@@ -1355,13 +1438,13 @@ struct Filter {
                 if (tryInsertAtBucket(altBucket, altFp)) {
                     // Successfully inserted the evicted tag at its alternate location
                     // Now atomically swap in our tag at the original location
-                    auto expected = bucket.packedTags[evictWord].load(cuda::memory_order_relaxed);
+                    auto expected = bucket.word(evictWord).load(cuda::memory_order_relaxed);
 
                     // Verify the tag is still there and try to replace it
                     if (bucket.extractTag(expected, evictTagIdx) == candidateFp) {
                         auto desired = bucket.replaceTag(expected, evictTagIdx, currentFp);
 
-                        if (bucket.packedTags[evictWord].compare_exchange_strong(
+                        if (bucket.word(evictWord).compare_exchange_strong(
                                 expected,
                                 desired,
                                 cuda::memory_order_relaxed,
@@ -1383,16 +1466,18 @@ struct Filter {
             }
 
             // Evict the last scanned candidate and continue from its alternate location.
-            auto expected = bucket.packedTags[restartWord].load(cuda::memory_order_relaxed);
+            auto expected = bucket.word(restartWord).load(cuda::memory_order_relaxed);
             typename Bucket::WordType desired;
             TagType evictedFp;
 
             do {
                 evictedFp = bucket.extractTag(expected, restartTagIdx);
                 desired = bucket.replaceTag(expected, restartTagIdx, currentFp);
-            } while (!bucket.packedTags[restartWord].compare_exchange_strong(
-                expected, desired, cuda::memory_order_relaxed, cuda::memory_order_relaxed
-            ));
+            } while (
+                !bucket.word(restartWord)
+                     .compare_exchange_strong(
+                         expected, desired, cuda::memory_order_relaxed, cuda::memory_order_relaxed
+                     ));
 
             if (evictedFp == EMPTY) {
                 return true;
