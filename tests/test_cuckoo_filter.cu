@@ -531,6 +531,73 @@ TEST_F(CuckooFilterTest, LargerThanL2KeepsOutputOrder) {
     EXPECT_LT(falsePositives, numInserted / 100);
 }
 
+// Batches too small to fill a sorted chunk per region give regions shorter than a chunk; each
+// region's results must survive its neighbours' writes.
+TEST_F(CuckooFilterTest, LargerThanL2SmallBatchKeepsAllResults) {
+    int device = 0;
+    int l2Bytes = 0;
+    ASSERT_EQ(cudaGetDevice(&device), cudaSuccess);
+    ASSERT_EQ(cudaDeviceGetAttribute(&l2Bytes, cudaDevAttrL2CacheSize, device), cudaSuccess);
+
+    using Filter = cuckoogpu::Filter<Config>;
+    Filter filter((static_cast<size_t>(l2Bytes) / sizeof(Filter::Bucket) + 1) * Config::bucketSize);
+    ASSERT_GT(filter.sizeInBytes(), static_cast<size_t>(l2Bytes));
+    const size_t n = filter.getNumBuckets();
+    thrust::device_vector<uint32_t> keys(n);
+    thrust::sequence(keys.begin(), keys.end(), 1u);
+
+    thrust::device_vector<uint8_t> output(n);
+    ASSERT_EQ(filter.insertMany(keys, output), n);
+    EXPECT_EQ(thrust::count(output.begin(), output.end(), uint8_t{1}), n);
+
+    filter.containsMany(keys, output);
+    EXPECT_EQ(thrust::count(output.begin(), output.end(), uint8_t{1}), n);
+
+    ASSERT_EQ(filter.deleteMany(keys, output), 0u);
+    EXPECT_EQ(thrust::count(output.begin(), output.end(), uint8_t{1}), n);
+}
+
+// Runs of one key longer than a per-key placement code can rank must still be answered in input
+// order.
+TEST_F(CuckooFilterTest, LargerThanL2LongDuplicateRunsKeepOutputOrder) {
+    int device = 0;
+    int l2Bytes = 0;
+    ASSERT_EQ(cudaGetDevice(&device), cudaSuccess);
+    ASSERT_EQ(cudaDeviceGetAttribute(&l2Bytes, cudaDevAttrL2CacheSize, device), cudaSuccess);
+
+    using Filter = cuckoogpu::Filter<Config>;
+    Filter filter(2 * static_cast<size_t>(l2Bytes) / sizeof(Filter::Bucket) * Config::bucketSize);
+    ASSERT_GT(filter.sizeInBytes(), static_cast<size_t>(l2Bytes));
+    const size_t n = filter.capacity() / 2;
+    thrust::device_vector<uint32_t> inserted(n);
+    thrust::sequence(inserted.begin(), inserted.end(), 1u);
+    ASSERT_EQ(filter.insertMany(inserted), n);
+
+    // Every key repeats `run` times in a row, alternating inserted and absent keys.
+    constexpr uint32_t run = 512;
+    auto wasInserted = [](size_t i) { return (i / run + 1) % 2 == 0; };
+    std::vector<uint32_t> h_queried(n);
+    for (size_t i = 0; i < n; ++i) {
+        const auto key = static_cast<uint32_t>(i / run + 1);
+        h_queried[i] = wasInserted(i) ? key : key + 0x80000000u;
+    }
+    thrust::device_vector<uint32_t> queried(h_queried);
+    thrust::device_vector<uint8_t> output(n);
+    filter.containsMany(queried, output);
+
+    std::vector<uint8_t> found(n);
+    thrust::copy(output.begin(), output.end(), found.begin());
+    size_t falseNegatives = 0;
+    size_t falsePositives = 0;
+    for (size_t i = 0; i < n; ++i) {
+        falseNegatives += wasInserted(i) && !found[i];
+        falsePositives += !wasInserted(i) && found[i];
+    }
+    EXPECT_EQ(falseNegatives, 0u);
+    // A false positive costs a whole run, but at ~0.06% FPR only a few runs are hit.
+    EXPECT_LT(falsePositives, n / 50);
+}
+
 // A batch whose keys all land in one bucket region cannot be region-grouped; it must still be
 // answered correctly.
 TEST_F(CuckooFilterTest, LargerThanL2SkewedBatch) {

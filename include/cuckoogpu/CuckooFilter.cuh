@@ -10,7 +10,6 @@
 #include <cuda/std/cstddef>
 #include <cuda/std/cstdint>
 #include <mutex>
-#include <optional>
 #include <vector>
 #include "bucket_policies.cuh"
 #include "hashutil.cuh"
@@ -104,24 +103,6 @@ __global__ void insertKernelSorted(
 );
 
 /**
- * @brief Maps thread `idx` so that consecutive warps walk `stripes` equally spaced chunks of
- * [0, total) in round-robin instead of one contiguous range. Covers
- * [0, stripedThreads(total, stripes)) bijectively; indices >= total must be skipped.
- */
-__host__ __device__ inline size_t stripedChunk(size_t total, uint32_t stripes) {
-    return SDIV(SDIV(total, stripes), 32) * 32;
-}
-
-__host__ __device__ inline size_t stripedThreads(size_t total, uint32_t stripes) {
-    return stripedChunk(total, stripes) * stripes;
-}
-
-__device__ inline size_t stripedIndex(size_t idx, size_t total, uint32_t stripes) {
-    const size_t warp = idx / 32;
-    return (warp % stripes) * stripedChunk(total, stripes) + (warp / stripes) * 32 + idx % 32;
-}
-
-/**
  * @brief Kernel for computing packed tags for sorting.
  */
 template <typename Config>
@@ -150,11 +131,42 @@ template <typename Config>
 __global__ void
 deleteKernel(const typename Config::KeyType* keys, bool* output, size_t n, Filter<Config>* filter);
 
-/// Keys handled per thread by the region scatter kernel.
-inline constexpr size_t partitionItemsPerThread = 8;
+/// Keys handled per thread by the region scatter kernel. Larger tiles mean shorter per-tile run
+/// tables for the gather; sixteen keys still leave enough loads in flight at three blocks per SM.
+inline constexpr size_t partitionItemsPerThread = 16;
+
+/// Keys handled per thread by `gatherBitmapKernel`, whose blocks each cover one scatter tile.
+inline constexpr size_t gatherItemsPerThread = 8;
 
 /// Upper bound on the number of regions a batch is split into (sizes shared memory).
 inline constexpr uint32_t maxRegions = 1024;
+
+/// Threads per block of `regionSortedKernel`; also its number of local-bucket bins.
+inline constexpr uint32_t sortedThreads = 512;
+
+/// Resident `regionSortedKernel` blocks per SM. Two blocks let one block's DRAM-bound tag load
+/// and sort overlap the other's L2-bound bucket visits; more would spill registers.
+inline constexpr uint32_t sortedBlocksPerSm = 2;
+
+/// What `regionSortedKernel` does with each entry of a region-grouped batch.
+enum class RegionOp {
+    Contains,
+    Insert,
+    Delete
+};
+
+/**
+ * Region-grouped batch entries one `regionSortedKernel` block sorts and visits: 80 bytes of
+ * entries per thread, the most for which two blocks' chunks still fit in an SM's shared memory.
+ * Larger chunks are denser, so a warp's sorted entries touch fewer cache lines.
+ */
+template <typename RegionTagType>
+inline constexpr uint32_t sortedChunk = sortedThreads * (80 / sizeof(RegionTagType));
+
+/// Dynamic shared memory of `regionSortedKernel`: the sorted chunk plus its result bitmap.
+template <typename RegionTagType>
+inline constexpr size_t sortedSharedBytes =
+    sortedChunk<RegionTagType> * sizeof(RegionTagType) + sortedChunk<RegionTagType> / 8;
 
 /**
  * @brief Layout of a region-grouped batch: region r owns slots [r * capacity, (r + 1) * capacity)
@@ -167,8 +179,25 @@ struct RegionLayout {
 };
 
 /**
+ * @brief Where a region-grouped batch put each input key, in 16 bits per key instead of a 32-bit
+ * slot. The scatter kernel claims, for each tile of keys and each region, a run of consecutive
+ * slots starting at runSlot[t * numRegions + b]. Key i's code keyRun[i] holds its region b in
+ * the top log2(numRegions) bits and its rank within the run in the rest, so it lands in slot
+ * runSlot[...] + rank. A run too long for its rank bits counts as a region overflow.
+ */
+struct KeyPlacement {
+    uint16_t* keyRun;   ///< Per key: region (high bits) and rank within its tile's run (low bits)
+    uint32_t* runSlot;  ///< Per tile and region: slot of the run's first key
+};
+
+/// Bits of a `KeyPlacement` code that hold the rank within a run.
+__device__ inline uint32_t runRankBits(uint32_t numRegions) {
+    return 16 - (31 - __clz(numRegions));
+}
+
+/**
  * @brief Hashes keys and scatters region-local tags into their region's slots. Sets *overflow if
- * any region runs out of capacity.
+ * any region runs out of capacity. Fills `placement` unless its pointers are null.
  */
 template <typename Config>
 __global__ void regionScatterKernel(
@@ -178,15 +207,17 @@ __global__ void regionScatterKernel(
     RegionLayout layout,
     uint32_t* regionCounts,
     typename Filter<Config>::RegionTagType* tags,
-    uint32_t* positions,
+    KeyPlacement placement,
     uint32_t* overflow
 );
 
 /**
- * @brief Looks up every occupied slot of a region-grouped batch.
+ * @brief Applies `Op` to every occupied slot of a region-grouped batch, one chunk of a region per
+ * block. If `results` is non-null, writes a bitmap with one bit per slot. Mutations update the
+ * occupancy counter.
  */
-template <typename Config>
-__global__ void regionContainsKernel(
+template <typename Config, RegionOp Op>
+__global__ void regionSortedKernel(
     const typename Filter<Config>::RegionTagType* tags,
     const uint32_t* regionCounts,
     RegionLayout layout,
@@ -195,29 +226,18 @@ __global__ void regionContainsKernel(
 );
 
 /**
- * @brief Mutates every occupied slot of a region-grouped batch, visiting `stripes` regions
- * concurrently.
+ * @brief output[i] = the `results` bit of the slot key i was scattered to, one scatter tile per
+ * block.
  */
-template <typename Config, bool Delete = false>
-__global__ void regionMutationKernel(
-    const typename Filter<Config>::RegionTagType* tags,
-    const uint32_t* regionCounts,
-    RegionLayout layout,
-    bool* results,
-    Filter<Config>* filter,
-    uint32_t stripes
+template <typename Config>
+__global__ void gatherBitmapKernel(
+    const uint32_t* results,
+    KeyPlacement placement,
+    uint32_t numRegions,
+    const uint32_t* overflow,
+    bool* output,
+    size_t n
 );
-
-/**
- * @brief output[i] = results[positions[i]].
- */
-template <typename Config>
-__global__ void
-gatherKernel(const bool* results, const uint32_t* positions, bool* output, size_t n);
-
-template <typename Config>
-__global__ void
-gatherBitmapKernel(const uint32_t* results, const uint32_t* positions, bool* output, size_t n);
 
 }  // namespace detail
 
@@ -575,6 +595,10 @@ struct Filter {
     void* d_scratch{};          ///< Reusable device scratch for batch preprocessing
     size_t d_scratchBytes = 0;  ///< Size of d_scratch in bytes
     std::mutex scratchMutex;    ///< Serialises host calls that use d_scratch
+    /// Device-memory copy of this object, passed to kernels instead of `this` so that device
+    /// code reads `d_buckets` and `numBuckets` from GPU memory, not from host memory over the
+    /// bus. Valid because every field device code reads is fixed once the constructor finishes.
+    Filter* d_self{};
 
     template <typename H>
     static __host__ __device__ uint64_t hash64(const H& key) {
@@ -643,6 +667,11 @@ struct Filter {
         CUCKOO_CUDA_CALL(cudaGetDevice(&device));
         CUCKOO_CUDA_CALL(cudaDeviceGetAttribute(&l2Bytes, cudaDevAttrL2CacheSize, device));
         l2CacheBytes = static_cast<size_t>(l2Bytes);
+        setSortedSharedMemory<detail::RegionOp::Contains>();
+        setSortedSharedMemory<detail::RegionOp::Insert>();
+        setSortedSharedMemory<detail::RegionOp::Delete>();
+        CUCKOO_CUDA_CALL(cudaMalloc(&d_self, sizeof(Filter)));
+        CUCKOO_CUDA_CALL(cudaMemcpy(d_self, this, sizeof(Filter), cudaMemcpyHostToDevice));
     }
 
     /**
@@ -656,6 +685,9 @@ struct Filter {
         }
         if (d_scratch) {
             CUCKOO_CUDA_CALL(cudaFree(d_scratch));
+        }
+        if (d_self) {
+            CUCKOO_CUDA_CALL(cudaFree(d_self));
         }
         if (d_numOccupied) {
             CUCKOO_CUDA_CALL(cudaFree(d_numOccupied));
@@ -691,40 +723,24 @@ struct Filter {
         bool* d_output = nullptr,
         cudaStream_t stream = {}
     ) {
-        if (usePartitioning(n)) {
-            std::lock_guard<std::mutex> lock(scratchMutex);
-            if (auto part = partitionByRegion(d_keys, n, d_output != nullptr, stream)) {
-                const auto stripes = regionMutationStripes(part->layout);
-                const size_t slots = part->slots();
-                detail::regionMutationKernel<Config>
-                    <<<SDIV(detail::stripedThreads(slots, stripes), blockSize),
-                       blockSize,
-                       0,
-                       stream>>>(
-                        part->tags, part->counts, part->layout, part->results, this, stripes
-                    );
-                if (d_output != nullptr) {
-                    detail::gatherKernel<Config><<<SDIV(n, blockSize), blockSize, 0, stream>>>(
-                        part->results, part->positions, d_output, n
-                    );
-                }
-                return syncOccupiedSlots(stream);
-            }
+        if (usePartitioning(n) &&
+            applyByRegion<detail::RegionOp::Insert>(d_keys, n, d_output, stream)) {
+            return syncOccupiedSlots(stream);
         }
 
         size_t numBlocks = SDIV(n, blockSize);
         detail::insertKernel<Config>
-            <<<numBlocks, blockSize, 0, stream>>>(d_keys, d_output, n, this, nullptr);
+            <<<numBlocks, blockSize, 0, stream>>>(d_keys, d_output, n, d_self, nullptr);
 
         return syncOccupiedSlots(stream);
     }
 
     /// Batch grouped by primary-bucket region, plus what is needed to restore input order.
     struct RegionPartition {
-        RegionTagType* tags;  ///< Region-local tags, grouped by region
-        uint32_t* counts;     ///< Occupied slots per region
-        uint32_t* positions;  ///< positions[i] = slot of input key i (optional)
-        bool* results;        ///< Per-slot results (optional)
+        RegionTagType* tags;             ///< Region-local tags, grouped by region
+        uint32_t* counts;                ///< Occupied slots per region
+        detail::KeyPlacement placement;  ///< Where each input key went (optional)
+        uint32_t* results;               ///< Result bitmap, one bit per slot (optional)
         detail::RegionLayout layout;
 
         [[nodiscard]] size_t slots() const {
@@ -779,47 +795,86 @@ struct Filter {
         return static_cast<size_t>(layout.numRegions) * layout.capacity <= UINT32_MAX;
     }
 
-    [[nodiscard]] uint32_t regionMutationStripes(detail::RegionLayout layout) const {
-        // Spread CAS traffic across regions while keeping their working set within L2.
-        const size_t regionBytes = sizeInBytes() / layout.numRegions;
-        return static_cast<uint32_t>(
-            std::bit_floor(std::clamp<size_t>(l2CacheBytes / (4 * regionBytes), 1, 16))
+    template <detail::RegionOp Op>
+    static void setSortedSharedMemory() {
+        CUCKOO_CUDA_CALL(cudaFuncSetAttribute(
+            detail::regionSortedKernel<Config, Op>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            static_cast<int>(detail::sortedSharedBytes<RegionTagType>)
+        ));
+    }
+
+    /**
+     * @brief Groups the batch by region and applies `Op` to it, writing per-key results to
+     * `d_output` if non-null. Returns false, having changed nothing, if a region overflowed.
+     */
+    template <detail::RegionOp Op>
+    bool applyByRegion(const T* d_keys, size_t n, bool* d_output, cudaStream_t stream) {
+        std::lock_guard<std::mutex> lock(scratchMutex);
+        const auto part = partitionByRegion(d_keys, n, d_output != nullptr, stream);
+        // The kernels below read the overflow flag themselves and do nothing if it is set, so the
+        // host checks it only once, after the stream finishes.
+        const uint32_t* overflow = part.counts + part.layout.numRegions;
+        constexpr uint32_t chunk = detail::sortedChunk<RegionTagType>;
+        detail::regionSortedKernel<Config, Op>
+            <<<part.layout.numRegions * SDIV(part.layout.capacity, chunk),
+               detail::sortedThreads,
+               detail::sortedSharedBytes<RegionTagType>,
+               stream>>>(part.tags, part.counts, part.layout, part.results, d_self);
+        if (d_output != nullptr) {
+            constexpr size_t tile = blockSize * detail::partitionItemsPerThread;
+            const uint32_t numRegions = part.layout.numRegions;
+            detail::gatherBitmapKernel<Config>
+                <<<SDIV(n, tile),
+                   tile / detail::gatherItemsPerThread,
+                   numRegions * sizeof(uint32_t),
+                   stream>>>(part.results, part.placement, numRegions, overflow, d_output, n);
+        }
+        CUCKOO_CUDA_CALL(
+            cudaMemcpyAsync(&h_overflow, overflow, sizeof(uint32_t), cudaMemcpyDeviceToHost, stream)
         );
+        // The partition lives in scratch, which the next batch may reuse once the lock is gone.
+        CUCKOO_CUDA_CALL(cudaStreamSynchronize(stream));
+        return h_overflow == 0;
     }
 
     /**
      * @brief Hashes `d_keys` and scatters them into fixed-capacity regions by primary bucket.
      *
-     * Returns std::nullopt if a region overflowed. Results live in the filter's scratch buffer,
-     * so the caller must hold scratchMutex until the stream has consumed them.
+     * With `withResults`, also records where each key went and allocates the result bitmap. If a
+     * region overflowed, the scatter sets `counts[layout.numRegions]`, and kernels consuming the
+     * partition must check it. Results live in the filter's scratch buffer, so the caller must
+     * hold scratchMutex until the stream has consumed them.
      */
-    std::optional<RegionPartition> partitionByRegion(
-        const T* d_keys,
-        size_t n,
-        bool withPositions,
-        cudaStream_t stream,
-        bool bitmap = false
-    ) {
+    RegionPartition
+    partitionByRegion(const T* d_keys, size_t n, bool withResults, cudaStream_t stream) {
         const auto layout = regionLayout(n);
         const size_t slots = static_cast<size_t>(layout.numRegions) * layout.capacity;
 
         auto aligned = [](size_t bytes) { return SDIV(bytes, 256) * 256; };
+        constexpr size_t tile = blockSize * detail::partitionItemsPerThread;
+        const size_t tileBins = SDIV(n, tile) * layout.numRegions;
         const size_t tagBytes = aligned(slots * sizeof(RegionTagType));
         const size_t countBytes = aligned((layout.numRegions + 1) * sizeof(uint32_t));
-        const size_t posBytes = withPositions ? aligned(n * sizeof(uint32_t)) : 0;
-        const size_t resultBytes =
-            withPositions
-                ? aligned(bitmap ? SDIV(slots, 32) * sizeof(uint32_t) : slots * sizeof(bool))
-                : 0;
+        const size_t keyRunBytes = withResults ? aligned(n * sizeof(uint16_t)) : 0;
+        const size_t runSlotBytes = withResults ? aligned(tileBins * sizeof(uint32_t)) : 0;
+        const size_t resultBytes = withResults ? aligned(SDIV(slots, 32) * sizeof(uint32_t)) : 0;
 
-        char* base =
-            static_cast<char*>(scratch(tagBytes + countBytes + posBytes + resultBytes, stream));
+        char* base = static_cast<char*>(
+            scratch(tagBytes + countBytes + keyRunBytes + runSlotBytes + resultBytes, stream)
+        );
+        char* const keyRun = base + tagBytes + countBytes;
+        char* const runSlot = keyRun + keyRunBytes;
+        char* const results = runSlot + runSlotBytes;
         RegionPartition part{
             reinterpret_cast<RegionTagType*>(base),
             reinterpret_cast<uint32_t*>(base + tagBytes),
-            withPositions ? reinterpret_cast<uint32_t*>(base + tagBytes + countBytes) : nullptr,
-            withPositions ? reinterpret_cast<bool*>(base + tagBytes + countBytes + posBytes)
-                          : nullptr,
+            withResults ? detail::KeyPlacement{
+                              reinterpret_cast<uint16_t*>(keyRun),
+                              reinterpret_cast<uint32_t*>(runSlot),
+                          }
+                        : detail::KeyPlacement{},
+            withResults ? reinterpret_cast<uint32_t*>(results) : nullptr,
             layout,
         };
         uint32_t* d_overflow = part.counts + layout.numRegions;
@@ -827,17 +882,10 @@ struct Filter {
         CUCKOO_CUDA_CALL(
             cudaMemsetAsync(part.counts, 0, (layout.numRegions + 1) * sizeof(uint32_t), stream)
         );
-        constexpr size_t tile = blockSize * detail::partitionItemsPerThread;
-        detail::regionScatterKernel<Config><<<SDIV(n, tile), blockSize, 0, stream>>>(
-            d_keys, n, numBuckets, layout, part.counts, part.tags, part.positions, d_overflow
-        );
-        CUCKOO_CUDA_CALL(cudaMemcpyAsync(
-            &h_overflow, d_overflow, sizeof(uint32_t), cudaMemcpyDeviceToHost, stream
-        ));
-        CUCKOO_CUDA_CALL(cudaStreamSynchronize(stream));
-        if (h_overflow != 0) {
-            return std::nullopt;
-        }
+        detail::regionScatterKernel<Config>
+            <<<SDIV(n, tile), blockSize, 3 * layout.numRegions * sizeof(uint32_t), stream>>>(
+                d_keys, n, numBuckets, layout, part.counts, part.tags, part.placement, d_overflow
+            );
         return part;
     }
 
@@ -887,7 +935,7 @@ struct Filter {
     ) {
         size_t numBlocks = SDIV(n, blockSize);
         detail::insertKernel<Config>
-            <<<numBlocks, blockSize, 0, stream>>>(d_keys, d_output, n, this, d_evictionAttempts);
+            <<<numBlocks, blockSize, 0, stream>>>(d_keys, d_output, n, d_self, d_evictionAttempts);
 
         return syncOccupiedSlots(stream);
     }
@@ -949,7 +997,7 @@ struct Filter {
         CUCKOO_CUDA_CALL(cudaFreeAsync(d_tempStorage, stream));
 
         detail::insertKernelSorted<Config>
-            <<<numBlocks, blockSize, 0, stream>>>(d_packedTags, d_output, n, this, nullptr);
+            <<<numBlocks, blockSize, 0, stream>>>(d_packedTags, d_output, n, d_self, nullptr);
 
         CUCKOO_CUDA_CALL(cudaFreeAsync(d_packedTags, stream));
         return syncOccupiedSlots(stream);
@@ -1013,7 +1061,7 @@ struct Filter {
         CUCKOO_CUDA_CALL(cudaFreeAsync(d_tempStorage, stream));
 
         detail::insertKernelSorted<Config><<<numBlocks, blockSize, 0, stream>>>(
-            d_packedTags, d_output, n, this, d_evictionAttempts
+            d_packedTags, d_output, n, d_self, d_evictionAttempts
         );
 
         CUCKOO_CUDA_CALL(cudaFreeAsync(d_packedTags, stream));
@@ -1031,26 +1079,13 @@ struct Filter {
      */
     void containsMany(const T* d_keys, const size_t n, bool* d_output, cudaStream_t stream = {}) {
         size_t numBlocks = SDIV(n, blockSize);
-        if (usePartitioning(n)) {
-            std::lock_guard<std::mutex> lock(scratchMutex);
-            if (auto part = partitionByRegion(d_keys, n, true, stream, true)) {
-                constexpr size_t queryBlockSize = SDIV(blockSize, 32) * 32;
-                auto* bitmap = reinterpret_cast<uint32_t*>(part->results);
-                detail::regionContainsKernel<Config>
-                    <<<SDIV(part->slots(), queryBlockSize), queryBlockSize, 0, stream>>>(
-                        part->tags, part->counts, part->layout, bitmap, this
-                    );
-                detail::gatherBitmapKernel<Config>
-                    <<<SDIV(n, 4 * blockSize), blockSize, 0, stream>>>(
-                        bitmap, part->positions, d_output, n
-                    );
-                CUCKOO_CUDA_CALL(cudaStreamSynchronize(stream));
-                return;
-            }
+        if (usePartitioning(n) &&
+            applyByRegion<detail::RegionOp::Contains>(d_keys, n, d_output, stream)) {
+            return;
         }
 
         detail::containsKernel<Config>
-            <<<numBlocks, blockSize, 0, stream>>>(d_keys, d_output, n, this);
+            <<<numBlocks, blockSize, 0, stream>>>(d_keys, d_output, n, d_self);
 
         CUCKOO_CUDA_CALL(cudaStreamSynchronize(stream));
     }
@@ -1076,39 +1111,12 @@ struct Filter {
             return syncOccupiedSlots(stream);
         }
         size_t numBlocks = SDIV(n, blockSize);
-        if (n >= numBuckets && usePartitioning(n)) {
-            std::lock_guard<std::mutex> lock(scratchMutex);
-            constexpr bool bitmap = blockSize % 32 == 0;
-            if (auto part = partitionByRegion(d_keys, n, d_output != nullptr, stream, bitmap)) {
-                const auto stripes = regionMutationStripes(part->layout);
-                const size_t slots = part->slots();
-                detail::regionMutationKernel<Config, true>
-                    <<<SDIV(detail::stripedThreads(slots, stripes), blockSize),
-                       blockSize,
-                       0,
-                       stream>>>(
-                        part->tags, part->counts, part->layout, part->results, this, stripes
-                    );
-                if (d_output != nullptr) {
-                    if constexpr (bitmap) {
-                        detail::gatherBitmapKernel<Config>
-                            <<<SDIV(n, 4 * blockSize), blockSize, 0, stream>>>(
-                                reinterpret_cast<const uint32_t*>(part->results),
-                                part->positions,
-                                d_output,
-                                n
-                            );
-                    } else {
-                        detail::gatherKernel<Config><<<numBlocks, blockSize, 0, stream>>>(
-                            part->results, part->positions, d_output, n
-                        );
-                    }
-                }
-                return syncOccupiedSlots(stream);
-            }
+        if (n >= numBuckets && usePartitioning(n) &&
+            applyByRegion<detail::RegionOp::Delete>(d_keys, n, d_output, stream)) {
+            return syncOccupiedSlots(stream);
         }
         detail::deleteKernel<Config>
-            <<<numBlocks, blockSize, 0, stream>>>(d_keys, d_output, n, this);
+            <<<numBlocks, blockSize, 0, stream>>>(d_keys, d_output, n, d_self);
 
         return syncOccupiedSlots(stream);
     }
@@ -1889,15 +1897,34 @@ struct Filter {
         TagType fp2,
         uint32_t* evictionAttempts = nullptr
     ) {
-        if (tryInsertAtBucket(i1, fp1)) {
-            return true;
-        }
+        return tryInsertAtBucket(i1, fp1) ||
+               insertOutsidePrimary(i1, i2, fp1, fp2, evictionAttempts);
+    }
+
+    /**
+     * @brief The rest of `insertCandidates` once bucket i1 had no room: place the fingerprint in
+     * i2, evicting if necessary.
+     */
+    __device__ bool insertOutsidePrimary(
+        size_t i1,
+        size_t i2,
+        TagType fp1,
+        TagType fp2,
+        uint32_t* evictionAttempts = nullptr
+    ) {
         // Whichever way the key ends up outside i1, lookups must learn to check i2.
         markOverflow(i1, fp1);
-        if (tryInsertAtBucket(i2, fp2)) {
-            return true;
-        }
+        return tryInsertAtBucket(i2, fp2) || insertByEviction(i1, i2, fp1, fp2, evictionAttempts);
+    }
 
+    /// The last resort of `insertOutsidePrimary`, once neither bucket had room.
+    __device__ bool insertByEviction(
+        size_t i1,
+        size_t i2,
+        TagType fp1,
+        TagType fp2,
+        uint32_t* evictionAttempts = nullptr
+    ) {
         // For eviction, use correct fingerprint for the starting bucket
         auto startBucket = (fp1 & 1) == 0 ? i1 : i2;
         TagType evictFp;
@@ -1937,29 +1964,6 @@ struct Filter {
     }
 
     /**
-     * @brief Decodes slot `slot` of a region-grouped batch into its primary bucket and
-     * fingerprint. Returns false for unused slots.
-     */
-    __device__ static bool decodeRegionSlot(
-        const RegionTagType* tags,
-        const uint32_t* regionCounts,
-        detail::RegionLayout layout,
-        size_t slot,
-        size_t& bucket,
-        TagType& fp
-    ) {
-        const size_t region = slot / layout.capacity;
-        const size_t offset = slot - region * layout.capacity;
-        if (region >= layout.numRegions || offset >= regionCounts[region]) {
-            return false;
-        }
-        const RegionTagType tag = tags[slot];
-        bucket = (region << layout.localBits) | static_cast<size_t>(tag >> bitsPerTag);
-        fp = static_cast<TagType>(tag & fpMask);
-        return true;
-    }
-
-    /**
      * @brief Removes a key from the filter.
      *
      * @param key The key to remove.
@@ -1976,8 +1980,10 @@ struct Filter {
 
 namespace detail {
 
+// Without a bound the inlined eviction code takes 54 registers, which leaves room for only four
+// 256-thread blocks of the six that fill a 1536-thread SM.
 template <typename Config>
-__global__ void insertKernel(
+__global__ void __launch_bounds__(Config::blockSize, 1536 / Config::blockSize) insertKernel(
     const typename Config::KeyType* keys,
     bool* output,
     size_t n,
@@ -2123,15 +2129,17 @@ __global__ void insertKernelSorted(
     }
 }
 
+// Bins are sized by the launch's region count and each key's region and rank share a register;
+// the staged tile limits the kernel to three blocks per SM.
 template <typename Config>
-__global__ void regionScatterKernel(
+__global__ void __launch_bounds__(Config::blockSize, 768 / Config::blockSize) regionScatterKernel(
     const typename Config::KeyType* keys,
     size_t n,
     size_t numBuckets,
     RegionLayout layout,
     uint32_t* regionCounts,
     typename Filter<Config>::RegionTagType* tags,
-    uint32_t* positions,
+    KeyPlacement placement,
     uint32_t* overflow
 ) {
     using RegionTagType = typename Filter<Config>::RegionTagType;
@@ -2141,14 +2149,17 @@ __global__ void regionScatterKernel(
     constexpr uint32_t noSlot = UINT32_MAX;
     using BlockScan = cub::BlockScan<uint32_t, blockSize>;
 
-    __shared__ uint32_t binCount[maxRegions];
-    __shared__ uint32_t binStart[maxRegions];
-    __shared__ uint32_t regionBase[maxRegions];
+    // binCount, binStart and regionBase, numRegions entries each.
+    extern __shared__ uint32_t binShared[];
+    const uint32_t numRegions = layout.numRegions;
+    uint32_t* const binCount = binShared;
+    uint32_t* const binStart = binShared + numRegions;
+    uint32_t* const regionBase = binShared + 2 * numRegions;
     __shared__ RegionTagType staged[tileSize];
     __shared__ uint16_t stagedBin[tileSize];
     __shared__ typename BlockScan::TempStorage scanStorage;
 
-    const uint32_t numRegions = layout.numRegions;
+    static_assert(tileSize <= 1u << 16, "ranks share a register with the region");
     for (uint32_t b = threadIdx.x; b < numRegions; b += blockSize) {
         binCount[b] = 0;
     }
@@ -2158,8 +2169,8 @@ __global__ void regionScatterKernel(
     const size_t base = static_cast<size_t>(blockIdx.x) * tileSize;
     const size_t localMask = (size_t{1} << layout.localBits) - 1;
     RegionTagType tag[partitionItemsPerThread];
-    uint32_t bin[partitionItemsPerThread];
-    uint32_t rank[partitionItemsPerThread];
+    // Region in the high half, rank within the tile's run in the low half.
+    uint32_t binRank[partitionItemsPerThread];
     _Pragma("unroll")
     for (uint32_t k = 0; k < partitionItemsPerThread; ++k) {
         const size_t i = base + k * blockSize + threadIdx.x;
@@ -2168,8 +2179,8 @@ __global__ void regionScatterKernel(
                 Filter<Config>::getCandidateBucketsAndFPs(keys[i], numBuckets);
             tag[k] = (static_cast<RegionTagType>(i1 & localMask) << Config::bitsPerTag) |
                      static_cast<RegionTagType>(fp1);
-            bin[k] = static_cast<uint32_t>(i1 >> layout.localBits);
-            rank[k] = atomicAdd(&binCount[bin[k]], 1u);
+            const auto b = static_cast<uint32_t>(i1 >> layout.localBits);
+            binRank[k] = b << 16 | atomicAdd(&binCount[b], 1u);
         }
     }
     __syncthreads();
@@ -2190,18 +2201,23 @@ __global__ void regionScatterKernel(
     }
 
     // Claim this tile's share of each region.
+    const uint32_t rankBits = runRankBits(numRegions);
     for (uint32_t b = threadIdx.x; b < numRegions; b += blockSize) {
         const uint32_t count = binCount[b];
         uint32_t slot = noSlot;
         if (count > 0) {
             const uint32_t offset = atomicAdd(&regionCounts[b], count);
-            if (offset + count <= layout.capacity) {
+            const bool rankFits = placement.keyRun == nullptr || count <= (1u << rankBits);
+            if (offset + count <= layout.capacity && rankFits) {
                 slot = b * layout.capacity + offset;
             } else {
                 atomicOr(overflow, 1u);
             }
         }
         regionBase[b] = slot;
+        if (placement.keyRun != nullptr) {
+            placement.runSlot[static_cast<size_t>(blockIdx.x) * numRegions + b] = slot;
+        }
     }
     __syncthreads();
 
@@ -2210,11 +2226,13 @@ __global__ void regionScatterKernel(
     for (uint32_t k = 0; k < partitionItemsPerThread; ++k) {
         const size_t i = base + k * blockSize + threadIdx.x;
         if (i < n) {
-            const uint32_t s = binStart[bin[k]] + rank[k];
+            const uint32_t b = binRank[k] >> 16;
+            const uint32_t r = binRank[k] & 0xffffu;
+            const uint32_t s = binStart[b] + r;
             staged[s] = tag[k];
-            stagedBin[s] = static_cast<uint16_t>(bin[k]);
-            if (positions != nullptr && regionBase[bin[k]] != noSlot) {
-                positions[i] = regionBase[bin[k]] + rank[k];
+            stagedBin[s] = static_cast<uint16_t>(b);
+            if (placement.keyRun != nullptr) {
+                placement.keyRun[i] = static_cast<uint16_t>(b << rankBits | r);
             }
         }
     }
@@ -2229,8 +2247,8 @@ __global__ void regionScatterKernel(
     }
 }
 
-template <typename Config>
-__global__ void regionContainsKernel(
+template <typename Config, RegionOp Op>
+__global__ void __launch_bounds__(sortedThreads, sortedBlocksPerSm) regionSortedKernel(
     const typename Filter<Config>::RegionTagType* tags,
     const uint32_t* regionCounts,
     RegionLayout layout,
@@ -2238,100 +2256,275 @@ __global__ void regionContainsKernel(
     Filter<Config>* filter
 ) {
     using FilterType = Filter<Config>;
+    using RegionTagType = typename FilterType::RegionTagType;
+    using TagType = typename FilterType::TagType;
+    using BlockScan = cub::BlockScan<uint32_t, sortedThreads>;
+    using BlockReduce = cub::BlockReduce<int32_t, sortedThreads>;
+    constexpr uint32_t threads = sortedThreads;
+    constexpr uint32_t chunk = sortedChunk<RegionTagType>;
+    constexpr uint32_t items = chunk / threads;
 
-    const size_t slot = globalThreadId();
-    size_t i1;
-    typename FilterType::TagType fp1;
-    bool found = false;
-    if (FilterType::decodeRegionSlot(tags, regionCounts, layout, slot, i1, fp1)) {
-        auto [i2, fp2] = FilterType::getAlternateBucketWithNewFp(i1, fp1, filter->numBuckets);
-        bool overflow = false;
-        found = filter->d_buckets[i1].contains(fp1, &overflow) ||
-                (overflow && filter->d_buckets[i2].contains(fp2));
-    }
-    const uint32_t bits = __ballot_sync(0xffffffffu, found);
-    if (slot % 32 == 0 &&
-        slot / 32 < static_cast<size_t>(layout.numRegions) * layout.capacity / 32) {
-        results[slot / 32] = bits;
-    }
-}
+    // Lanes of a warp whose buckets share a 128-byte line share one L2 request, so the chunk is
+    // counting-sorted by local bucket before it is visited. A chunk is a large share of its
+    // region, so a warp's 32 sorted entries span few lines.
+    extern __shared__ uint4 sharedRaw[];
+    auto* sorted = reinterpret_cast<RegionTagType*>(sharedRaw);
+    auto* hits = reinterpret_cast<uint32_t*>(sorted + chunk);
+    __shared__ uint32_t binStart[threads];
+    __shared__ union {
+        typename BlockScan::TempStorage scan;
+        typename BlockReduce::TempStorage reduce;
+    } storage;
 
-template <typename Config>
-__global__ void
-gatherBitmapKernel(const uint32_t* results, const uint32_t* positions, bool* output, size_t n) {
-    // Four keys per thread: independent bitmap reads and one 32-bit output store.
-    const size_t first = globalThreadId() * 4;
-    auto bit = [&](uint32_t slot) { return (results[slot / 32] >> (slot % 32)) & 1; };
-    if (first + 4 <= n && reinterpret_cast<uintptr_t>(output) % 4 == 0) {
-        const uint4 slots = *reinterpret_cast<const uint4*>(positions + first);
-        const uint32_t packed =
-            bit(slots.x) | bit(slots.y) << 8 | bit(slots.z) << 16 | bit(slots.w) << 24;
-        *reinterpret_cast<uint32_t*>(output + first) = packed;
+    // A region overflowed: the whole batch goes through the unpartitioned path instead.
+    if (regionCounts[layout.numRegions] != 0) {
+        return;
+    }
+    const uint32_t chunksPerRegion = SDIV(layout.capacity, chunk);
+    const uint32_t region = blockIdx.x / chunksPerRegion;
+    const uint32_t first = (blockIdx.x % chunksPerRegion) * chunk;
+    const uint32_t count = min(regionCounts[region], layout.capacity);
+    if (first >= count) {
+        return;
+    }
+    const uint32_t valid = min(count - first, chunk);
+    // Region capacity is a multiple of 32, so the chunk starts on a bitmap word.
+    const size_t base = static_cast<size_t>(region) * layout.capacity + first;
+    // One bin per thread.
+    constexpr uint32_t binBits = std::bit_width(threads) - 1;
+    static_assert(threads == 1u << binBits, "thread count must be a power of two");
+    const uint32_t binShift = layout.localBits > binBits ? layout.localBits - binBits : 0;
+    auto binOf = [&](RegionTagType tag) {
+        return static_cast<uint32_t>(tag >> Config::bitsPerTag) >> binShift;
+    };
+
+    // The region's chunks run at about the same time, and each touches lines all over the
+    // region. Each block prefetches its share of the region into L2 so the DRAM fetches overlap
+    // the sort below and the lookups hit L2.
+    {
+        using Bucket = typename FilterType::Bucket;
+        constexpr size_t lineBytes = 128;
+        const size_t regionLines =
+            ((size_t{1} << layout.localBits) * sizeof(Bucket) + lineBytes - 1) / lineBytes;
+        const size_t share = SDIV(regionLines, SDIV(count, chunk));
+        const size_t line = (first / chunk) * share + threadIdx.x;
+        const auto* regionStart = reinterpret_cast<const char*>(
+            filter->d_buckets + (static_cast<size_t>(region) << layout.localBits)
+        );
+        for (size_t l = line; l < min(regionLines, (first / chunk + 1) * share); l += threads) {
+            asm volatile("prefetch.global.L2 [%0];" ::"l"(regionStart + l * lineBytes));
+        }
+    }
+
+    binStart[threadIdx.x] = 0;
+    __syncthreads();
+    RegionTagType tag[items];
+    // Sorted positions stay live until the results are un-permuted; two 16-bit positions per
+    // register leave room for larger chunks without spilling.
+    static_assert(chunk <= 1u << 16, "sorted positions are 16-bit");
+    uint32_t packedPos[(items + 1) / 2] = {};
+    auto posOf = [&](uint32_t k) { return (packedPos[k / 2] >> (16 * (k % 2))) & 0xffffu; };
+    _Pragma("unroll")
+    for (uint32_t k = 0; k < items; ++k) {
+        const uint32_t j = k * threads + threadIdx.x;
+        if (j < valid) {
+            tag[k] = tags[base + j];
+            packedPos[k / 2] |= atomicAdd(&binStart[binOf(tag[k])], 1u) << (16 * (k % 2));
+        }
+    }
+    __syncthreads();
+    uint32_t start = binStart[threadIdx.x];
+    BlockScan(storage.scan).ExclusiveSum(start, start);
+    binStart[threadIdx.x] = start;
+    __syncthreads();
+    _Pragma("unroll")
+    for (uint32_t k = 0; k < items; ++k) {
+        if (k * threads + threadIdx.x < valid) {
+            // The rank within a bin plus the bin's start is below the chunk size, so no carry.
+            packedPos[k / 2] += binStart[binOf(tag[k])] << (16 * (k % 2));
+            sorted[posOf(k)] = tag[k];
+        }
+    }
+    __syncthreads();
+
+    const uint32_t warp = threadIdx.x / 32;
+    const uint32_t lane = threadIdx.x % 32;
+    auto* const buckets = filter->d_buckets;
+    const size_t numBuckets = filter->numBuckets;
+    auto decode = [&](uint32_t p, size_t& i1, TagType& fp1) {
+        const RegionTagType entry = sorted[p];
+        i1 = (static_cast<size_t>(region) << layout.localBits) |
+             static_cast<size_t>(entry >> Config::bitsPerTag);
+        fp1 = static_cast<TagType>(entry & FilterType::fpMask);
+    };
+    // Primary buckets first. Work that also needs the alternate bucket is deferred, so a warp
+    // does not wait on one lane's second round trip (or eviction chain) at every step.
+    static_assert(items <= 32, "deferred entries are tracked in a 32-bit mask");
+    uint32_t deferred = 0;
+    int32_t changed = 0;
+    for (uint32_t k = 0; k < items; ++k) {
+        const uint32_t p = k * threads + threadIdx.x;
+        bool success = false;
+        if (p < valid) {
+            size_t i1;
+            TagType fp1;
+            decode(p, i1, fp1);
+            if constexpr (Op == RegionOp::Insert) {
+                success = filter->tryInsertAtBucket(i1, fp1);
+                deferred |= uint32_t(!success) << k;
+            } else if constexpr (Op == RegionOp::Delete) {
+                success = filter->tryRemoveAtBucket(i1, fp1);
+                deferred |= uint32_t(!success) << k;
+            } else {
+                bool overflow = false;
+                success = buckets[i1].contains(fp1, &overflow);
+                deferred |= uint32_t(!success && overflow) << k;
+            }
+            changed += success;
+        }
+        const uint32_t bits = __ballot_sync(0xffffffffu, success);
+        if (lane == 0) {
+            hits[p / 32] = bits;
+        }
+    }
+    auto visitAlternate = [&](uint32_t p, bool evict) {
+        size_t i1;
+        TagType fp1;
+        decode(p, i1, fp1);
+        auto [i2, fp2] = FilterType::getAlternateBucketWithNewFp(i1, fp1, numBuckets);
+        bool success;
+        if constexpr (Op == RegionOp::Insert) {
+            if (evict) {
+                success = filter->insertByEviction(i1, i2, fp1, fp2);
+            } else {
+                // Whichever way the key ends up outside i1, lookups must learn to check i2.
+                filter->markOverflow(i1, fp1);
+                success = filter->tryInsertAtBucket(i2, fp2);
+            }
+        } else if constexpr (Op == RegionOp::Delete) {
+            success = filter->tryRemoveAtBucket(i2, fp2);
+        } else {
+            success = buckets[i2].contains(fp2);
+        }
+        changed += success;
+        if (success) {
+            atomicOr(&hits[p / 32], 1u << (p % 32));
+        }
+    };
+    if constexpr (Op == RegionOp::Contains) {
+        __syncwarp();
+        while (deferred != 0) {
+            const uint32_t k = __ffs(deferred) - 1;
+            deferred &= deferred - 1;
+            visitAlternate(k * threads + threadIdx.x, false);
+        }
     } else {
-        for (size_t idx = first; idx < min(first + 4, n); ++idx) {
-            output[idx] = bit(positions[idx]);
+        // Mutations defer more entries, with longer work each (CAS retries, evictions), so they
+        // go through a block-wide queue (reusing `binStart`): every thread takes an equal share
+        // instead of each warp waiting on its busiest lane.
+        static_assert(chunk <= 1u << 16, "queued entries are 16-bit chunk offsets");
+        constexpr uint32_t queueSize = threads * sizeof(uint32_t) / sizeof(uint16_t);
+        auto* const queue = reinterpret_cast<uint16_t*>(binStart);
+        auto drain = [&](bool evict) {
+            while (__syncthreads_or(deferred != 0)) {
+                uint32_t offset = __popc(deferred);
+                uint32_t total;
+                BlockScan(storage.scan).ExclusiveSum(offset, offset, total);
+                while (deferred != 0 && offset < queueSize) {
+                    const uint32_t k = __ffs(deferred) - 1;
+                    deferred &= deferred - 1;
+                    queue[offset++] = static_cast<uint16_t>(k * threads + threadIdx.x);
+                }
+                __syncthreads();
+                for (uint32_t q = threadIdx.x; q < min(total, queueSize); q += threads) {
+                    visitAlternate(queue[q], evict);
+                }
+            }
+        };
+        drain(false);
+        if constexpr (Op == RegionOp::Insert) {
+            // Entries with no room in either bucket evict in a pass of their own, so warps above
+            // do not wait on one lane's eviction chain at every step. The last barrier of
+            // `drain` made every placement visible in `hits`.
+            for (uint32_t k = 0; k < items; ++k) {
+                const uint32_t p = k * threads + threadIdx.x;
+                deferred |= uint32_t(p < valid && !((hits[p / 32] >> (p % 32)) & 1u)) << k;
+            }
+            drain(true);
         }
     }
-}
-
-template <typename Config, bool Delete>
-__global__ void regionMutationKernel(
-    const typename Filter<Config>::RegionTagType* tags,
-    const uint32_t* regionCounts,
-    RegionLayout layout,
-    bool* results,
-    Filter<Config>* filter,
-    uint32_t stripes
-) {
-    using FilterType = Filter<Config>;
-    using BlockReduce = cub::BlockReduce<int32_t, Config::blockSize>;
-    __shared__ typename BlockReduce::TempStorage tempStorage;
-
-    const size_t slots = static_cast<size_t>(layout.numRegions) * layout.capacity;
-    const size_t slot = stripedIndex(globalThreadId(), slots, stripes);
-
-    int32_t success = 0;
-    size_t i1;
-    typename FilterType::TagType fp1;
-    if (slot < slots && FilterType::decodeRegionSlot(tags, regionCounts, layout, slot, i1, fp1)) {
-        auto [i2, fp2] = FilterType::getAlternateBucketWithNewFp(i1, fp1, filter->numBuckets);
-        if constexpr (Delete) {
-            success = filter->tryRemoveAtBucket(i1, fp1) || filter->tryRemoveAtBucket(i2, fp2);
-        } else {
-            success = filter->insertCandidates(i1, i2, fp1, fp2);
-        }
-        if constexpr (!Delete || Config::blockSize % 32 != 0) {
-            if (results != nullptr) {
-                results[slot] = success;
+    if constexpr (Op != RegionOp::Contains) {
+        __syncthreads();  // storage.scan is reused for the reduction.
+        const int32_t blockSum = BlockReduce(storage.reduce).Sum(changed);
+        if (threadIdx.x == 0 && blockSum > 0) {
+            if constexpr (Op == RegionOp::Insert) {
+                filter->d_numOccupied->fetch_add(blockSum, cuda::memory_order_relaxed);
+            } else {
+                filter->d_numOccupied->fetch_sub(blockSum, cuda::memory_order_relaxed);
             }
         }
     }
-
-    if constexpr (Delete && Config::blockSize % 32 == 0) {
-        if (results != nullptr) {
-            const uint32_t bits = __ballot_sync(0xffffffffu, success);
-            if (slot % 32 == 0 && slot < slots) {
-                reinterpret_cast<uint32_t*>(results)[slot / 32] = bits;
-            }
-        }
+    if (results == nullptr) {
+        return;
     }
+    __syncthreads();
 
-    int32_t blockSum = BlockReduce(tempStorage).Sum(success);
-    if (threadIdx.x == 0 && blockSum > 0) {
-        if constexpr (Delete) {
-            filter->d_numOccupied->fetch_sub(blockSum, cuda::memory_order_relaxed);
-        } else {
-            filter->d_numOccupied->fetch_add(blockSum, cuda::memory_order_relaxed);
+    // Back to slot order. Words past `valid` may belong to the next region, whose capacity can be
+    // smaller than a chunk, so they are left alone.
+    _Pragma("unroll")
+    for (uint32_t k = 0; k < items; ++k) {
+        const uint32_t j = k * threads + threadIdx.x;
+        const bool success = j < valid && ((hits[posOf(k) / 32] >> (posOf(k) % 32)) & 1u);
+        const uint32_t bits = __ballot_sync(0xffffffffu, success);
+        if (lane == 0 && j < valid) {
+            results[base / 32 + k * (threads / 32) + warp] = bits;
         }
     }
 }
 
 template <typename Config>
-__global__ void
-gatherKernel(const bool* results, const uint32_t* positions, bool* output, size_t n) {
-    const size_t idx = globalThreadId();
-    if (idx < n) {
-        output[idx] = results[positions[idx]];
+__global__ void gatherBitmapKernel(
+    const uint32_t* results,
+    KeyPlacement placement,
+    uint32_t numRegions,
+    const uint32_t* overflow,
+    bool* output,
+    size_t n
+) {
+    constexpr uint32_t items = gatherItemsPerThread;
+    constexpr uint32_t tileSize = Config::blockSize * partitionItemsPerThread;
+    if (*overflow != 0) {
+        return;
+    }
+    extern __shared__ uint32_t runSlot[];
+    const size_t tileRuns = static_cast<size_t>(blockIdx.x) * numRegions;
+    for (uint32_t b = threadIdx.x; b < numRegions; b += blockDim.x) {
+        runSlot[b] = placement.runSlot[tileRuns + b];
+    }
+    __syncthreads();
+
+    const uint32_t rankBits = runRankBits(numRegions);
+    auto bit = [&](uint32_t code) {
+        const uint32_t slot = runSlot[code >> rankBits] + (code & ((1u << rankBits) - 1));
+        return (results[slot / 32] >> (slot % 32)) & 1;
+    };
+
+    // Consecutive keys per thread: one vector load of placement codes and one vector store.
+    static_assert(items == 8, "the vector path moves eight 16-bit indices and eight flags");
+    const size_t first = static_cast<size_t>(blockIdx.x) * tileSize + threadIdx.x * items;
+    if (first + items <= n && reinterpret_cast<uintptr_t>(output) % 8 == 0) {
+        const uint4 s = *reinterpret_cast<const uint4*>(placement.keyRun + first);
+        const uint32_t words[4] = {s.x, s.y, s.z, s.w};
+        uint32_t packed[2] = {};
+        _Pragma("unroll")
+        for (uint32_t q = 0; q < items; ++q) {
+            packed[q / 4] |= bit((words[q / 2] >> (16 * (q % 2))) & 0xffffu) << (8 * (q % 4));
+        }
+        *reinterpret_cast<uint2*>(output + first) = make_uint2(packed[0], packed[1]);
+    } else {
+        for (size_t idx = first; idx < min(first + items, n); ++idx) {
+            output[idx] = bit(placement.keyRun[idx]);
+        }
     }
 }
 
