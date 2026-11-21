@@ -526,9 +526,7 @@ struct Filter {
         detail::insertKernel<Config>
             <<<numBlocks, blockSize, 0, stream>>>(d_keys, d_output, n, this, nullptr);
 
-        CUCKOO_CUDA_CALL(cudaStreamSynchronize(stream));
-
-        return occupiedSlots();
+        return syncOccupiedSlots(stream);
     }
 
 #ifdef CUCKOO_FILTER_COUNT_EVICTIONS
@@ -554,9 +552,7 @@ struct Filter {
         detail::insertKernel<Config>
             <<<numBlocks, blockSize, 0, stream>>>(d_keys, d_output, n, this, d_evictionAttempts);
 
-        CUCKOO_CUDA_CALL(cudaStreamSynchronize(stream));
-
-        return occupiedSlots();
+        return syncOccupiedSlots(stream);
     }
 #endif
 
@@ -619,9 +615,7 @@ struct Filter {
             <<<numBlocks, blockSize, 0, stream>>>(d_packedTags, d_output, n, this, nullptr);
 
         CUCKOO_CUDA_CALL(cudaFreeAsync(d_packedTags, stream));
-        CUCKOO_CUDA_CALL(cudaStreamSynchronize(stream));
-
-        return occupiedSlots();
+        return syncOccupiedSlots(stream);
     }
 
 #ifdef CUCKOO_FILTER_COUNT_EVICTIONS
@@ -686,9 +680,7 @@ struct Filter {
         );
 
         CUCKOO_CUDA_CALL(cudaFreeAsync(d_packedTags, stream));
-        CUCKOO_CUDA_CALL(cudaStreamSynchronize(stream));
-
-        return occupiedSlots();
+        return syncOccupiedSlots(stream);
     }
 #endif
 
@@ -729,9 +721,7 @@ struct Filter {
         detail::deleteKernel<Config>
             <<<numBlocks, blockSize, 0, stream>>>(d_keys, d_output, n, this);
 
-        CUCKOO_CUDA_CALL(cudaStreamSynchronize(stream));
-
-        return occupiedSlots();
+        return syncOccupiedSlots(stream);
     }
 
     /**
@@ -1059,6 +1049,18 @@ struct Filter {
         CUCKOO_CUDA_CALL(
             cudaMemcpy(&h_numOccupied, d_numOccupied, sizeof(size_t), cudaMemcpyDeviceToHost)
         );
+        return h_numOccupied;
+    }
+
+    /**
+     * @brief Waits for `stream` and returns the occupied-slot count, reading the counter back in
+     * the same stream so only one host round trip is needed.
+     */
+    size_t syncOccupiedSlots(cudaStream_t stream) {
+        CUCKOO_CUDA_CALL(cudaMemcpyAsync(
+            &h_numOccupied, d_numOccupied, sizeof(size_t), cudaMemcpyDeviceToHost, stream
+        ));
+        CUCKOO_CUDA_CALL(cudaStreamSynchronize(stream));
         return h_numOccupied;
     }
 
